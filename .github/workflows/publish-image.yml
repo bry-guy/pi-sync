@@ -5,7 +5,7 @@ on:
     tags: ['v*.*.*']
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -25,7 +25,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=sha
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
@@ -33,3 +34,40 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
           sbom: true
+
+      - name: Update deployment digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 - "$IMAGE_DIGEST" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          digest = sys.argv[1]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit(f"unexpected image digest: {digest!r}")
+          path = pathlib.Path("deploy/k8s/deployment.yaml")
+          text = path.read_text()
+          updated, count = re.subn(
+              r"ghcr\.io/bry-guy/pi-syncd@sha256:[^\s]+",
+              f"ghcr.io/bry-guy/pi-syncd@{digest}",
+              text,
+          )
+          if count != 1:
+              raise SystemExit("expected one pi-syncd image reference")
+          path.write_text(updated)
+          PY
+
+      - name: Commit deployment digest
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- deploy/k8s/deployment.yaml; then
+            exit 0
+          fi
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add deploy/k8s/deployment.yaml
+          git commit -m "chore(deploy): pin image digest [skip ci]"
+          git push origin HEAD:main

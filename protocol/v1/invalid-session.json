@@ -1,0 +1,10 @@
+{
+  "formatVersion": 1,
+  "sessionId": "invalid/session",
+  "piSessionVersion": 3,
+  "createdAt": "not-a-date",
+  "parentSessionId": null,
+  "headEntryId": "missing",
+  "title": "",
+  "entries": []
+}

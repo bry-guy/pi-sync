@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "sessionId": "01936f4a-5f04-7b2d-9ce4-9c2c5c4a8e11",
+  "piSessionVersion": 3,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "parentSessionId": null,
+  "headEntryId": "a1b2c3d4",
+  "title": "Example synchronized session",
+  "entries": [
+    {
+      "type": "message",
+      "id": "a1b2c3d4",
+      "parentId": null,
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "message": {
+        "role": "user",
+        "content": "Hello"
+      }
+    }
+  ],
+  "workspace": {
+    "gitRemote": "git@github.com:owner/repository.git",
+    "branch": "main",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  }
+}

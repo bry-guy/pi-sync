@@ -1,0 +1,34 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - run: test -z "$(gofmt -d $(find cmd internal -name '*.go' -print))"
+        shell: bash
+      - run: go test -race ./...
+      - run: go vet ./...
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/pi-sync/package-lock.json
+      - run: npm ci --include=dev --prefix packages/pi-sync
+      - run: npm test --prefix packages/pi-sync

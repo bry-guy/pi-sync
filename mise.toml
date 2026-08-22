@@ -1,0 +1,34 @@
+[tools]
+go = "1.25.0"
+node = "22"
+
+[tasks.fmt]
+description = "Format Go and TypeScript sources"
+run = [
+  "gofmt -w cmd internal",
+  "npm --prefix packages/pi-sync run build"
+]
+
+[tasks.go-test]
+description = "Run Go tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.ts-test]
+description = "Build and test the TypeScript package"
+run = "npm --prefix packages/pi-sync test"
+
+[tasks.test]
+description = "Run the complete test suite"
+depends = ["go-test", "ts-test"]
+
+[tasks.check]
+description = "Run formatting, tests, and manifest checks"
+depends = ["test"]
+run = "git diff --check"
+
+[tasks.build]
+description = "Build the daemon and TypeScript package"
+run = [
+  "go build ./cmd/pi-syncd",
+  "npm --prefix packages/pi-sync run build"
+]

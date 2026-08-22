@@ -4,7 +4,16 @@
 for carrying Pi conversations between CLI installations and host applications
 such as pi-ez-web.
 
-The repository is currently in the planning stage. See
-[`docs/implementation-plan.md`](docs/implementation-plan.md) for the agreed
-architecture, implementation sequence, and cross-repository integration
-contract.
+The repository contains the v1 Go daemon (`pi-syncd`), reusable TypeScript
+client and JSONL session adapter, Pi extension and skill, protocol fixtures,
+and generic container/Kubernetes release artifacts.
+
+```sh
+mise run test
+PI_SYNC_DATA_DIR=.pi-sync-data go run ./cmd/pi-syncd
+```
+
+Set `PI_SYNC_SERVER_URL` for the Pi package, then install the package with
+`pi install ./packages/pi-sync` (after `npm --prefix packages/pi-sync run build`).
+See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the
+architecture and cross-repository integration contract.

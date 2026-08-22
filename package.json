@@ -1,0 +1,11 @@
+{
+  "name": "pi-sync-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/pi-sync"],
+  "scripts": {
+    "build": "npm --prefix packages/pi-sync run build",
+    "test": "npm --prefix packages/pi-sync test",
+    "check": "npm --prefix packages/pi-sync run check"
+  }
+}

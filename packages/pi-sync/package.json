@@ -1,0 +1,54 @@
+{
+  "name": "@earendil-works/pi-sync",
+  "version": "0.1.0",
+  "description": "Pi conversation synchronization client, extension, and workspace skill",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/src/protocol.d.ts",
+      "import": "./dist/src/protocol.js"
+    },
+    "./client": {
+      "types": "./dist/src/client/client.d.ts",
+      "import": "./dist/src/client/client.js"
+    },
+    "./session": {
+      "types": "./dist/src/session/index.d.ts",
+      "import": "./dist/src/session/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "extensions",
+    "README.md"
+  ],
+  "keywords": ["pi-package", "pi", "conversation", "sync"],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "npm run build",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "pi": {
+    "extensions": ["dist/extensions/sync.js"],
+    "skills": ["skills"]
+  }
+}

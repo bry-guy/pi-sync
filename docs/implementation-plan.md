@@ -1,6 +1,6 @@
 # pi-sync implementation plan
 
-Status: proposed implementation plan
+Status: implementation baseline (standalone service and Pi package implemented; pi-ez-web and infra integration remain cross-repository work)
 
 ## Context
 

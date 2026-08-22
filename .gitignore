@@ -1,0 +1,6 @@
+.DS_Store
+.pi-sync-data/
+node_modules/
+packages/pi-sync/node_modules/
+packages/pi-sync/dist/
+*.test

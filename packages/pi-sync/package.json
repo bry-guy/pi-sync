@@ -1,6 +1,6 @@
 {
   "name": "@bry-guy/pi-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi conversation synchronization client, extension, and workspace skill",
   "type": "module",
   "main": "./dist/src/index.js",

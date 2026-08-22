@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/earendil-works/pi-sync/internal/session"
+	"github.com/bry-guy/pi-sync/internal/session"
 )
 
 var (

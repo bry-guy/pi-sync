@@ -1,8 +1,9 @@
 # pi-sync
 
-`pi-sync` is a self-hosted, single-user synchronization service and Pi package
-for carrying Pi conversations between CLI installations and host applications
-such as pi-ez-web.
+`pi-sync` is a bry-guy-owned self-hosted, single-user synchronization service
+and Pi package for carrying Pi conversations between CLI installations and host
+applications such as pi-ez-web. It wraps and extends Pi from
+`@earendil-works/pi-coding-agent`.
 
 The repository contains the v1 Go daemon (`pi-syncd`), reusable TypeScript
 client and JSONL session adapter, Pi extension and skill, protocol fixtures,

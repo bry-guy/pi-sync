@@ -1,6 +1,8 @@
 # Generic Kubernetes manifests
 
-These manifests intentionally provide only the single-replica daemon, ClusterIP
-service, and generic PVC. The `infra` repository must supply the site-specific
-persistent volume, tailnet-only route, image pull configuration, and Argo CD
-Application. Pin the deployment image by digest during rollout.
+These manifests provide the single-replica daemon, ClusterIP service, and
+retained local PVC request required by the `infra` pi-sync deployment contract.
+The `infra` repository supplies the StorageClass, namespace, tailnet-only route,
+image pull Secret, and Argo CD Application. Replace the digest placeholder in
+`deployment.yaml` with the published immutable GHCR digest before enabling Argo
+CD.

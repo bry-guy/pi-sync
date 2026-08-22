@@ -1,10 +1,11 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pi-syncd-data
+  name: pi-sync-data
   labels:
     app.kubernetes.io/name: pi-syncd
 spec:
+  storageClassName: selfhost-pi-sync-local-retained
   accessModes:
     - ReadWriteOnce
   resources:

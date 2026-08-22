@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/earendil-works/pi-sync/internal/session"
+	"github.com/bry-guy/pi-sync/internal/session"
 )
 
 func storeEnvelope(id string) session.Envelope {

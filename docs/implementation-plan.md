@@ -15,6 +15,8 @@ not a remote agent runtime: models, tools, repositories, and worktrees remain
 on the client currently holding a conversation lease. The service carries the
 conversation plus a pointer to the last committed and pushed Git revision.
 
+This repository is owned by bry-guy. Pi itself is provided by `@earendil-works`; this project wraps Pi with a synchronization daemon, client, extension, and skill.
+
 The complete system is split across three repositories:
 
 - `pi-sync` owns the protocol, Go server, reusable TypeScript client, Pi
@@ -218,10 +220,11 @@ Implement:
 - `/sync`: fetch list metadata, show a normal `ctx.ui.select()` picker, acquire
   the selected lease, materialize under the current workspace, switch the Pi
   session, and navigate to the stored head.
-- `/sync start`: enroll the current persistent local session and begin its
+- `/sync start`: enroll the current persistent local session, or explicitly
+  repair a binding whose server record is missing, then begin its
   lease/heartbeat lifecycle.
-- `/sync status`: display server reachability, lease state, ETag state, and the
-  recorded upstream branch/commit.
+- `/sync status`: display server reachability, lease state, setup-required/ETag
+  state, and the recorded upstream branch/commit.
 
 A synchronized session opened through Pi's native local resume flow must verify
 its binding and current lease before accepting input. When it cannot safely
@@ -238,6 +241,10 @@ refresh an already-loaded manager, block input and direct the user through
 - On `session_shutdown`, attempt a final changed-session upload, then release.
 - If renewal fails transiently, mark the lease uncertain and block the next new
   prompt. Finish any already-running turn locally.
+- If any synchronization operation returns `session_not_found`, preserve the
+  local session, clear the lease, mark the binding `setup_required`, and wait
+  for an explicit `/sync start` repair confirmation. Never recreate in the
+  background.
 - If reacquisition finds the same ETag, upload normally. If it finds a new ETag,
   preserve the local materialization and surface a conflict without mutating
   either copy.

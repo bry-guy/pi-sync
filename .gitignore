@@ -4,3 +4,4 @@ node_modules/
 packages/pi-sync/node_modules/
 packages/pi-sync/dist/
 *.test
+/pi-syncd

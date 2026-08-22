@@ -4,6 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { WorkspacePointer } from "./protocol.js";
 
+export type SyncBindingState = "ready" | "setup_required";
+
 export interface SyncBinding {
   nativeSessionId: string;
   serverUrl: string;
@@ -16,6 +18,7 @@ export interface SyncBinding {
   workspace?: WorkspacePointer;
   parentSessionId?: string | null;
   title?: string;
+  state?: SyncBindingState;
 }
 
 interface BindingFile {
@@ -122,7 +125,8 @@ function isBinding(value: unknown): value is SyncBinding {
     (value.lastFingerprint === undefined || typeof value.lastFingerprint === "string") &&
     (value.workspace === undefined || isRecord(value.workspace)) &&
     (value.parentSessionId === undefined || value.parentSessionId === null || typeof value.parentSessionId === "string") &&
-    (value.title === undefined || typeof value.title === "string");
+    (value.title === undefined || typeof value.title === "string") &&
+    (value.state === undefined || value.state === "ready" || value.state === "setup_required");
 }
 
 function defaultAgentDir(): string {

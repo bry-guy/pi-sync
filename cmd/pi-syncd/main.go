@@ -10,15 +10,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/earendil-works/pi-sync/internal/api"
-	"github.com/earendil-works/pi-sync/internal/lease"
-	"github.com/earendil-works/pi-sync/internal/store"
+	"github.com/bry-guy/pi-sync/internal/api"
+	"github.com/bry-guy/pi-sync/internal/lease"
+	"github.com/bry-guy/pi-sync/internal/store"
 )
 
 func main() {
 	listen := os.Getenv("PI_SYNC_LISTEN")
 	if listen == "" {
-		listen = "127.0.0.1:8787"
+		listen = "127.0.0.1:8080"
 	}
 	dataDir := os.Getenv("PI_SYNC_DATA_DIR")
 	if dataDir == "" {

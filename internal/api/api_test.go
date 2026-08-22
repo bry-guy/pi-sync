@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/earendil-works/pi-sync/internal/lease"
-	"github.com/earendil-works/pi-sync/internal/session"
-	"github.com/earendil-works/pi-sync/internal/store"
+	"github.com/bry-guy/pi-sync/internal/lease"
+	"github.com/bry-guy/pi-sync/internal/session"
+	"github.com/bry-guy/pi-sync/internal/store"
 )
 
 func apiEnvelope() session.Envelope {

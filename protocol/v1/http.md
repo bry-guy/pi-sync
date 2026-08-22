@@ -51,7 +51,8 @@ Errors are JSON objects with a stable machine code:
 
 Important statuses are:
 
-- `409 duplicate_enrollment`: the session ID already exists.
+- `404 session_not_found`: a previously bound session no longer exists on the server; the client preserves its local copy and requires explicit re-enrollment.
+- `409 duplicate_enrollment`: the session ID already exists. Repair clients never overwrite the existing copy.
 - `412 stale_etag`: the submitted base is no longer canonical.
 - `423 active_lease` / `lease_invalid`: another client owns the lease or the
   token is no longer valid.
@@ -59,4 +60,6 @@ Important statuses are:
 
 The server never merges conversation entries and never overwrites a stale
 base. Clients preserve their local materialization when an update receives
-`412`.
+`412`. A missing server record is not recreated automatically in the background;
+the Pi extension marks the local binding as requiring setup and `/sync start`
+explicitly re-enrolls the local session after confirmation.

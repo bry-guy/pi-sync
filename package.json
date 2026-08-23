@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "workspaces": ["packages/pi-sync"],
+  "pi": {
+    "extensions": ["packages/pi-sync/extensions/sync.ts"],
+    "skills": ["packages/pi-sync/skills"]
+  },
   "scripts": {
     "build": "npm --prefix packages/pi-sync run build",
     "test": "npm --prefix packages/pi-sync test",

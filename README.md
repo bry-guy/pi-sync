@@ -14,7 +14,12 @@ mise run test
 PI_SYNC_DATA_DIR=.pi-sync-data go run ./cmd/pi-syncd
 ```
 
-Set `PI_SYNC_SERVER_URL` for the Pi package, then install the package with
-`pi install ./packages/pi-sync` (after `npm --prefix packages/pi-sync run build`).
-See [`docs/implementation-plan.md`](docs/implementation-plan.md) for the
+Set `PI_SYNC_SERVER_URL` for the Pi package, then install it directly from Git:
+
+```sh
+pi install git:github.com/bry-guy/pi-sync
+```
+
+For a local checkout, run `pi install .` from the repository root instead. See
+[`docs/implementation-plan.md`](docs/implementation-plan.md) for the
 architecture and cross-repository integration contract.

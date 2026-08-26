@@ -1,6 +1,6 @@
 # pi-sync implementation plan
 
-Status: implementation baseline (standalone service and Pi package implemented; pi-ez-web and infra integration remain cross-repository work)
+Status: implementation baseline (protocol, CLI handoff, pi-ez-web refresh, and vendored client integration implemented; deployment rollout remains separate)
 
 ## Context
 
@@ -34,8 +34,9 @@ The complete system is split across three repositories:
   the homelab deployment will use Tailscale and tailnet ACLs.
 - Every enrolled conversation has one canonical snapshot on `pi-syncd`.
 - A client must hold the conversation's exclusive lease to update it.
-- CLI clients hold a lease while the synchronized session is open. Host clients
-  such as pi-ez-web may acquire a lease only around a run or other mutation.
+- CLI clients acquire a lease for each durable turn and release it after the
+  settled snapshot uploads. Host clients such as pi-ez-web acquire a lease only
+  around a run, refresh, or other mutation.
 - Clients upload complete settled snapshots. The server uses opaque ETags for
   compare-and-swap and never overwrites a stale base.
 - A background heartbeat renews a lease independently of model streaming and
@@ -218,10 +219,10 @@ that identity through the conversation.
 Implement:
 
 - `/sync`: fetch list metadata, show a normal `ctx.ui.select()` picker, acquire
-  the selected lease, materialize under the current workspace, switch the Pi
-  session, and navigate to the stored head.
+  the selected lease, materialize under the current workspace, release the
+  lease, switch the Pi session, and navigate to the stored head.
 - `/sync start`: enroll the current persistent local session, or explicitly
-  repair a binding whose server record is missing, then begin its
+  repair a binding whose server record is missing. The next prompt starts the
   lease/heartbeat lifecycle.
 - `/sync status`: display server reachability, lease state, setup-required/ETag
   state, and the recorded upstream branch/commit.
@@ -233,14 +234,16 @@ refresh an already-loaded manager, block input and direct the user through
 
 ### Lifecycle
 
-- Start the heartbeat after enrollment or acquisition and renew independently
-  of agent activity.
+- Do not acquire a lease when a synchronized session is merely opened. Acquire
+  on idle input, then renew independently during the agent turn.
 - On `agent_settled`, normalize the complete session using the manager's current
-  leaf, derive the current upstream Git pointer, and upload with the lease token
-  and base ETag.
-- On `session_shutdown`, attempt a final changed-session upload, then release.
+  leaf, derive the current upstream Git pointer, upload with the lease token and
+  base ETag, then release the lease.
+- On `session_shutdown`, settle an active turn or retry its pending release; do
+  not acquire a fresh lease.
 - If renewal fails transiently, mark the lease uncertain and block the next new
-  prompt. Finish any already-running turn locally.
+  prompt. Finish any already-running turn locally and retain the token for a
+  safe upload/release retry.
 - If any synchronization operation returns `session_not_found`, preserve the
   local session, clear the lease, mark the binding `setup_required`, and wait
   for an explicit `/sync start` repair confirmation. Never recreate in the

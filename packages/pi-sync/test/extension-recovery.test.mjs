@@ -33,8 +33,7 @@ test("explicitly repairs a missing server record from the local session", async 
       canonicalSessionId: "session-1",
       lastEtag: "old-etag",
       materializedFile: sessionPath,
-      leaseToken: "old-token",
-      state: "ready",
+      state: "setup_required",
     });
 
     globalThis.fetch = async (url, init = {}) => {
@@ -86,13 +85,19 @@ test("explicitly repairs a missing server record from the local session", async 
 
     await handlers.get("session_start")({}, ctx);
     assert.equal((await new BindingStore(root).get("session-1")).state, "setup_required");
+    assert.equal(acquireCount, 0);
 
     await handlers.get("command:sync")("start", ctx);
     const repaired = await new BindingStore(root).get("session-1");
     assert.equal(repaired.state, "ready");
     assert.equal(repaired.lastEtag, "new-etag");
-    assert.equal(repaired.leaseToken, "new-token");
+    assert.equal(repaired.leaseToken, undefined);
     assert.equal(createCount, 1);
+    assert.equal(acquireCount, 0);
+
+    await handlers.get("input")({}, ctx);
+    const leased = await new BindingStore(root).get("session-1");
+    assert.equal(leased.leaseToken, "new-token");
     assert.equal(acquireCount, 1);
 
     await handlers.get("session_shutdown")({}, ctx);

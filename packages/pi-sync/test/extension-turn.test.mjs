@@ -58,6 +58,7 @@ async function harness(fetch) {
     notices,
     statuses,
     store: new BindingStore(root),
+    async binding() { return new BindingStore(root).get(envelope.sessionId); },
     async close() {
       globalThis.fetch = previousFetch;
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -97,6 +98,7 @@ test("acquires per input, settles PUT before DELETE, and reacquires next input",
   const requests = [];
   const fake = await harness(async (url, init = {}) => {
     requests.push({ path: new URL(url).pathname, method: init.method });
+    if (init.method === "POST" && new URL(url).pathname.endsWith("/lease/renew")) return responseForRenew("e1");
     if (init.method === "POST" && new URL(url).pathname.endsWith("/lease")) {
       return responseForLease(requests.filter((request) => request.method === "POST").length === 1 ? "token-1" : "token-2", requests.filter((request) => request.method === "POST").length === 1 ? "e1" : "e2");
     }
@@ -117,15 +119,17 @@ test("acquires per input, settles PUT before DELETE, and reacquires next input",
     assert.deepEqual(requests, []);
 
     assert.deepEqual(await fake.handlers.get("input")({}, fake.ctx), { action: "continue" });
+    assert.deepEqual(await fake.handlers.get("input")({ streamingBehavior: "followUp" }, fake.ctx), { action: "continue" });
+    assert.deepEqual(requests.map(({ method }) => method), ["POST", "POST"]);
     assert.deepEqual(await fake.handlers.get("agent_settled")({}, fake.ctx), undefined);
-    assert.deepEqual(requests.map(({ method }) => method), ["POST", "PUT", "DELETE"]);
-    const settled = await fake.store.get(envelope.sessionId);
+    assert.deepEqual(requests.map(({ method }) => method), ["POST", "POST", "PUT", "DELETE"]);
+    const settled = await fake.binding();
     assert.equal(settled.lastEtag, "e2");
     assert.equal(settled.leaseToken, undefined);
     assert.equal(settled.leaseExpiresAt, undefined);
 
     assert.deepEqual(await fake.handlers.get("input")({}, fake.ctx), { action: "continue" });
-    assert.deepEqual(requests.map(({ method }) => method), ["POST", "PUT", "DELETE", "POST"]);
+    assert.deepEqual(requests.map(({ method }) => method), ["POST", "POST", "PUT", "DELETE", "POST"]);
     await fake.handlers.get("session_shutdown")({}, fake.ctx);
   } finally {
     await fake.close();
@@ -157,7 +161,7 @@ test("failed PUT blocks without DELETE and preserves the local session and bindi
     await fake.handlers.get("agent_settled")({}, fake.ctx);
     assert.equal((await readFile(fake.sessionPath, "utf8")), before);
     assert.deepEqual(requests.map(({ method }) => method), ["POST", "PUT"]);
-    const failed = await fake.store.get(envelope.sessionId);
+    const failed = await fake.binding();
     assert.equal(failed.leaseToken, "token-1");
     assert.equal(failed.lastEtag, "e1");
     assert.equal(failed.lastFingerprint, "old-fingerprint");
@@ -198,7 +202,7 @@ test("stale PUT releases safely and preserves the local binding base", async () 
     await fake.handlers.get("agent_settled")({}, fake.ctx);
     assert.deepEqual(requests.map(({ method }) => method), ["POST", "PUT", "DELETE"]);
     assert.equal((await readFile(fake.sessionPath, "utf8")), before);
-    const binding = await fake.store.get(envelope.sessionId);
+    const binding = await fake.binding();
     assert.equal(binding.leaseToken, undefined);
     assert.equal(binding.lastEtag, "e1");
     assert.equal(binding.lastFingerprint, "old-fingerprint");
@@ -239,12 +243,12 @@ test("release failure retains the committed token for a delete-only retry", asyn
     await fake.handlers.get("session_start")({}, fake.ctx);
     await fake.handlers.get("input")({}, fake.ctx);
     await fake.handlers.get("agent_settled")({}, fake.ctx);
-    assert.equal((await fake.store.get(envelope.sessionId)).leaseToken, "token-1");
+    assert.equal((await fake.binding()).leaseToken, "token-1");
     assert.equal(fake.statuses.some((status) => String(status).includes("committed")), false);
 
     assert.deepEqual(await fake.handlers.get("input")({}, fake.ctx), { action: "continue" });
     assert.deepEqual(requests.map(({ method }) => method), ["POST", "PUT", "DELETE", "POST", "DELETE", "POST"]);
-    assert.equal((await fake.store.get(envelope.sessionId)).leaseToken, "token-2");
+    assert.equal((await fake.binding()).leaseToken, "token-2");
     await fake.handlers.get("session_shutdown")({}, fake.ctx);
   } finally {
     await fake.close();
@@ -286,7 +290,7 @@ test("expired persisted leases reacquire only on input when the ETag is unchange
       "DELETE /v1/sessions/session-1/lease",
       "POST /v1/sessions/session-1/lease",
     ]);
-    assert.equal((await fake.store.get(envelope.sessionId)).leaseToken, "turn-token");
+    assert.equal((await fake.binding()).leaseToken, "turn-token");
     await fake.handlers.get("session_shutdown")({}, fake.ctx);
   } finally {
     await fake.close();
@@ -323,7 +327,7 @@ test("expired-token ETag mismatch preserves the local binding and blocks input",
       "DELETE /v1/sessions/session-1/lease",
     ]);
     assert.equal((await readFile(fake.sessionPath, "utf8")), before);
-    const blocked = await fake.store.get(envelope.sessionId);
+    const blocked = await fake.binding();
     assert.equal(blocked.leaseToken, undefined);
     assert.equal(blocked.lastEtag, "e1");
     assert.equal(blocked.lastFingerprint, "old-fingerprint");
@@ -358,7 +362,7 @@ test("ETag conflict and active lease block without changing local state", async 
       const before = await readFile(fake.sessionPath, "utf8");
       assert.deepEqual(await fake.handlers.get("input")({}, fake.ctx), { action: "handled" });
       assert.equal((await readFile(fake.sessionPath, "utf8")), before);
-      const blocked = await fake.store.get(envelope.sessionId);
+      const blocked = await fake.binding();
       assert.equal(blocked.leaseToken, undefined);
       assert.equal(blocked.lastEtag, "e1");
       assert.match(fake.notices.join(" "), mode === "etag" ? /\/sync/ : /use/);

@@ -624,7 +624,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     return skillPath ? { skillPaths: [skillPath] } : undefined;
   });
 
-  pi.on("input", async (_event, ctx) => {
+  pi.on("input", async (event, ctx) => {
     if (!currentSessionId) return { action: "continue" as const };
     let binding = await store.get(currentSessionId);
     if (!binding) return { action: "continue" as const };
@@ -640,12 +640,14 @@ export default function syncExtension(pi: ExtensionAPI) {
       }
       binding = await store.get(currentSessionId);
       if (!binding) return { action: "continue" as const };
-      if (!(await completeTurn(ctx, false))) {
-        showBlocked(ctx);
-        return { action: "handled" as const };
+      if (event.streamingBehavior === undefined) {
+        if (!(await completeTurn(ctx, false))) {
+          showBlocked(ctx);
+          return { action: "handled" as const };
+        }
+        binding = await store.get(currentSessionId);
+        if (!binding) return { action: "continue" as const };
       }
-      binding = await store.get(currentSessionId);
-      if (!binding) return { action: "continue" as const };
     }
     if (ready()) return { action: "continue" as const };
     if (!(await acquireBinding(ctx, binding))) {

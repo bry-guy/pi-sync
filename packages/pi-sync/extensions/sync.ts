@@ -543,20 +543,32 @@ export default function syncExtension(pi: ExtensionAPI) {
       } else {
         notify(ctx, "The synchronized session was materialized, but its lease could not be released; the next prompt will retry.", "warning");
       }
-      const result = await ctx.switchSession(target, {
-        withSession: async (replacement) => {
-          await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), acquired.session.headEntryId);
-          replacement.ui.notify("Synchronized conversation opened. The next prompt will acquire its lease.", "info");
-        },
-      });
-      if (result.cancelled) {
-        if (!released) await releasePickerLease();
-        if (stored && released) await store.remove(targetBinding.nativeSessionId);
-      }
     } catch (error) {
       if (!released) await releasePickerLease();
       if (stored && released) await store.remove(targetBinding.nativeSessionId).catch(() => undefined);
       notify(ctx, error instanceof Error ? error.message : "Could not open synchronized session.", "error");
+      return;
+    }
+
+    let result;
+    try {
+      result = await ctx.switchSession(target, {
+        withSession: async (replacement) => {
+          try {
+            await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), acquired.session.headEntryId);
+            replacement.ui.notify("Synchronized conversation opened. The next prompt will acquire its lease.", "info");
+          } catch (error) {
+            replacement.ui.notify(error instanceof Error ? error.message : "Could not restore synchronized conversation head.", "error");
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Could not open synchronized session.", error);
+      return;
+    }
+    if (result.cancelled) {
+      if (!released) await releasePickerLease();
+      if (stored && released) await store.remove(targetBinding.nativeSessionId);
     }
   };
 
@@ -677,7 +689,10 @@ export default function syncExtension(pi: ExtensionAPI) {
       return { cancel: true as const };
     }
   };
-  pi.on("session_before_tree", async (_event, ctx) => guardDurableMutation(ctx));
+  pi.on("session_before_tree", async (event, ctx) => {
+    if (!event.preparation.userWantsSummary) return;
+    return guardDurableMutation(ctx);
+  });
   pi.on("session_before_compact", async (_event, ctx) => guardDurableMutation(ctx));
   pi.on("session_before_fork", async (_event, ctx) => guardDurableMutation(ctx));
 

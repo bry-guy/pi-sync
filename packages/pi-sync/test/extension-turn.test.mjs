@@ -372,3 +372,79 @@ test("ETag conflict and active lease block without changing local state", async 
     }
   }
 });
+
+test("opens a synchronized session without crashing on replacement errors", async () => {
+  const previousUrl = process.env.PI_SYNC_SERVER_URL;
+  process.env.PI_SYNC_SERVER_URL = "http://sync.test";
+  const requests = [];
+  const fake = await harness(async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    requests.push({ path, method: init.method });
+    if (path === "/v1/sessions" && init.method === "GET") {
+      return Response.json({
+        formatVersion: 1,
+        sessions: [{
+          sessionId: envelope.sessionId,
+          title: "Synced session",
+          createdAt: envelope.createdAt,
+          headEntryId: envelope.headEntryId,
+          etag: "e1",
+          leaseHolder: null,
+          leaseExpiresAt: null,
+        }],
+      });
+    }
+    if (path.endsWith("/lease") && init.method === "POST") return responseForLease("picker-token");
+    if (path.endsWith("/lease") && init.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  });
+  const replacementNotices = [];
+  let switched = false;
+  let guardCancelled;
+  try {
+    fake.ctx.ui.notify = (message) => {
+      if (switched) throw new Error("stale command context used");
+      fake.notices.push(message);
+    };
+    fake.ctx.ui.select = async () => "Synced session — available";
+    fake.ctx.switchSession = async (target, options) => {
+      switched = true;
+      const replacement = {
+        hasUI: true,
+        cwd: fake.root,
+        ui: {
+          notify: (message) => replacementNotices.push(message),
+          setStatus() {},
+        },
+        sessionManager: {
+          getSessionId: () => envelope.sessionId,
+          getSessionFile: () => target,
+          getSessionDir: () => fake.root,
+          getLeafId: () => envelope.headEntryId,
+          getSessionName: () => envelope.title,
+        },
+        navigateTree: async (_id, navigateOptions) => {
+          const result = await fake.handlers.get("session_before_tree")({
+            preparation: { userWantsSummary: navigateOptions?.summarize === true },
+            signal: new AbortController().signal,
+          }, replacement);
+          guardCancelled = result?.cancel === true;
+          if (guardCancelled) return { cancelled: true };
+          throw new Error("head restoration failed");
+        },
+      };
+      await fake.handlers.get("session_start")({}, replacement);
+      await options.withSession(replacement);
+      return { cancelled: false };
+    };
+    await fake.handlers.get("command:sync")("", fake.ctx);
+    assert.equal(guardCancelled, false);
+    assert.match(replacementNotices.join(" "), /head restoration failed/);
+    assert.equal(fake.notices.length, 0);
+    assert.deepEqual(requests.map(({ method }) => method), ["GET", "POST", "DELETE"]);
+  } finally {
+    if (previousUrl === undefined) delete process.env.PI_SYNC_SERVER_URL;
+    else process.env.PI_SYNC_SERVER_URL = previousUrl;
+    await fake.close();
+  }
+});

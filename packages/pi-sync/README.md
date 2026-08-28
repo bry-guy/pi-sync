@@ -9,5 +9,7 @@ and `synchronized-workspace` skill.
 The extension expects `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) and is intended
 to be installed as a trusted Pi package. Use `/sync start` to enroll a local
 session, or to explicitly recreate a server record that is reported missing.
-Lease tokens are device-local state; they are never written to synchronized
-session entries or Git metadata.
+The `/sync` picker limits choices to the current normalized Git repository when
+Git information is available; unscoped conversations remain separate. Lease
+tokens are device-local state; they are never written to synchronized session
+entries or Git metadata.

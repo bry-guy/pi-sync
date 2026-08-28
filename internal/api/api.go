@@ -60,6 +60,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		repository, scoped, err := requestedRepository(r)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_repository", "repository scope is invalid", nil)
+			return
+		}
 		records, err := s.store.List()
 		if err != nil {
 			s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session store is unavailable", nil)
@@ -67,6 +72,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		sessions := make([]metadata, 0, len(records))
 		for _, record := range records {
+			if scoped && session.RepositoryIdentity(record.Envelope.Workspace) != repository {
+				continue
+			}
 			sessions = append(sessions, s.metadata(record))
 		}
 		sort.Slice(sessions, func(i, j int) bool {
@@ -155,7 +163,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 	var request struct {
-		Holder string `json:"holder"`
+		Holder     string  `json:"holder"`
+		Repository *string `json:"repository"`
 	}
 	if !s.readJSON(w, r, &request) {
 		return
@@ -167,6 +176,21 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 	record, err := s.store.Get(id)
 	if err != nil {
 		s.writeStoreError(w, err)
+		return
+	}
+	repository := session.UnscopedRepository
+	if request.Repository != nil {
+		repository, err = normalizeRequestedRepository(*request.Repository)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_repository", "repository scope is invalid", nil)
+			return
+		}
+	} else if record.Envelope.Workspace != nil {
+		s.writeError(w, http.StatusConflict, "workspace_required", "repository scope is required for this conversation", nil)
+		return
+	}
+	if session.RepositoryIdentity(record.Envelope.Workspace) != repository {
+		s.writeError(w, http.StatusConflict, "workspace_mismatch", "conversation belongs to a different Git repository", nil)
 		return
 	}
 	current, err := s.leases.Acquire(id, request.Holder)
@@ -259,6 +283,15 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusBadRequest, "invalid_session", "envelope session id does not match URL", nil)
 		return
 	}
+	current, err := s.store.Get(id)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if session.RepositoryIdentity(current.Envelope.Workspace) != session.RepositoryIdentity(envelope.Workspace) {
+		s.writeError(w, http.StatusConflict, "workspace_mismatch", "conversation belongs to a different Git repository", nil)
+		return
+	}
 	record, err := s.store.Update(id, ifMatch, envelope)
 	if err != nil {
 		var stale *store.StaleETagError
@@ -281,6 +314,36 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		"session":       record.Envelope,
 		"etag":          record.ETag,
 	})
+}
+
+func requestedRepository(r *http.Request) (string, bool, error) {
+	values, present := r.URL.Query()["repository"]
+	if !present {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", true, errors.New("repository scope must be supplied once")
+	}
+	repository, err := normalizeRequestedRepository(values[0])
+	if err != nil {
+		return "", true, err
+	}
+	return repository, true, nil
+}
+
+func normalizeRequestedRepository(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > session.MaxWorkspaceField || strings.ContainsAny(value, "\r\n\x00") {
+		return "", errors.New("invalid repository scope")
+	}
+	if value == session.UnscopedRepository {
+		return value, nil
+	}
+	value = session.NormalizeGitRemote(value)
+	if value == "" {
+		return "", errors.New("invalid repository scope")
+	}
+	return value, nil
 }
 
 func (s *Server) metadata(record store.Record) metadata {

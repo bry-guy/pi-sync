@@ -130,11 +130,15 @@ DELETE /v1/sessions/:id/lease
 ```
 
 `GET /v1/sessions` returns only list metadata, current ETag, lease holder label,
-lease expiry, and workspace pointer. Acquiring a lease returns the complete
-snapshot and an opaque random lease token. Updating requires both the token and
-`If-Match` ETag. Errors use stable machine codes with conventional HTTP status:
-`409` for duplicate enrollment, `412` for a stale ETag, and `423` for an active
-lease.
+lease expiry, and workspace pointer. It accepts an optional `repository` query
+value; `none` selects unscoped sessions and any other value is a normalized Git
+remote identity. Acquiring a lease returns the complete snapshot and an opaque
+random lease token. Acquisition accepts the same repository value and rejects a
+missing or mismatched scope for Git-scoped sessions. Updating requires both the
+token and `If-Match` ETag and cannot change or remove an established repository
+scope. Errors use stable machine codes with conventional HTTP status: `409` for
+duplicate enrollment or workspace scope mismatch, `412` for a stale ETag, and
+`423` for an active lease.
 
 No browser talks directly to this API in the first integration; CLI extensions
 and server-side adapters are the clients.

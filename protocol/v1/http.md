@@ -20,7 +20,7 @@ are not synchronized.
 | Method | Path | Response |
 | --- | --- | --- |
 | GET | `/v1/health` | protocol and lease timing |
-| GET | `/v1/sessions` | metadata, ETags, lease display, workspace pointers |
+| GET | `/v1/sessions` | metadata, ETags, lease display, workspace pointers (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
 | POST | `/v1/sessions/:id/lease` | acquire lease and return complete snapshot |
 | POST | `/v1/sessions/:id/lease/renew` | renew lease |
@@ -32,7 +32,11 @@ Lease tokens are returned only by acquisition and are sent in
 as compatibility aliases. Updates must also send `If-Match` with the exact ETag
 returned by acquisition or the previous update.
 
-Acquisition accepts `{ "holder": "display-only device label" }`. The default
+Acquisition accepts `{ "holder": "display-only device label", "repository": "normalized repository identity" }`.
+The optional `repository` value is `none` for an unscoped conversation. A
+scoped conversation requires a matching repository value; mismatches return
+`409 workspace_mismatch`, and missing scope returns `409 workspace_required`.
+`GET /v1/sessions?repository=<value>` applies the same filter. The default
 lease heartbeat is 20 seconds and expiry is 120 seconds. A restart clears all
 leases.
 
@@ -53,6 +57,8 @@ Important statuses are:
 
 - `404 session_not_found`: a previously bound session no longer exists on the server; the client preserves its local copy and requires explicit re-enrollment.
 - `409 duplicate_enrollment`: the session ID already exists. Repair clients never overwrite the existing copy.
+- `409 workspace_mismatch` / `workspace_required`: the requested repository
+  scope does not match the canonical conversation.
 - `412 stale_etag`: the submitted base is no longer canonical.
 - `423 active_lease` / `lease_invalid`: another client owns the lease or the
   token is no longer valid.

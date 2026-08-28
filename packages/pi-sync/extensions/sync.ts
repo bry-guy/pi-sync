@@ -13,8 +13,10 @@ import {
   SyncClient,
   SyncClientError,
   type SessionEnvelope,
+  deriveRepositoryIdentity,
   deriveWorkspacePointer,
   materializeSessionFile,
+  repositoryIdentity,
   normalizeSessionFile,
   restoreHead,
   stableEnvelopeFingerprint,
@@ -23,7 +25,7 @@ import {
 const HEARTBEAT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 
-type BlockReason = "active_lease" | "uncertain" | "conflict" | "unreachable" | "setup_required" | "invalid";
+type BlockReason = "active_lease" | "uncertain" | "conflict" | "unreachable" | "setup_required" | "workspace_mismatch" | "invalid";
 
 type ActiveLease = {
   binding: SyncBinding;
@@ -100,7 +102,9 @@ export default function syncExtension(pi: ExtensionAPI) {
           ? "The sync server no longer has this conversation. Run /sync start to set it up again from this local copy."
           : blocked === "invalid"
             ? "This file is not the recorded synchronized materialization. Use /sync to open the canonical copy safely."
-            : "The synchronized conversation lease is uncertain. Pi will not accept another prompt until it can safely reacquire it.";
+            : blocked === "workspace_mismatch"
+              ? "The synchronized conversation belongs to a different Git repository. Open it from its repository workspace."
+              : "The synchronized conversation lease is uncertain. Pi will not accept another prompt until it can safely reacquire it.";
     notify(ctx, text, "warning");
   };
 
@@ -177,6 +181,11 @@ export default function syncExtension(pi: ExtensionAPI) {
     let token = binding.leaseToken;
     let expiresAt = binding.leaseExpiresAt;
     let etag = binding.lastEtag;
+    const repository = await repositoryForPicker(ctx);
+    if (repositoryIdentity(binding.workspace) !== repository) {
+      markBlocked(ctx, "workspace_mismatch");
+      return false;
+    }
 
     if (token) {
       try {
@@ -208,7 +217,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         return false;
       }
       try {
-        const acquired = await client.acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS });
+        const acquired = await client.acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS, repository: repository ?? null });
         if (etag && acquired.etag !== etag) {
           try {
             await client.release(binding.canonicalSessionId, acquired.lease.token);
@@ -227,6 +236,7 @@ export default function syncExtension(pi: ExtensionAPI) {
           await markSetupRequired(ctx, binding);
         } else if (error instanceof SyncClientError && error.code === "active_lease") markBlocked(ctx, "active_lease");
         else if (error instanceof SyncClientError && ["network_error", "timeout"].includes(error.code)) markBlocked(ctx, "unreachable");
+        else if (error instanceof SyncClientError && ["workspace_mismatch", "workspace_required"].includes(error.code)) markBlocked(ctx, "workspace_mismatch");
         else markBlocked(ctx, "uncertain");
         return false;
       }
@@ -248,10 +258,22 @@ export default function syncExtension(pi: ExtensionAPI) {
     return activateBinding(ctx, binding, true);
   };
 
-  const workspaceFor = async (ctx: ExtensionContext) => deriveWorkspacePointer(ctx.cwd, async (command, args) => {
+  const gitRunnerFor = (ctx: ExtensionContext) => async (command: string, args: string[]) => {
     const result = await pi.exec(command, args, { cwd: ctx.cwd, timeout: 5_000 });
     return { stdout: result.stdout, code: result.code };
-  });
+  };
+
+  const workspaceFor = async (ctx: ExtensionContext) => deriveWorkspacePointer(ctx.cwd, gitRunnerFor(ctx));
+
+  const repositoryFor = async (ctx: ExtensionContext) => deriveRepositoryIdentity(ctx.cwd, gitRunnerFor(ctx));
+
+  const repositoryForPicker = async (ctx: ExtensionContext) => {
+    try {
+      return await repositoryFor(ctx);
+    } catch {
+      return undefined;
+    }
+  };
 
   const normalizeCurrent = async (ctx: ExtensionContext, binding?: SyncBinding): Promise<{ envelope: SessionEnvelope; path: string }> => {
     const path = ctx.sessionManager.getSessionFile();
@@ -447,30 +469,42 @@ export default function syncExtension(pi: ExtensionAPI) {
       notify(ctx, "The synchronized-session picker requires Pi interactive UI.", "error");
       return;
     }
+    const repository = await repositoryForPicker(ctx);
     let list;
     try {
-      list = await clientFor(url).list();
+      list = await clientFor(url).list({ repository: repository ?? null });
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : "Could not list synchronized sessions.", "error");
       return;
     }
-    if (list.sessions.length === 0) {
-      notify(ctx, "No synchronized conversations are enrolled yet. Use /sync start.", "info");
+    const sessions = list.sessions.filter((item) => repositoryIdentity(item.workspace) === repository);
+    if (sessions.length === 0) {
+      notify(ctx, repository
+        ? "No synchronized conversations are available for this Git repository."
+        : "No unscoped synchronized conversations are available here.", "info");
       return;
     }
-    const rows = list.sessions.map((item) => ({
+    const rows = sessions.map((item) => ({
       item,
       label: `${item.title || item.sessionId} — ${item.leaseHolder ? `in use by ${item.leaseHolder}` : "available"}`,
     }));
     const selected = await ctx.ui.select("Synchronized conversations", rows.map((row) => row.label));
     if (!selected) return;
     const row = rows.find((candidate) => candidate.label === selected);
-    if (!row) return;
+    if (!row || repositoryIdentity(row.item.workspace) !== repository) {
+      notify(ctx, "The selected conversation belongs to a different Git repository.", "error");
+      return;
+    }
     let acquired;
     try {
-      acquired = await clientFor(url).acquire(row.item.sessionId, deviceLabel);
+      acquired = await clientFor(url).acquire(row.item.sessionId, deviceLabel, { repository: repository ?? null });
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : "Could not acquire synchronized session.", "error");
+      return;
+    }
+    if (repositoryIdentity(acquired.session.workspace) !== repository) {
+      await clientFor(url).release(acquired.session.sessionId, acquired.lease.token).catch(() => undefined);
+      notify(ctx, "The selected conversation belongs to a different Git repository.", "error");
       return;
     }
     const sessionDir = ctx.sessionManager.getSessionDir();

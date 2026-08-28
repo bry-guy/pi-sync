@@ -33,13 +33,15 @@ function responder() {
 test("client validates responses and sends lease/CAS headers", async () => {
   const fake = responder();
   const client = new SyncClient({ baseUrl: "http://sync.test/", fetch: fake.fetch });
-  const list = await client.list();
+  const list = await client.list({ repository: "github.com/owner/repo" });
   assert.equal(list.sessions[0].sessionId, "session-1");
-  const acquired = await client.acquire("session-1", "device");
+  assert.equal(new URL(fake.requests[0].url).search, "?repository=github.com%2Fowner%2Frepo");
+  const acquired = await client.acquire("session-1", "device", { repository: "github.com/owner/repo" });
   assert.equal(acquired.lease.token, "secret-token");
   await client.release("session-1", acquired.lease.token);
   const acquireRequest = fake.requests.find((entry) => entry.init.method === "POST");
   assert.match(acquireRequest.init.body, /device/);
+  assert.deepEqual(JSON.parse(acquireRequest.init.body), { holder: "device", repository: "github.com/owner/repo" });
   assert.equal(fake.requests.at(-1).init.headers["X-Pi-Sync-Lease"], "secret-token");
 });
 

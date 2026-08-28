@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deriveWorkspacePointer, materializeNativeJsonl, normalizeNativeJsonl, restoreHead } from "../dist/src/session/index.js";
+import { deriveRepositoryIdentity, deriveWorkspacePointer, materializeNativeJsonl, normalizeNativeJsonl, repositoryIdentity, restoreHead } from "../dist/src/session/index.js";
 
 test("normalizes and materializes a portable Pi JSONL session", async () => {
   const native = [
@@ -37,6 +37,32 @@ test("derives only the pushed upstream workspace pointer", async () => {
     commit: "0123456789abcdef0123456789abcdef01234567",
   });
   assert.equal(calls.length, 3);
+});
+
+test("normalizes equivalent Git remote forms to one repository identity", () => {
+  assert.equal(repositoryIdentity("git@github.com:owner/repo.git"), "github.com/owner/repo");
+  assert.equal(repositoryIdentity("https://user:secret@github.com/owner/repo.git?token=secret"), "github.com/owner/repo");
+  assert.notEqual(repositoryIdentity("https://github.com/owner/repo.git"), repositoryIdentity("https://github.com/other/repo.git"));
+});
+
+test("derives a repository identity when the current branch has no upstream", async () => {
+  const workspace = await deriveRepositoryIdentity("/work", async (_command, args) => {
+    if (args[0] === "rev-parse") return { stdout: "", code: 1 };
+    if (args[0] === "remote" && args[1] === "get-url" && args[2] === "origin") return { stdout: "https://github.com/owner/repo.git\n", code: 0 };
+    return { stdout: "", code: 1 };
+  });
+  assert.equal(workspace, "github.com/owner/repo");
+});
+
+test("falls back to the first Git remote when origin is unavailable", async () => {
+  const repository = await deriveRepositoryIdentity("/work", async (_command, args) => {
+    if (args[0] === "rev-parse") return { stdout: "", code: 1 };
+    if (args[0] === "remote" && args[1] === "get-url" && args[2] === "origin") return { stdout: "", code: 2 };
+    if (args[0] === "remote" && args.length === 1) return { stdout: "upstream\n", code: 0 };
+    if (args[0] === "remote" && args[1] === "get-url" && args[2] === "upstream") return { stdout: "git@github.com:owner/repo.git\n", code: 0 };
+    return { stdout: "", code: 1 };
+  });
+  assert.equal(repository, "github.com/owner/repo");
 });
 
 test("restores the canonical head through Pi navigation", async () => {

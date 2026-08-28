@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -30,6 +31,51 @@ type Workspace struct {
 	GitRemote string `json:"gitRemote"`
 	Branch    string `json:"branch"`
 	Commit    string `json:"commit"`
+}
+
+const UnscopedRepository = "none"
+
+func RepositoryIdentity(workspace *Workspace) string {
+	if workspace == nil {
+		return UnscopedRepository
+	}
+	return NormalizeGitRemote(workspace.GitRemote)
+}
+
+func NormalizeGitRemote(value string) string {
+	remote := strings.TrimSpace(value)
+	if remote == "" {
+		return ""
+	}
+	if !strings.Contains(remote, "://") {
+		if separator := strings.IndexByte(remote, ':'); separator > 0 {
+			host := remote[:separator]
+			if at := strings.LastIndexByte(host, '@'); at >= 0 {
+				host = host[at+1:]
+			}
+			if host != "" && !strings.Contains(host, "/") && separator+1 < len(remote) {
+				return repositoryHostPath(host, remote[separator+1:])
+			}
+		}
+		return remote
+	}
+	parsed, err := url.Parse(remote)
+	if err != nil || parsed.Hostname() == "" {
+		return remote
+	}
+	host := strings.ToLower(parsed.Host)
+	return repositoryHostPath(host, parsed.Path)
+}
+
+func repositoryHostPath(host, path string) string {
+	path = strings.Trim(path, "/")
+	if len(path) >= 4 && strings.EqualFold(path[len(path)-4:], ".git") {
+		path = path[:len(path)-4]
+	}
+	if path == "" {
+		return strings.ToLower(host)
+	}
+	return strings.ToLower(host) + "/" + path
 }
 
 type Envelope struct {

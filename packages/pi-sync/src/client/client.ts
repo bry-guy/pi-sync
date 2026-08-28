@@ -27,6 +27,10 @@ export interface RequestOptions {
   timeoutMs?: number;
 }
 
+export interface RepositoryRequestOptions extends RequestOptions {
+  repository?: string | null;
+}
+
 export class SyncClientError extends Error {
   readonly code: string;
   readonly status?: number;
@@ -57,6 +61,8 @@ const messages: Record<string, string> = {
   lease_invalid: "The synchronized session lease expired or is no longer valid.",
   lease_not_found: "The synchronized session lease is no longer active.",
   session_not_found: "The synchronized session no longer exists.",
+  workspace_mismatch: "The synchronized conversation belongs to a different Git repository.",
+  workspace_required: "A Git repository scope is required for this synchronized conversation.",
   invalid_session: "The synchronized session data was rejected by the server.",
   request_too_large: "The synchronized session is too large.",
   not_found: "The synchronization endpoint was not found.",
@@ -91,8 +97,11 @@ export class SyncClient {
     };
   }
 
-  async list(options: RequestOptions = {}): Promise<SessionListResponse> {
-    const value = await this.request("/v1/sessions", { method: "GET" }, options);
+  async list(options: RepositoryRequestOptions = {}): Promise<SessionListResponse> {
+    const query = options.repository === undefined
+      ? ""
+      : `?repository=${encodeURIComponent(options.repository || "none")}`;
+    const value = await this.request(`/v1/sessions${query}`, { method: "GET" }, options);
     try {
       return validateListResponse(value);
     } catch {
@@ -104,11 +113,11 @@ export class SyncClient {
     return this.sessionRequest("/v1/sessions", "POST", envelope, options);
   }
 
-  async acquire(sessionId: string, holder: string, options: RequestOptions = {}): Promise<AcquireResponse> {
+  async acquire(sessionId: string, holder: string, options: RepositoryRequestOptions = {}): Promise<AcquireResponse> {
     const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/lease`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ holder }),
+      body: JSON.stringify({ holder, ...(options.repository === undefined ? {} : { repository: options.repository || "none" }) }),
     }, options);
     try {
       if (!isRecord(value)) throw new Error("object expected");

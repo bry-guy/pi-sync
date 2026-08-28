@@ -2,7 +2,10 @@ name: publish-image
 
 on:
   push:
+    branches:
+      - 'feature/**'
     tags: ['v*.*.*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,13 +22,32 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve source revision and image tag
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_ref="$GITHUB_REF_NAME"
+          source_sha="$(git rev-parse HEAD)"
+          if [[ "$GITHUB_REF" == refs/heads/feature/* ]]; then
+            slug="$(printf '%s' "$source_ref" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40 | sed 's/-$//')"
+            slug="${slug:-ref}"
+            tag="branch-${slug}-${source_sha:0:12}"
+          else
+            tag="sha-${source_sha:0:12}"
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building $source_ref at $source_sha as $tag"
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/pi-syncd
           tags: |
-            type=semver,pattern={{version}}
-            type=sha
+            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ startsWith(github.ref, 'refs/heads/feature/') }}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -37,6 +59,7 @@ jobs:
           sbom: true
 
       - name: Update deployment digest
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
@@ -62,6 +85,7 @@ jobs:
           PY
 
       - name: Commit deployment digest
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           if git diff --quiet -- deploy/k8s/deployment.yaml; then

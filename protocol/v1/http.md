@@ -67,5 +67,5 @@ Important statuses are:
 The server never merges conversation entries and never overwrites a stale
 base. Clients preserve their local materialization when an update receives
 `412`. A missing server record is not recreated automatically in the background;
-the Pi extension marks the local binding as requiring setup and `/sync start`
+the Pi extension marks the local binding as requiring setup and `/sync attach`
 explicitly re-enrolls the local session after confirmation.

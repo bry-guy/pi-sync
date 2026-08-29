@@ -87,7 +87,7 @@ test("explicitly repairs a missing server record from the local session", async 
     assert.equal((await new BindingStore(root).get("session-1")).state, "setup_required");
     assert.equal(acquireCount, 0);
 
-    await handlers.get("command:sync")("start", ctx);
+    await handlers.get("command:sync")("attach", ctx);
     const repaired = await new BindingStore(root).get("session-1");
     assert.equal(repaired.state, "ready");
     assert.equal(repaired.lastEtag, "new-etag");

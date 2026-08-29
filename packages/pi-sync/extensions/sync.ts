@@ -81,7 +81,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       : blocked === "conflict"
         ? "The synchronized conversation changed remotely. Use /sync to inspect the canonical copy; the local copy was preserved."
         : blocked === "setup_required"
-          ? "The sync server no longer has this conversation. Run /sync start to set it up again from this local copy."
+          ? "The sync server no longer has this conversation. Run /sync attach to set it up again from this local copy."
           : blocked === "invalid"
             ? "This file is not the recorded synchronized materialization. Use /sync to open the canonical copy safely."
             : blocked === "workspace_mismatch"
@@ -110,7 +110,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     await store.set(next);
     blocked = "setup_required";
     setStatus(ctx, "sync: setup required");
-    if (notifyUser) notify(ctx, "The sync server no longer has this conversation. Run /sync start to set it up again from this local copy.", "warning");
+    if (notifyUser) notify(ctx, "The sync server no longer has this conversation. Run /sync attach to set it up again from this local copy.", "warning");
     return next;
   };
 
@@ -396,7 +396,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   const repairCurrent = async (ctx: ExtensionCommandContext, binding: SyncBinding): Promise<void> => {
     if (!ctx.hasUI) {
-      notify(ctx, "Open Pi interactively and run /sync start to confirm rebuilding this missing server session.", "warning");
+      notify(ctx, "Open Pi interactively and run /sync attach to confirm rebuilding this missing server session.", "warning");
       return;
     }
     const confirmed = await ctx.ui.confirm(
@@ -452,7 +452,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     const existing = await store.get(currentSessionId);
     const url = configuredUrl(args) ?? existing?.serverUrl;
     if (!url) {
-      notify(ctx, "Set PI_SYNC_SERVER_URL or provide a sync server URL after /sync start.", "error");
+      notify(ctx, "Set PI_SYNC_SERVER_URL or provide a sync server URL after /sync attach.", "error");
       return;
     }
     if (existing) {
@@ -529,7 +529,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     const rows = sessions.map((item) => ({
       item,
-      label: `${item.title || item.sessionId} — ${item.leaseHolder ? `in use by ${item.leaseHolder}` : "available"}`,
+      label: `${item.title || item.sessionId} — ${item.workspace?.branch ?? "no branch"} — ${item.leaseHolder ? `● ${item.leaseHolder}` : "○ available"}`,
     }));
     const selected = await ctx.ui.select("Synchronized conversations", rows.map((row) => row.label));
     if (!selected) return;
@@ -615,6 +615,135 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
   };
 
+  const refreshCurrent = async (ctx: ExtensionCommandContext) => {
+    await ctx.waitForIdle();
+    currentSessionId = ctx.sessionManager.getSessionId();
+    let binding = await store.get(currentSessionId);
+    if (!binding) {
+      notify(ctx, "This Pi session is not synchronized. Use /sync attach first.", "info");
+      return;
+    }
+    if (binding.state === "setup_required" || blocked === "invalid") {
+      showBlocked(ctx);
+      return;
+    }
+    if (binding.leaseToken || active?.token) {
+      if (!(await completeTurn(ctx, false, true))) {
+        notify(ctx, "Could not safely release synchronization before refreshing.", "warning");
+        return;
+      }
+      binding = await store.get(currentSessionId);
+      if (!binding) return;
+    }
+    const repository = await repositoryForPicker(ctx);
+    if (repositoryIdentity(binding.workspace) !== repository) {
+      markBlocked(ctx, "workspace_mismatch");
+      showBlocked(ctx);
+      return;
+    }
+    let normalized: { envelope: SessionEnvelope; path: string };
+    try {
+      normalized = await normalizeCurrent(ctx, binding);
+    } catch (error) {
+      notify(ctx, error instanceof Error ? error.message : "Could not inspect the local conversation.", "error");
+      return;
+    }
+    let acquired;
+    try {
+      acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { repository: repository ?? null });
+    } catch (error) {
+      notify(ctx, error instanceof Error ? error.message : "Could not refresh the synchronized conversation.", "error");
+      return;
+    }
+    const releaseRefreshLease = () => clientFor(binding.serverUrl).release(acquired.session.sessionId, acquired.lease.token);
+    if (acquired.etag === binding.lastEtag) {
+      try {
+        await releaseRefreshLease();
+      } catch {
+        await persistBinding(binding, acquired.lease.token, acquired.lease.expiresAt);
+        markBlocked(ctx, "uncertain");
+        notify(ctx, "The conversation is current, but its refresh lease could not be released.", "warning");
+        return;
+      }
+      notify(ctx, "The synchronized conversation is already current.", "info");
+      return;
+    }
+    if (!binding.lastFingerprint || stableEnvelopeFingerprint(normalized.envelope) !== binding.lastFingerprint) {
+      await releaseRefreshLease().catch(() => undefined);
+      notify(ctx, "The local conversation has unsynchronized changes. It was preserved; use /sync to open the canonical copy separately.", "warning");
+      return;
+    }
+    try {
+      await releaseRefreshLease();
+    } catch {
+      await persistBinding(binding, acquired.lease.token, acquired.lease.expiresAt);
+      markBlocked(ctx, "uncertain");
+      notify(ctx, "The refreshed snapshot could not be opened because its lease could not be released.", "warning");
+      return;
+    }
+
+    const target = join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${acquired.session.sessionId}.jsonl`);
+    const refreshedBinding: SyncBinding = {
+      ...binding,
+      state: "ready",
+      lastEtag: acquired.etag,
+      materializedFile: target,
+      lastFingerprint: stableEnvelopeFingerprint(acquired.session),
+      workspace: acquired.session.workspace,
+      parentSessionId: acquired.session.parentSessionId,
+      title: acquired.session.title,
+    };
+    delete refreshedBinding.leaseToken;
+    delete refreshedBinding.leaseExpiresAt;
+    try {
+      await materializeSessionFile(target, acquired.session, { cwd: ctx.cwd });
+      await store.set(refreshedBinding);
+      const result = await ctx.switchSession(target, {
+        withSession: async (replacement) => {
+          try {
+            await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), acquired.session.headEntryId);
+            replacement.ui.notify("Synchronized conversation refreshed.", "info");
+          } catch (error) {
+            replacement.ui.notify(error instanceof Error ? error.message : "Could not restore synchronized conversation head.", "error");
+          }
+        },
+      });
+      if (result.cancelled) await store.set(binding);
+    } catch (error) {
+      await store.set(binding).catch(() => undefined);
+      console.error("Could not open the refreshed synchronized conversation.", error);
+    }
+  };
+
+  const detachCurrent = async (ctx: ExtensionCommandContext) => {
+    currentSessionId = ctx.sessionManager.getSessionId();
+    const binding = await store.get(currentSessionId);
+    if (!binding) {
+      notify(ctx, "This Pi session is not synchronized.", "info");
+      return;
+    }
+    if (ctx.hasUI) {
+      const confirmed = await ctx.ui.confirm(
+        "Detach synchronized conversation?",
+        "Stop synchronizing this local conversation? The server copy and other clients will not be changed.",
+      );
+      if (!confirmed) return;
+    }
+    await ctx.waitForIdle();
+    if (binding.leaseToken || active?.token) {
+      if (!(await completeTurn(ctx, false, true))) {
+        notify(ctx, "Could not safely release synchronization; this conversation remains attached.", "warning");
+        return;
+      }
+    }
+    clearHeartbeat();
+    active = undefined;
+    blocked = undefined;
+    await store.remove(currentSessionId);
+    setStatus(ctx);
+    notify(ctx, "This local conversation is detached. The synchronized server copy was preserved.", "info");
+  };
+
   const showStatus = async (ctx: ExtensionCommandContext) => {
     currentSessionId = ctx.sessionManager.getSessionId();
     const binding = await store.get(currentSessionId);
@@ -635,19 +764,23 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   pi.registerCommand("sync", {
-    description: "Open, enroll, or inspect synchronized Pi conversations",
+    description: "Open, attach, detach, or inspect synchronized Pi conversations",
     handler: async (args, ctx) => {
       await store.load();
       deviceLabel = await store.deviceLabel();
       const command = args.trim();
-      if (command === "start" || command.startsWith("start ")) {
-        await enrollCurrent(ctx, command.slice("start".length).trim());
+      if (command === "attach" || command.startsWith("attach ")) {
+        await enrollCurrent(ctx, command.slice("attach".length).trim());
+      } else if (command === "detach") {
+        await detachCurrent(ctx);
+      } else if (command === "refresh") {
+        await refreshCurrent(ctx);
       } else if (command === "status") {
         await showStatus(ctx);
-      } else if (command === "" || command === "open") {
+      } else if (command === "") {
         await syncPick(ctx);
       } else {
-        notify(ctx, "Usage: /sync, /sync start [server URL], or /sync status", "error");
+        notify(ctx, "Usage: /sync, /sync attach [server URL], /sync detach, /sync refresh, or /sync status", "error");
       }
     },
   });

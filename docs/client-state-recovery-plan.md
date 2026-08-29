@@ -12,7 +12,7 @@ server-disaster-recovery system.
 When a bound session receives a confirmed `session_not_found` response, the
 client preserves its local file, stops claiming that it is synchronized, and
 marks the binding `setup_required`. It does not recreate the server record in
-the background. The user runs `/sync start` and explicitly confirms using the
+the background. The user runs `/sync attach` and explicitly confirms using the
 current local session to set the record up again.
 
 Create-if-absent remains the safety boundary. A repair that receives
@@ -59,7 +59,7 @@ their existing blocked/error behavior.
 
 ## Repair flow
 
-When `/sync start` is run for a `setup_required` binding:
+When `/sync attach` is run for a `setup_required` binding:
 
 1. Require a persistent current Pi session and the configured server URL.
 2. Ask the user to confirm that this local session should seed the missing
@@ -72,7 +72,7 @@ When `/sync start` is run for a `setup_required` binding:
    to `/sync` to retrieve the existing canonical copy.
 7. On any other failure, preserve `setup_required` and the local file.
 
-A session without a binding continues to use `/sync start` for normal initial
+A session without a binding continues to use `/sync attach` for normal initial
 enrollment. If the server already contains that session ID, it is never
 silently overwritten.
 
@@ -81,7 +81,7 @@ silently overwritten.
 For an empty or restored server:
 
 1. Choose the client containing the desired local conversation.
-2. Run `/sync start` and confirm re-enrollment.
+2. Run `/sync attach` and confirm re-enrollment.
 3. On other clients, use `/sync` to acquire the newly canonical copy.
 4. Resume normal lease-transfer operation.
 

@@ -7,9 +7,11 @@ synchronization protocol. It wraps and extends Pi from
 and `synchronized-workspace` skill.
 
 The extension expects `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) and is intended
-to be installed as a trusted Pi package. Use `/sync start` to enroll a local
-session, or to explicitly recreate a server record that is reported missing.
-The `/sync` picker limits choices to the current normalized Git repository when
-Git information is available; unscoped conversations remain separate. Lease
+to be installed as a trusted Pi package. Use `/sync attach` to enroll a local
+session or explicitly recreate a server record that is reported missing. Use `/sync detach` to remove only the local
+binding and `/sync refresh` to pull a newer canonical snapshot safely. The
+`/sync` picker limits choices to the current normalized Git repository and shows
+the branch plus the current lease holder. Unscoped conversations remain
+separate. Lease
 tokens are device-local state; they are never written to synchronized session
 entries or Git metadata.

@@ -42,6 +42,7 @@ async function harness(fetch) {
       notify: (message) => notices.push(message),
       setStatus: (_id, text) => statuses.push(text),
     },
+    waitForIdle: async () => {},
     sessionManager: {
       getSessionId: () => envelope.sessionId,
       getSessionFile: () => sessionPath,
@@ -54,6 +55,7 @@ async function harness(fetch) {
     root,
     sessionPath,
     handlers,
+    pi,
     ctx,
     notices,
     statuses,
@@ -373,6 +375,94 @@ test("ETag conflict and active lease block without changing local state", async 
   }
 });
 
+test("refresh replaces an unchanged local materialization with a newer canonical snapshot", async () => {
+  const remote = {
+    ...envelope,
+    headEntryId: "b",
+    title: "Remote update",
+    entries: [
+      ...envelope.entries,
+      { type: "message", id: "b", parentId: "a", timestamp: "2026-01-01T00:00:02Z" },
+    ],
+  };
+  const requests = [];
+  const fake = await harness(async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    requests.push({ path, method: init.method });
+    if (path.endsWith("/lease") && init.method === "POST") {
+      const response = await responseForLease("refresh-token", "e2").json();
+      return Response.json({ ...response, session: remote });
+    }
+    if (path.endsWith("/lease") && init.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  });
+  let switchedTarget;
+  try {
+    await fake.store.set({
+      nativeSessionId: envelope.sessionId,
+      serverUrl: "http://sync.test",
+      canonicalSessionId: envelope.sessionId,
+      lastEtag: "e1",
+      materializedFile: fake.sessionPath,
+      lastFingerprint: JSON.stringify(envelope),
+      state: "ready",
+    });
+    fake.ctx.switchSession = async (target, options) => {
+      switchedTarget = target;
+      const replacement = {
+        ...fake.ctx,
+        ui: { ...fake.ctx.ui, notify: (message) => fake.notices.push(message) },
+        sessionManager: {
+          ...fake.ctx.sessionManager,
+          getSessionFile: () => target,
+          getLeafId: () => remote.headEntryId,
+          getSessionName: () => remote.title,
+        },
+        navigateTree: async () => ({ cancelled: false }),
+      };
+      await fake.handlers.get("session_start")({}, replacement);
+      await options.withSession(replacement);
+      return { cancelled: false };
+    };
+    await fake.handlers.get("session_start")({}, fake.ctx);
+    await fake.handlers.get("command:sync")("refresh", fake.ctx);
+    assert.ok(switchedTarget);
+    assert.deepEqual(requests.map(({ method }) => method), ["POST", "DELETE"]);
+    const refreshed = await fake.binding();
+    assert.equal(refreshed.lastEtag, "e2");
+    assert.equal(refreshed.materializedFile, switchedTarget);
+    assert.match(await readFile(switchedTarget, "utf8"), /"id":"b"/);
+    assert.match(fake.notices.join(" "), /refreshed/);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("detach removes only the local binding", async () => {
+  const requests = [];
+  const fake = await harness(async (url, init = {}) => {
+    requests.push({ path: new URL(url).pathname, method: init.method });
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  });
+  try {
+    await fake.store.set({
+      nativeSessionId: envelope.sessionId,
+      serverUrl: "http://sync.test",
+      canonicalSessionId: envelope.sessionId,
+      lastEtag: "e1",
+      materializedFile: fake.sessionPath,
+      state: "ready",
+    });
+    await fake.handlers.get("session_start")({}, fake.ctx);
+    await fake.handlers.get("command:sync")("detach", fake.ctx);
+    assert.equal(await fake.binding(), undefined);
+    assert.deepEqual(requests, []);
+    assert.match(fake.notices.join(" "), /server copy was preserved/);
+  } finally {
+    await fake.close();
+  }
+});
+
 test("opens a synchronized session without crashing on replacement errors", async () => {
   const previousUrl = process.env.PI_SYNC_SERVER_URL;
   process.env.PI_SYNC_SERVER_URL = "http://sync.test";
@@ -389,16 +479,30 @@ test("opens a synchronized session without crashing on replacement errors", asyn
           createdAt: envelope.createdAt,
           headEntryId: envelope.headEntryId,
           etag: "e1",
-          leaseHolder: null,
-          leaseExpiresAt: null,
+          leaseHolder: "pi-web",
+          leaseExpiresAt: "2026-01-01T00:02:00Z",
+          workspace,
         }],
       });
     }
-    if (path.endsWith("/lease") && init.method === "POST") return responseForLease("picker-token");
+    if (path.endsWith("/lease") && init.method === "POST") {
+      const response = await responseForLease("picker-token").json();
+      return Response.json({ ...response, session: { ...response.session, workspace } });
+    }
     if (path.endsWith("/lease") && init.method === "DELETE") return new Response(null, { status: 204 });
     return Response.json({ error: { code: "not_found" } }, { status: 404 });
   });
   const replacementNotices = [];
+  const workspace = {
+    gitRemote: "git@github.com:bry-guy/pi-sync.git",
+    branch: "feature/sync-ui",
+    commit: "abcdef1234567",
+  };
+  fake.pi.exec = async (_command, args) => {
+    if (args.includes("--abbrev-ref")) return { stdout: `origin/${workspace.branch}\n`, code: 0 };
+    if (args[0] === "remote" && args[1] === "get-url") return { stdout: `${workspace.gitRemote}\n`, code: 0 };
+    return { stdout: "", code: 1 };
+  };
   let switched = false;
   let guardCancelled;
   try {
@@ -406,7 +510,10 @@ test("opens a synchronized session without crashing on replacement errors", asyn
       if (switched) throw new Error("stale command context used");
       fake.notices.push(message);
     };
-    fake.ctx.ui.select = async () => "Synced session — available";
+    fake.ctx.ui.select = async (_title, items) => {
+      assert.deepEqual(items, ["Synced session — feature/sync-ui — ● pi-web"]);
+      return items[0];
+    };
     fake.ctx.switchSession = async (target, options) => {
       switched = true;
       const replacement = {

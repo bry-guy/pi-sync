@@ -225,16 +225,20 @@ Implement:
 - `/sync`: fetch list metadata, show a normal `ctx.ui.select()` picker, acquire
   the selected lease, materialize under the current workspace, release the
   lease, switch the Pi session, and navigate to the stored head.
-- `/sync start`: enroll the current persistent local session, or explicitly
+- `/sync attach`: enroll the current persistent local session, or explicitly
   repair a binding whose server record is missing. The next prompt starts the
   lease/heartbeat lifecycle.
+- `/sync detach`: remove the device-local binding after safely releasing any
+  lease. The canonical server copy and other clients remain unchanged.
+- `/sync refresh`: replace an unchanged local materialization with the latest
+  canonical snapshot through Pi's supported session-switch lifecycle.
 - `/sync status`: display server reachability, lease state, setup-required/ETag
   state, and the recorded upstream branch/commit.
 
 A synchronized session opened through Pi's native local resume flow must verify
 its binding and current lease before accepting input. When it cannot safely
 refresh an already-loaded manager, block input and direct the user through
-`/sync` so replacement uses the supported session switch lifecycle.
+`/sync refresh` or `/sync` so replacement uses the supported session switch lifecycle.
 
 ### Lifecycle
 
@@ -250,7 +254,7 @@ refresh an already-loaded manager, block input and direct the user through
   safe upload/release retry.
 - If any synchronization operation returns `session_not_found`, preserve the
   local session, clear the lease, mark the binding `setup_required`, and wait
-  for an explicit `/sync start` repair confirmation. Never recreate in the
+  for an explicit `/sync attach` repair confirmation. Never recreate in the
   background.
 - If reacquisition finds the same ETag, upload normally. If it finds a new ETag,
   preserve the local materialization and surface a conflict without mutating

@@ -866,16 +866,38 @@ export default function syncExtension(pi: ExtensionAPI) {
   const guardDurableMutation = async (ctx: ExtensionContext) => {
     if (!currentSessionId) return;
     const binding = await store.get(currentSessionId);
-    if (binding && !ready()) {
+    if (binding && !ready() && ctx.mode !== "json") {
       showBlocked(ctx);
       return { cancel: true as const };
     }
   };
+
+  const prepareCompaction = async (event: { reason: "manual" | "threshold" | "overflow" }, ctx: ExtensionContext) => {
+    if (!currentSessionId) return;
+    const binding = await store.get(currentSessionId);
+    if (!binding) return;
+    if (event.reason === "manual" && !ready()) {
+      if (binding.leaseToken) {
+        if (!active || active.token !== binding.leaseToken) resumeActive(ctx, binding);
+        if (await verifyPendingLease(ctx, binding)) return;
+      } else if (!active && await acquireBinding(ctx, binding)) return;
+    }
+    if (ready()) return;
+    showBlocked(ctx);
+    return { cancel: true as const };
+  };
+
   pi.on("session_before_tree", async (event, ctx) => {
     if (!event.preparation.userWantsSummary) return;
     return guardDurableMutation(ctx);
   });
-  pi.on("session_before_compact", async (_event, ctx) => guardDurableMutation(ctx));
+  pi.on("session_before_compact", async (event, ctx) => prepareCompaction(event, ctx));
+  pi.on("session_compact", async (event, ctx) => {
+    if (event.reason === "manual") await completeTurn(ctx, false, true);
+  });
+  pi.on("session_compact_failed", async (event, ctx) => {
+    if (event.reason === "manual") await completeTurn(ctx, false, true);
+  });
   pi.on("session_before_fork", async (_event, ctx) => guardDurableMutation(ctx));
 
   pi.on("session_shutdown", async (_event, ctx) => {

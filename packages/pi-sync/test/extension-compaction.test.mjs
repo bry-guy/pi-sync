@@ -138,35 +138,37 @@ async function bind(fake) {
   await fake.handlers.get("session_start")({}, fake.ctx);
 }
 
-test("manual compaction acquires, uploads, and releases in JSON mode", async () => {
-  const requests = [];
-  const fake = await harness(async (url, init = {}) => {
-    const request = requestRecord(url, init);
-    requests.push(request);
-    if (request.path.endsWith("/lease") && request.method === "POST") return responseForLease("compact-token");
-    if (request.method === "PUT") return responseForUpdate(request.body);
-    if (request.path.endsWith("/lease") && request.method === "DELETE") return new Response(null, { status: 204 });
-    return Response.json({ error: { code: "not_found" } }, { status: 404 });
-  }, { serverUrl: "http://sync.test", mode: "json" });
-  try {
-    await bind(fake);
-    await fake.setEntries([...baseEnvelope.entries, compactionEntry]);
-    assert.equal(await fake.handlers.get("session_before_compact")({ reason: "manual" }, fake.ctx), undefined);
-    await fake.handlers.get("session_compact")({ reason: "manual" }, fake.ctx);
+test("manual compaction acquires, uploads, and releases in both contexts", async () => {
+  for (const mode of [undefined, "json"]) {
+    const requests = [];
+    const fake = await harness(async (url, init = {}) => {
+      const request = requestRecord(url, init);
+      requests.push(request);
+      if (request.path.endsWith("/lease") && request.method === "POST") return responseForLease("compact-token");
+      if (request.method === "PUT") return responseForUpdate(request.body);
+      if (request.path.endsWith("/lease") && request.method === "DELETE") return new Response(null, { status: 204 });
+      return Response.json({ error: { code: "not_found" } }, { status: 404 });
+    }, { serverUrl: "http://sync.test", ...(mode ? { mode } : {}) });
+    try {
+      await bind(fake);
+      await fake.setEntries([...baseEnvelope.entries, compactionEntry]);
+      assert.equal(await fake.handlers.get("session_before_compact")({ reason: "manual" }, fake.ctx), undefined);
+      await fake.handlers.get("session_compact")({ reason: "manual" }, fake.ctx);
 
-    assert.deepEqual(requests.map(({ method, path }) => `${method} ${path}`), [
-      "POST /v1/sessions/session-1/lease",
-      "PUT /v1/sessions/session-1",
-      "DELETE /v1/sessions/session-1/lease",
-    ]);
-    const update = requests.find(({ method }) => method === "PUT");
-    assert.equal(update.body.headEntryId, "c1");
-    assert.equal(update.body.entries.at(-1).type, "compaction");
-    const binding = await fake.binding();
-    assert.equal(binding.lastEtag, "e2");
-    assert.equal(binding.leaseToken, undefined);
-  } finally {
-    await fake.close();
+      assert.deepEqual(requests.map(({ method, path }) => `${method} ${path}`), [
+        "POST /v1/sessions/session-1/lease",
+        "PUT /v1/sessions/session-1",
+        "DELETE /v1/sessions/session-1/lease",
+      ]);
+      const update = requests.find(({ method }) => method === "PUT");
+      assert.equal(update.body.headEntryId, "c1");
+      assert.equal(update.body.entries.at(-1).type, "compaction");
+      const binding = await fake.binding();
+      assert.equal(binding.lastEtag, "e2");
+      assert.equal(binding.leaseToken, undefined);
+    } finally {
+      await fake.close();
+    }
   }
 });
 

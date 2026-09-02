@@ -866,7 +866,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const guardDurableMutation = async (ctx: ExtensionContext) => {
     if (!currentSessionId) return;
     const binding = await store.get(currentSessionId);
-    if (binding && !ready()) {
+    if (binding && !ready() && ctx.mode !== "json") {
       showBlocked(ctx);
       return { cancel: true as const };
     }

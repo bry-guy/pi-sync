@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -121,6 +121,7 @@ function requestRecord(url, init = {}) {
   return {
     path: new URL(url).pathname,
     method: init.method,
+    headers: new Headers(init.headers),
     body: init.body ? JSON.parse(init.body) : undefined,
   };
 }
@@ -160,7 +161,8 @@ test("manual compaction acquires, uploads, and releases in both contexts", async
         "PUT /v1/sessions/session-1",
         "DELETE /v1/sessions/session-1/lease",
       ]);
-      const update = requests.find(({ method }) => method === "PUT");
+          const update = requests.find(({ method }) => method === "PUT");
+      assert.equal(update.headers.get("if-match"), "e1");
       assert.equal(update.body.headEntryId, "c1");
       assert.equal(update.body.entries.at(-1).type, "compaction");
       const binding = await fake.binding();
@@ -212,6 +214,70 @@ test("failed manual compaction releases an unchanged lease without uploading", a
     const binding = await fake.binding();
     assert.equal(binding.lastEtag, "e1");
     assert.equal(binding.leaseToken, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("manual compaction failure after append uploads before release", async () => {
+  const requests = [];
+  const fake = await harness(async (url, init = {}) => {
+    const request = requestRecord(url, init);
+    requests.push(request);
+    if (request.path.endsWith("/lease") && request.method === "POST") return responseForLease("partial-token");
+    if (request.method === "PUT") return responseForUpdate(request.body);
+    if (request.path.endsWith("/lease") && request.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  }, { serverUrl: "http://sync.test", mode: "json" });
+  try {
+    await bind(fake);
+    await fake.handlers.get("session_before_compact")({ reason: "manual" }, fake.ctx);
+    await fake.setEntries([...baseEnvelope.entries, compactionEntry]);
+    await fake.handlers.get("session_compact_failed")({ reason: "manual" }, fake.ctx);
+    assert.deepEqual(requests.map(({ method, path }) => `${method} ${path}`), [
+      "POST /v1/sessions/session-1/lease",
+      "PUT /v1/sessions/session-1",
+      "DELETE /v1/sessions/session-1/lease",
+    ]);
+    const update = requests.find(({ method }) => method === "PUT");
+    assert.equal(update.headers.get("if-match"), "e1");
+    assert.equal(update.body.entries.at(-1).type, "compaction");
+    const binding = await fake.binding();
+    assert.equal(binding.lastEtag, "e2");
+    assert.equal(binding.leaseToken, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("stale compaction upload preserves local state and binding base", async () => {
+  const requests = [];
+  const fake = await harness(async (url, init = {}) => {
+    const request = requestRecord(url, init);
+    requests.push(request);
+    if (request.path.endsWith("/lease") && request.method === "POST") return responseForLease("stale-token");
+    if (request.method === "PUT") return Response.json({ error: { code: "stale_etag" } }, { status: 412 });
+    if (request.path.endsWith("/lease") && request.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  }, { serverUrl: "http://sync.test", mode: "json" });
+  try {
+    await bind(fake);
+    await fake.setEntries([...baseEnvelope.entries, compactionEntry]);
+    await fake.handlers.get("session_before_compact")({ reason: "manual" }, fake.ctx);
+    await fake.handlers.get("session_compact")({ reason: "manual" }, fake.ctx);
+    assert.deepEqual(requests.map(({ method, path }) => `${method} ${path}`), [
+      "POST /v1/sessions/session-1/lease",
+      "PUT /v1/sessions/session-1",
+      "DELETE /v1/sessions/session-1/lease",
+    ]);
+    const update = requests.find(({ method }) => method === "PUT");
+    assert.equal(update.headers.get("if-match"), "e1");
+    assert.equal((await readFile(fake.sessionPath, "utf8")).includes('"id":"c1"'), true);
+    const binding = await fake.binding();
+    assert.equal(binding.lastEtag, "e1");
+    assert.equal(binding.lastFingerprint, JSON.stringify(baseEnvelope));
+    assert.equal(binding.leaseToken, undefined);
+    assert.match(fake.notices.join(" "), /preserved/);
   } finally {
     await fake.close();
   }

@@ -40,8 +40,9 @@ The complete system is split across three repositories:
 - Clients upload complete settled snapshots. The server uses opaque ETags for
   compare-and-swap and never overwrites a stale base.
 - A background heartbeat renews a lease independently of model streaming and
-  tool execution. The initial constants are a 20-second heartbeat and a
-  120-second expiry.
+  tool execution. When no lease is held, the same cadence polls lightweight
+  session metadata for remote ETag changes. The initial constants are a
+  20-second heartbeat and a 120-second expiry.
 - If a lease expires, a client may reacquire and upload only when the canonical
   ETag is unchanged. Otherwise it retains its local file and reports a conflict.
 - Workspace transfer means only a Git remote, upstream branch, and upstream
@@ -226,24 +227,29 @@ Implement:
   the selected lease, materialize under the current workspace, release the
   lease, switch the Pi session, and navigate to the stored head.
 - `/sync attach`: enroll the current persistent local session, or explicitly
-  repair a binding whose server record is missing. The next prompt starts the
-  lease/heartbeat lifecycle.
+  repair a binding whose server record is missing. Idle polling starts
+  immediately; the next prompt starts the lease/heartbeat lifecycle.
 - `/sync detach`: remove the device-local binding after safely releasing any
   lease. The canonical server copy and other clients remain unchanged.
-- `/sync refresh`: replace an unchanged local materialization with the latest
-  canonical snapshot through Pi's supported session-switch lifecycle.
+- `/sync refresh`: explicitly replace an unchanged local materialization with
+  the latest canonical snapshot through Pi's supported session-switch lifecycle;
+  the same path runs automatically when idle polling finds a remote ETag change.
 - `/sync status`: display server reachability, lease state, setup-required/ETag
   state, and the recorded upstream branch/commit.
 
 A synchronized session opened through Pi's native local resume flow must verify
-its binding and current lease before accepting input. When it cannot safely
-refresh an already-loaded manager, block input and direct the user through
-`/sync refresh` or `/sync` so replacement uses the supported session switch lifecycle.
+its binding and current lease before accepting input. Automatic refresh must not
+replace an active turn or a locally changed materialization; preserve the local
+copy and direct the user through `/sync refresh` or `/sync` so replacement uses
+the supported session switch lifecycle.
 
 ### Lifecycle
 
 - Do not acquire a lease when a synchronized session is merely opened. Acquire
-  on idle input, then renew independently during the agent turn.
+  on idle input, then renew independently during the agent turn. After the turn
+  lease is released, poll session metadata on the heartbeat cadence and use the
+  supported refresh lifecycle when Pi is idle and the local fingerprint is
+  unchanged.
 - On `agent_settled`, normalize the complete session using the manager's current
   leaf, derive the current upstream Git pointer, upload with the lease token and
   base ETag, then release the lease.

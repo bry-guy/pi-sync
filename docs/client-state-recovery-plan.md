@@ -12,8 +12,8 @@ server-disaster-recovery system.
 When a bound session receives a confirmed `session_not_found` response, the
 client preserves its local file, stops claiming that it is synchronized, and
 marks the binding `setup_required`. It does not recreate the server record in
-the background. The user runs `/sync attach` and explicitly confirms using the
-current local session to set the record up again.
+the background. The user runs `/sync attach` to set the record up again from the
+current local session.
 
 Create-if-absent remains the safety boundary. A repair that receives
 `duplicate_enrollment` never overwrites an existing server copy; the user is
@@ -62,15 +62,13 @@ their existing blocked/error behavior.
 When `/sync attach` is run for a `setup_required` binding:
 
 1. Require a persistent current Pi session and the configured server URL.
-2. Ask the user to confirm that this local session should seed the missing
-   server record.
-3. Normalize the local JSONL session through the existing adapter.
-4. Call the existing `POST /v1/sessions` create-if-absent endpoint.
-5. On `201`, update the binding's ETag, fingerprint, workspace metadata, and
-   state, then acquire the lease and resume the heartbeat.
-6. On `409 duplicate_enrollment`, preserve the local file and direct the user
-   to `/sync` to retrieve the existing canonical copy.
-7. On any other failure, preserve `setup_required` and the local file.
+2. Normalize the local JSONL session through the existing adapter.
+3. Call the existing `POST /v1/sessions` create-if-absent endpoint.
+4. On `201`, update the binding's ETag, fingerprint, workspace metadata, and
+   state. The next prompt takes the lease as usual.
+5. On `409 duplicate_enrollment`, adopt the existing canonical copy. Any local
+   conversation entries it lacks are saved as a separate session first.
+6. On any other failure, preserve `setup_required` and the local file.
 
 A session without a binding continues to use `/sync attach` for normal initial
 enrollment. If the server already contains that session ID, it is never
@@ -81,7 +79,7 @@ silently overwritten.
 For an empty or restored server:
 
 1. Choose the client containing the desired local conversation.
-2. Run `/sync attach` and confirm re-enrollment.
+2. Run `/sync attach`.
 3. On other clients, use `/sync` to acquire the newly canonical copy.
 4. Resume normal lease-transfer operation.
 

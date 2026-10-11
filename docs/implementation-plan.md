@@ -125,21 +125,24 @@ Implement:
 GET    /v1/health
 GET    /v1/sessions
 POST   /v1/sessions
+GET    /v1/sessions/:id
 POST   /v1/sessions/:id/lease
 POST   /v1/sessions/:id/lease/renew
 PUT    /v1/sessions/:id
 DELETE /v1/sessions/:id/lease
 ```
 
-`GET /v1/sessions` returns only list metadata, current ETag, lease holder label,
-lease expiry, and workspace pointer. It accepts an optional `repository` query
-value; `none` selects unscoped sessions and any other value is a normalized Git
-remote identity. Acquiring a lease returns the complete snapshot and an opaque
-random lease token. Acquisition accepts the same repository value and rejects a
-missing or mismatched scope for Git-scoped sessions. Updating requires both the
-token and `If-Match` ETag and cannot change or remove an established repository
-scope. Errors use stable machine codes with conventional HTTP status: `409` for
-duplicate enrollment or workspace scope mismatch, `412` for a stale ETag, and
+`GET /v1/sessions` returns only list metadata, current ETag, `updatedAt`,
+lease holder label, lease expiry, and workspace pointer. It accepts an optional
+`repository` query value; `none` selects unscoped sessions and any other value
+is a normalized Git remote identity. `GET /v1/sessions/:id` returns the
+complete snapshot without a lease so idle clients can catch up without
+appearing busy. Acquiring a lease returns the complete snapshot and an opaque
+random lease token. The repository value is advisory: an upstream appears,
+changes, or disappears as the user pushes and switches branches, so neither
+acquisition nor updates reject a scope change. Updating requires both the
+token and `If-Match` ETag. Errors use stable machine codes with conventional HTTP status: `409` for
+duplicate enrollment, `412` for a stale ETag, and
 `423` for an active lease.
 
 No browser talks directly to this API in the first integration; CLI extensions
@@ -223,48 +226,58 @@ that identity through the conversation.
 
 Implement:
 
-- `/sync`: fetch list metadata, show a normal `ctx.ui.select()` picker, acquire
-  the selected lease, materialize under the current workspace, release the
-  lease, switch the Pi session, and navigate to the stored head.
-- `/sync attach`: enroll the current persistent local session, or explicitly
-  repair a binding whose server record is missing. Idle polling starts
-  immediately; the next prompt starts the lease/heartbeat lifecycle.
-- `/sync detach`: remove the device-local binding after safely releasing any
-  lease. The canonical server copy and other clients remain unchanged.
-- `/sync refresh`: explicitly replace an unchanged local materialization with
-  the latest canonical snapshot through Pi's supported session-switch lifecycle;
-  the same path runs automatically when idle polling finds a remote ETag change.
-- `/sync status`: display server reachability, lease state, setup-required/ETag
-  state, and the recorded upstream branch/commit.
-
-A synchronized session opened through Pi's native local resume flow must verify
-its binding and current lease before accepting input. Automatic refresh must not
-replace an active turn or a locally changed materialization; preserve the local
-copy and direct the user through `/sync refresh` or `/sync` so replacement uses
-the supported session switch lifecycle.
+- `/sync`: list every synchronized conversation, with the current repository
+  first and the rest by most recent. Rows show the title (the session name, or
+  else the first user message), the repository and branch, the age, the device
+  running it, and whether this device already has it. Opening a conversation
+  reads the snapshot without a lease. A conversation this device already has
+  is rewritten in place; otherwise one file is created. Pi then switches to it
+  and restores the stored head.
+- `/sync attach`: enroll the current persistent session. If the server already
+  has it, for example after a detach, adopt the server copy. If the server
+  reported the record missing, upload this copy again.
+- `/sync detach`: finish any turn, then remove the device-local binding. The
+  canonical server copy and other clients remain unchanged.
+- `/sync refresh`: catch up now. This is the same path the background poll and
+  input catch-up use.
+- `/sync status`: show reachability, whether the copy is current, ahead,
+  behind, or running elsewhere, the device label, and the upstream pointer.
+- `/sync auto-check` and `/sync reconcile`: for hosts that disable the
+  background poll (JSON mode). They catch up if needed and return
+  `{ outcome: "unchanged" | "busy" | "conflict" | "refreshed" }`.
 
 ### Lifecycle
 
-- Do not acquire a lease when a synchronized session is merely opened. Acquire
-  on idle input, then renew independently during the agent turn. After the turn
-  lease is released, poll session metadata on the heartbeat cadence and use the
-  supported refresh lifecycle when Pi is idle and the local fingerprint is
-  unchanged.
-- On `agent_settled`, normalize the complete session using the manager's current
-  leaf, derive the current upstream Git pointer, upload with the lease token and
-  base ETag, then release the lease.
-- On `session_shutdown`, settle an active turn or retry its pending release; do
-  not acquire a fresh lease.
-- If renewal fails transiently, mark the lease uncertain and block the next new
-  prompt. Finish any already-running turn locally and retain the token for a
-  safe upload/release retry.
-- If any synchronization operation returns `session_not_found`, preserve the
-  local session, clear the lease, mark the binding `setup_required`, and wait
-  for an explicit `/sync attach` repair confirmation. Never recreate in the
-  background.
-- If reacquisition finds the same ETag, upload normally. If it finds a new ETag,
-  preserve the local materialization and surface a conflict without mutating
-  either copy.
+- Opening a synchronized session never takes a lease. Each device keeps one
+  file per conversation, and a catch-up rewrites that file in place, then
+  re-opens it through Pi's session-switch lifecycle.
+- On input, acquire the lease. Repeated `423` responses are retried for about
+  two seconds to absorb another device's brief idle upload.
+  - If the canonical ETag equals the last synchronized ETag, the turn proceeds
+    while a background heartbeat renews the lease.
+  - If the canonical copy moved, release the lease, catch up, and re-send the
+    same prompt in the refreshed session. The user never has to resolve this.
+  - If another device holds the lease, refuse the prompt with that device's
+    name and put the text back in the editor.
+- On `agent_settled`, upload the settled snapshot with `If-Match`, then
+  release. Upload failures do not block the user. The copy stays "ahead" and
+  the next check retries it. A crash leaves the lease token in the binding so
+  the next start releases it.
+- While idle (every 20 seconds, and right after a session starts), compare the
+  server metadata with the binding. Catch up if the server moved, or upload if
+  only local entries were added.
+- Catching up classifies the local entries the canonical copy lacks:
+  - Model or thinking changes, names, labels, and extension state are rebased
+    onto the canonical head and uploaded later.
+  - Conversation entries (messages, custom messages, compactions, branch
+    summaries) mean two devices really wrote the conversation. The whole local
+    copy is saved as a separate, unsynchronized session, and the canonical
+    copy wins.
+- Manual compaction takes the lease like a turn. If the conversation is
+  behind, it catches up first and asks the user to compact again.
+- On `session_not_found`, preserve the local session, mark the binding
+  `setup_required`, and refuse prompts until `/sync attach` re-enrolls it.
+  Never recreate in the background.
 
 ### Workspace skill
 
@@ -293,6 +306,12 @@ transitions, settled upload, shutdown release, timeout handling, and stale ETag
 preservation.
 
 ### End-to-end test
+
+`npm --prefix packages/pi-sync run test:e2e` runs two real Pi processes in RPC
+mode against a temporary `pi-syncd` and a fake model. It covers device
+switching, idle catch-up, blocked simultaneous use, idle local changes, lost
+uploads, crash recovery, unpushed branches, picker reuse, compaction, server
+record loss, and detach/attach.
 
 Start a temporary `pi-syncd` and two isolated Pi agent homes. Enroll from client
 A, confirm B receives `423` while A is active, release A, continue from B under

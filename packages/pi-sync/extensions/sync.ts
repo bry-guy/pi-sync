@@ -450,7 +450,8 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (replay) pi.sendUserMessage(replay.text);
       return { outcome: "unchanged", sessionId };
     }
-    const message = mode === "manual" ? "Synchronized conversation refreshed." : replay ? undefined : "Updated with changes from another device.";
+    // Automatic catch-ups stay quiet: the new turns appearing is the signal.
+    const message = mode === "manual" ? "Synchronized conversation refreshed." : undefined;
     await reopen(ctx, result.target, result.written.headEntryId, message, result.written.copyPath, replay);
     return { outcome: result.written.copyPath ? "conflict" : "refreshed", sessionId, switched: true };
   };

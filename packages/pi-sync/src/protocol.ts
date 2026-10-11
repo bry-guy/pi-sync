@@ -38,6 +38,7 @@ export interface SessionMetadata {
   etag: string;
   leaseHolder: string | null;
   leaseExpiresAt: string | null;
+  updatedAt?: string;
   workspace?: WorkspacePointer;
 }
 
@@ -220,7 +221,8 @@ export function validateMetadata(value: unknown): SessionMetadata {
   const etag = stringField(value.etag, "etag", 512);
   const leaseHolder = value.leaseHolder === null || value.leaseHolder === undefined ? null : stringField(value.leaseHolder, "leaseHolder", 128);
   const leaseExpiresAt = value.leaseExpiresAt === null || value.leaseExpiresAt === undefined ? null : timestamp(value.leaseExpiresAt, "leaseExpiresAt");
-  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, workspace: validateWorkspace(value.workspace) };
+  const updatedAt = value.updatedAt === undefined || value.updatedAt === null ? undefined : timestamp(value.updatedAt, "updatedAt");
+  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), workspace: validateWorkspace(value.workspace) };
 }
 
 export function validateSessionResponse(value: unknown): SessionResponse {

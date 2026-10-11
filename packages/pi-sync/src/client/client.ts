@@ -109,6 +109,16 @@ export class SyncClient {
     }
   }
 
+  /** Reads the canonical snapshot without taking a lease. */
+  async get(sessionId: string, options: RequestOptions = {}): Promise<SessionResponse> {
+    const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "GET" }, options);
+    try {
+      return validateSessionResponse(value);
+    } catch {
+      throw new SyncClientError("invalid_response", "The sync server returned an invalid session.");
+    }
+  }
+
   async enroll(envelope: SessionEnvelope, options: RequestOptions = {}): Promise<SessionResponse> {
     return this.sessionRequest("/v1/sessions", "POST", envelope, options);
   }

@@ -90,18 +90,7 @@ func TestHTTPRepositoryScope(t *testing.T) {
 		t.Fatalf("unscoped filter returned status %d and %d sessions", response.StatusCode, len(listed.Sessions))
 	}
 
-	request, _ := http.NewRequest(http.MethodPost, router.URL+"/v1/sessions/repo-a/lease", bytes.NewReader([]byte(`{"holder":"a"}`)))
-	request.Header.Set("Content-Type", "application/json")
-	response, err = http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("missing repository scope status = %d", response.StatusCode)
-	}
-	response.Body.Close()
-
-	request, _ = http.NewRequest(http.MethodPost, router.URL+"/v1/sessions/repo-a/lease", bytes.NewReader([]byte(`{"holder":"a","repository":"https://github.com/owner/repo.git"}`)))
+	request, _ := http.NewRequest(http.MethodPost, router.URL+"/v1/sessions/repo-a/lease", bytes.NewReader([]byte(`{"holder":"a","repository":"https://github.com/owner/repo.git"}`)))
 	request.Header.Set("Content-Type", "application/json")
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -121,17 +110,6 @@ func TestHTTPRepositoryScope(t *testing.T) {
 	}
 	response.Body.Close()
 
-	request, _ = http.NewRequest(http.MethodPost, router.URL+"/v1/sessions/repo-b/lease", bytes.NewReader([]byte(`{"holder":"b","repository":"github.com/owner/repo"}`)))
-	request.Header.Set("Content-Type", "application/json")
-	response, err = http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("different repository scope status = %d", response.StatusCode)
-	}
-	response.Body.Close()
-
 	updated := scopedAPIEnvelope("repo-a", "https://github.com/other/repo.git", "main")
 	updatedBody, _ := json.Marshal(updated)
 	request, _ = http.NewRequest(http.MethodPut, router.URL+"/v1/sessions/repo-a", bytes.NewReader(updatedBody))
@@ -142,7 +120,8 @@ func TestHTTPRepositoryScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusConflict {
+	// Repository scope is advisory, so an upstream change is an ordinary update.
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("scope-changing update status = %d", response.StatusCode)
 	}
 	response.Body.Close()
@@ -185,7 +164,7 @@ func TestHTTPRepositoryScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusConflict {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("unscoped scope-changing update status = %d", response.StatusCode)
 	}
 	response.Body.Close()
@@ -283,4 +262,54 @@ func TestHTTPLeaseAndConditionalUpdate(t *testing.T) {
 		t.Fatalf("release status = %d", response.StatusCode)
 	}
 	response.Body.Close()
+}
+
+func TestHTTPSnapshotWithoutLease(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := httptest.NewServer(New(filesystem, lease.New(nil, lease.DefaultExpiry)))
+	defer router.Close()
+	body, _ := json.Marshal(apiEnvelope())
+	created, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+
+	response, err := http.Get(router.URL + "/v1/sessions/session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var snapshot struct {
+		ETag    string `json:"etag"`
+		Session struct {
+			SessionID string `json:"sessionId"`
+		} `json:"session"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || snapshot.Session.SessionID != "session-1" || snapshot.ETag == "" || response.Header.Get("ETag") != snapshot.ETag {
+		t.Fatalf("snapshot status %d etag %q session %q", response.StatusCode, snapshot.ETag, snapshot.Session.SessionID)
+	}
+	listed, err := http.Get(router.URL + "/v1/sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listed.Body.Close()
+	var list struct {
+		Sessions []struct {
+			LeaseHolder *string `json:"leaseHolder"`
+			UpdatedAt   string  `json:"updatedAt"`
+		} `json:"sessions"`
+	}
+	if err := json.NewDecoder(listed.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].LeaseHolder != nil || list.Sessions[0].UpdatedAt == "" {
+		t.Fatalf("snapshot must not lease and list must report updatedAt: %+v", list.Sessions)
+	}
 }

@@ -133,12 +133,15 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	switch operation {
 	case "session":
-		if r.Method != http.MethodPut {
-			w.Header().Set("Allow", "PUT")
+		switch r.Method {
+		case http.MethodGet:
+			s.snapshot(w, id)
+		case http.MethodPut:
+			s.update(w, r, id)
+		default:
+			w.Header().Set("Allow", "GET, PUT")
 			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
-			return
 		}
-		s.update(w, r, id)
 	case "lease":
 		switch r.Method {
 		case http.MethodPost:
@@ -178,20 +181,13 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeStoreError(w, err)
 		return
 	}
-	repository := session.UnscopedRepository
+	// The repository value is advisory: a conversation's upstream can appear,
+	// change, or disappear as the user pushes and switches branches.
 	if request.Repository != nil {
-		repository, err = normalizeRequestedRepository(*request.Repository)
-		if err != nil {
+		if _, err := normalizeRequestedRepository(*request.Repository); err != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_repository", "repository scope is invalid", nil)
 			return
 		}
-	} else if record.Envelope.Workspace != nil {
-		s.writeError(w, http.StatusConflict, "workspace_required", "repository scope is required for this conversation", nil)
-		return
-	}
-	if session.RepositoryIdentity(record.Envelope.Workspace) != repository {
-		s.writeError(w, http.StatusConflict, "workspace_mismatch", "conversation belongs to a different Git repository", nil)
-		return
 	}
 	current, err := s.leases.Acquire(id, request.Holder)
 	if err != nil {
@@ -211,6 +207,22 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 		"session":       record.Envelope,
 		"etag":          record.ETag,
 		"lease":         leaseJSON(current, true),
+	})
+}
+
+// snapshot returns the canonical copy without a lease so idle clients can catch up
+// without briefly appearing to be "in use".
+func (s *Server) snapshot(w http.ResponseWriter, id string) {
+	record, err := s.store.Get(id)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("ETag", record.ETag)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"formatVersion": session.FormatVersion,
+		"session":       record.Envelope,
+		"etag":          record.ETag,
 	})
 }
 
@@ -283,13 +295,8 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusBadRequest, "invalid_session", "envelope session id does not match URL", nil)
 		return
 	}
-	current, err := s.store.Get(id)
-	if err != nil {
+	if _, err := s.store.Get(id); err != nil {
 		s.writeStoreError(w, err)
-		return
-	}
-	if session.RepositoryIdentity(current.Envelope.Workspace) != session.RepositoryIdentity(envelope.Workspace) {
-		s.writeError(w, http.StatusConflict, "workspace_mismatch", "conversation belongs to a different Git repository", nil)
 		return
 	}
 	record, err := s.store.Update(id, ifMatch, envelope)
@@ -355,6 +362,10 @@ func (s *Server) metadata(record store.Record) metadata {
 		ETag:        record.ETag,
 		Workspace:   record.Envelope.Workspace,
 	}
+	if !record.UpdatedAt.IsZero() {
+		updatedAt := record.UpdatedAt
+		value.UpdatedAt = &updatedAt
+	}
 	if current, ok := s.leases.Current(record.Envelope.SessionID); ok {
 		value.LeaseHolder = &current.Holder
 		value.LeaseExpiresAt = &current.ExpiresAt
@@ -370,6 +381,7 @@ type metadata struct {
 	ETag           string             `json:"etag"`
 	LeaseHolder    *string            `json:"leaseHolder"`
 	LeaseExpiresAt *time.Time         `json:"leaseExpiresAt"`
+	UpdatedAt      *time.Time         `json:"updatedAt,omitempty"`
 	Workspace      *session.Workspace `json:"workspace,omitempty"`
 }
 

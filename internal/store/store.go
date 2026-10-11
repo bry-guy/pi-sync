@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bry-guy/pi-sync/internal/session"
 )
@@ -31,6 +32,8 @@ type Record struct {
 	Envelope session.Envelope
 	ETag     string
 	Bytes    []byte
+	// UpdatedAt is the stored file's modification time; zero for records not read from disk.
+	UpdatedAt time.Time
 }
 
 type Store struct {
@@ -201,7 +204,7 @@ func (s *Store) readPath(path string) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("validate stored session: %w", err)
 	}
-	return Record{Envelope: envelope, ETag: etag(data), Bytes: data}, nil
+	return Record{Envelope: envelope, ETag: etag(data), Bytes: data, UpdatedAt: info.ModTime().UTC()}, nil
 }
 
 func writeAtomic(path string, data []byte) error {

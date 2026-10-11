@@ -29,14 +29,20 @@
     "extensions",
     "README.md"
   ],
-  "keywords": ["pi-package", "pi", "conversation", "sync"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "conversation",
+    "sync"
+  ],
   "license": "MIT",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
     "test": "npm run build && node --test test/*.test.mjs",
     "check": "npm run build",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:e2e": "npm run build && PI_SYNC_E2E=1 node --test --test-concurrency=1 test/e2e/*.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -48,7 +54,11 @@
     "typescript": "^5.7.0"
   },
   "pi": {
-    "extensions": ["dist/extensions/sync.js"],
-    "skills": ["skills"]
+    "extensions": [
+      "dist/extensions/sync.js"
+    ],
+    "skills": [
+      "skills"
+    ]
   }
 }

@@ -362,7 +362,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     const result = await ctx.switchSession(target, {
       withSession: async (replacement) => {
         try {
-          await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), headEntryId);
+          // Usually the head is the last entry; navigating anyway prints a needless "Navigated" notice.
+          if (replacement.sessionManager.getLeafId() !== headEntryId) {
+            await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), headEntryId);
+          }
         } catch {
           // The materialized file's last entry remains a valid head.
         }

@@ -41,3 +41,21 @@ test("exposes session-not-found as a repairable protocol error", async () => {
     return true;
   });
 });
+
+test("drops legacy whole-envelope fingerprints so the binding file stays small", async () => {
+  const { BindingStore } = await import("../dist/src/index.js");
+  const { mkdtemp, writeFile, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pi-sync-bindings-"));
+  const base = { serverUrl: "http://sync.test", lastEtag: "e1", materializedFile: "/tmp/x.jsonl", state: "ready" };
+  await writeFile(join(dir, "sync-bindings.json"), JSON.stringify({ version: 1, bindings: [
+    { ...base, nativeSessionId: "legacy", canonicalSessionId: "legacy", lastFingerprint: JSON.stringify({ entries: "x".repeat(10000) }) },
+    { ...base, nativeSessionId: "current", canonicalSessionId: "current", lastFingerprint: "ids-abc" },
+  ] }));
+  const store = new BindingStore(dir);
+  assert.equal((await store.get("legacy")).lastFingerprint, undefined);
+  assert.equal((await store.get("current")).lastFingerprint, "ids-abc");
+  await store.set(await store.get("current"));
+  assert.ok((await readFile(join(dir, "sync-bindings.json"), "utf8")).length < 1000);
+});

@@ -43,17 +43,26 @@ export class BindingStore {
 
   async load(): Promise<void> {
     await mkdir(this.root, { recursive: true, mode: 0o700 });
-    try {
-      const value = JSON.parse(await readFile(this.path, "utf8")) as Partial<BindingFile>;
-      if (value.version !== 1 || !Array.isArray(value.bindings)) throw new Error("invalid sync binding file");
-      this.bindings.clear();
-      for (const raw of value.bindings) {
-        if (!isBinding(raw)) continue;
-        this.bindings.set(raw.nativeSessionId, { ...raw });
+    let value: Partial<BindingFile> | undefined;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        value = JSON.parse(await readFile(this.path, "utf8")) as Partial<BindingFile>;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        // A read racing a replacement on some filesystems sees a torn file; the next read is whole.
+        if (!(error instanceof SyntaxError) || attempt >= 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.bindings.clear();
+    }
+    if (value && (value.version !== 1 || !Array.isArray(value.bindings))) throw new Error("invalid sync binding file");
+    this.bindings.clear();
+    for (const raw of value?.bindings ?? []) {
+      if (!isBinding(raw)) continue;
+      const binding = { ...raw };
+      // Older clients stored whole envelopes here, making the file megabytes; only compact fingerprints are meaningful now.
+      if (binding.lastFingerprint && !binding.lastFingerprint.startsWith("ids-")) delete binding.lastFingerprint;
+      this.bindings.set(binding.nativeSessionId, binding);
     }
     this.loaded = true;
   }

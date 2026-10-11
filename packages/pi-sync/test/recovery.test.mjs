@@ -59,3 +59,16 @@ test("drops legacy whole-envelope fingerprints so the binding file stays small",
   await store.set(await store.get("current"));
   assert.ok((await readFile(join(dir, "sync-bindings.json"), "utf8")).length < 1000);
 });
+
+test("separate binding stores sharing a file never lose each other's writes", async () => {
+  const { BindingStore } = await import("../dist/src/index.js");
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pi-sync-shared-"));
+  const stores = [new BindingStore(dir), new BindingStore(dir), new BindingStore(dir)];
+  await Promise.all(stores.flatMap((store, i) => Array.from({ length: 10 }, (_, j) => store.set({
+    nativeSessionId: `s${i}-${j}`, canonicalSessionId: `s${i}-${j}`, serverUrl: "http://sync.test", lastEtag: "e", materializedFile: "/tmp/x", state: "ready",
+  }))));
+  assert.equal((await new BindingStore(dir).all()).length, 30);
+});

@@ -33,7 +33,6 @@ export class BindingStore {
   readonly path: string;
   readonly devicePath: string;
   private bindings = new Map<string, SyncBinding>();
-  private loaded = false;
 
   constructor(root = defaultAgentDir()) {
     this.root = resolve(root);
@@ -42,6 +41,10 @@ export class BindingStore {
   }
 
   async load(): Promise<void> {
+    this.bindings = await this.read();
+  }
+
+  private async read(): Promise<Map<string, SyncBinding>> {
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     let value: Partial<BindingFile> | undefined;
     for (let attempt = 0; ; attempt++) {
@@ -50,54 +53,68 @@ export class BindingStore {
         break;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
-        // A read racing a replacement on some filesystems sees a torn file; the next read is whole.
+        // A read racing a replacement on some filesystems (NFS) sees a torn file; the next read is whole.
         if (!(error instanceof SyntaxError) || attempt >= 4) throw error;
         await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
       }
     }
     if (value && (value.version !== 1 || !Array.isArray(value.bindings))) throw new Error("invalid sync binding file");
-    this.bindings.clear();
+    const bindings = new Map<string, SyncBinding>();
     for (const raw of value?.bindings ?? []) {
       if (!isBinding(raw)) continue;
       const binding = { ...raw };
       // Older clients stored whole envelopes here, making the file megabytes; only compact fingerprints are meaningful now.
       if (binding.lastFingerprint && !binding.lastFingerprint.startsWith("ids-")) delete binding.lastFingerprint;
-      this.bindings.set(binding.nativeSessionId, binding);
+      bindings.set(binding.nativeSessionId, binding);
     }
-    this.loaded = true;
+    return bindings;
   }
 
+  // Every read and mutation goes to disk: several Pi processes (and every session runtime in a
+  // host such as pi-ez-web) share this file, so an in-memory copy would overwrite their changes.
   async get(nativeSessionId: string): Promise<SyncBinding | undefined> {
-    await this.ensureLoaded();
+    await this.load();
     const value = this.bindings.get(nativeSessionId);
     return value ? { ...value } : undefined;
   }
 
   async all(): Promise<SyncBinding[]> {
-    await this.ensureLoaded();
+    await this.load();
     return [...this.bindings.values()].map((value) => ({ ...value }));
   }
 
   async set(binding: SyncBinding): Promise<void> {
-    await this.ensureLoaded();
-    this.bindings.set(binding.nativeSessionId, { ...binding });
-    await this.flush();
+    await this.mutate((bindings) => {
+      bindings.set(binding.nativeSessionId, { ...binding });
+    });
   }
 
   async update(nativeSessionId: string, patch: Partial<SyncBinding>): Promise<SyncBinding | undefined> {
-    await this.ensureLoaded();
-    const current = this.bindings.get(nativeSessionId);
-    if (!current) return undefined;
-    const next = { ...current, ...patch };
-    this.bindings.set(nativeSessionId, next);
-    await this.flush();
-    return { ...next };
+    let next: SyncBinding | undefined;
+    await this.mutate((bindings) => {
+      const current = bindings.get(nativeSessionId);
+      if (!current) return;
+      next = { ...current, ...patch };
+      bindings.set(nativeSessionId, next);
+    });
+    return next ? { ...next } : undefined;
   }
 
   async remove(nativeSessionId: string): Promise<void> {
-    await this.ensureLoaded();
-    this.bindings.delete(nativeSessionId);
-    await this.flush();
+    await this.mutate((bindings) => {
+      bindings.delete(nativeSessionId);
+    });
+  }
+
+  /** Read-modify-write under a cross-process lock so concurrent writers never lose each other's bindings. */
+  private async mutate(change: (bindings: Map<string, SyncBinding>) => void): Promise<void> {
+    await mkdir(this.root, { recursive: true, mode: 0o700 });
+    await withFileLock(`${this.path}.lock`, async () => {
+      const bindings = await this.read();
+      change(bindings);
+      await atomicWrite(this.path, JSON.stringify({ version: 1, bindings: [...bindings.values()] } satisfies BindingFile) + "\n");
+      this.bindings = bindings;
+    });
   }
 
   async deviceLabel(): Promise<string> {
@@ -112,14 +129,6 @@ export class BindingStore {
     return label;
   }
 
-  private async ensureLoaded(): Promise<void> {
-    if (!this.loaded) await this.load();
-  }
-
-  private async flush(): Promise<void> {
-    const value: BindingFile = { version: 1, bindings: [...this.bindings.values()] };
-    await atomicWrite(this.path, JSON.stringify(value) + "\n");
-  }
 }
 
 function isBinding(value: unknown): value is SyncBinding {
@@ -136,6 +145,28 @@ function isBinding(value: unknown): value is SyncBinding {
     (value.parentSessionId === undefined || value.parentSessionId === null || typeof value.parentSessionId === "string") &&
     (value.title === undefined || typeof value.title === "string") &&
     (value.state === undefined || value.state === "ready" || value.state === "setup_required");
+}
+
+async function withFileLock<T>(lockPath: string, task: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      await handle.close();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // A lock older than a few seconds belongs to a crashed writer; writes take milliseconds.
+      const info = await lstat(lockPath).catch(() => undefined);
+      if (info && Date.now() - info.mtimeMs > 5_000) await rm(lockPath, { force: true });
+      else if (attempt > 400) throw new Error(`timed out waiting for ${lockPath}`);
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    return await task();
+  } finally {
+    await rm(lockPath, { force: true });
+  }
 }
 
 function defaultAgentDir(): string {
@@ -175,6 +206,6 @@ async function atomicWrite(path: string, content: string): Promise<void> {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

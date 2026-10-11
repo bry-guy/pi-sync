@@ -468,8 +468,14 @@ export default function syncExtension(pi: ExtensionAPI) {
       return { outcome: "busy", sessionId };
     }
     if (!metadata) return { outcome: "busy", sessionId };
-    if (metadata.leaseHolder) return { outcome: "busy", sessionId };
-    if (metadata.etag === binding.lastEtag && localFingerprint(ctx) === binding.lastFingerprint) return { outcome: "unchanged", sessionId };
+    if (metadata.leaseHolder) {
+      setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
+      return { outcome: "busy", sessionId };
+    }
+    if (metadata.etag === binding.lastEtag && localFingerprint(ctx) === binding.lastFingerprint) {
+      setStatus(ctx, "sync: up to date");
+      return { outcome: "unchanged", sessionId };
+    }
     return refreshCurrent(ctx, "check");
   };
 

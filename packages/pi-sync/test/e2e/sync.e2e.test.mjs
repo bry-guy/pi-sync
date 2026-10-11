@@ -245,3 +245,22 @@ test("detach then attach adopts the server copy without duplicates", { ...opts, 
   await sleep(2500);
   assert.deepEqual(await userTexts(B), ["one", "two", "three"]);
 });
+
+test("resuming an older copy of the file catches up instead of rolling the conversation back", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  const { copyFileSync } = await import("node:fs");
+  const file = (await A.state()).sessionFile;
+  copyFileSync(file, `${file}.old`);
+  await B.prompt("two");
+  await sleep(2500);
+  await A.stop();
+  copyFileSync(`${file}.old`, file); // A's file is now behind the canonical copy
+  rmSync(`${file}.old`);
+  const A2 = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["-c"] });
+  peers.push(A2);
+  await sleep(3000);
+  await A2.prompt("three");
+  assert.deepEqual(await userTexts(A2), ["one", "two", "three"]);
+  await sleep(2500);
+  assert.deepEqual(await userTexts(B), ["one", "two", "three"]);
+});

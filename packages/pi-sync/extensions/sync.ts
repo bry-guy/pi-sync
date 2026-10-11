@@ -35,7 +35,7 @@ type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
 type Replay = { sessionId: string; text: string; images?: unknown[] };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
-type Acquired = { ok: true; acquired: { etag: string; lease: { token: string } } } | { ok: false; message: string };
+type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
 
 function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
@@ -64,6 +64,12 @@ function entriesFingerprint(entries: readonly { id?: unknown }[], headEntryId: s
   for (const entry of entries) hash.update(`${String(entry.id)}\n`);
   hash.update(`head:${headEntryId ?? ""}`);
   return `ids-${hash.digest("hex")}`;
+}
+
+/** True when the local copy lacks canonical entries, e.g. an older file reopened through /resume. */
+function missingCanonicalEntries(local: readonly { id?: unknown }[], canonical: readonly { id?: unknown }[]): boolean {
+  const ids = new Set(local.map((entry) => entry.id));
+  return canonical.some((entry) => !ids.has(entry.id));
 }
 
 function defaultDeviceLabel(): string {
@@ -412,7 +418,8 @@ export default function syncExtension(pi: ExtensionAPI) {
       const fetched = await fetchCanonical(ctx, binding);
       if (!fetched.ok) return { kind: "refused" as const, message: fetched.message };
       const { snapshot } = fetched;
-      if (snapshot.etag === binding.lastEtag) {
+      // Uploading a copy that lacks canonical entries would roll the conversation back, so it catches up instead.
+      if (snapshot.etag === binding.lastEtag && !missingCanonicalEntries(ctx.sessionManager.getEntries() as { id?: unknown }[], snapshot.session.entries)) {
         // Already current; push idle local changes (renames, model switches) under a brief lease.
         if (localFingerprint(ctx) !== binding.lastFingerprint) {
           const reserved = await acquire(ctx, binding);
@@ -749,7 +756,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     const reserved = await exclusive(() => acquire(ctx, binding));
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;
-    if (acquired.etag === binding.lastEtag) {
+    if (acquired.etag === binding.lastEtag && !missingCanonicalEntries(ctx.sessionManager.getEntries() as { id?: unknown }[], acquired.session.entries)) {
       holdLease(ctx, binding, acquired.lease.token);
       return { action: "continue" as const };
     }

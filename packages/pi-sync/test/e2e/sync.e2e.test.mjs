@@ -131,11 +131,15 @@ test("simultaneous use is blocked with the prompt restored, then works once the 
 test("idle model/thinking changes never wedge synchronization", { ...opts, timeout: 90_000 }, async () => {
   const { A, B } = await handoff();
   await A.cmd({ type: "set_thinking_level", level: "high" });
+  await A.cmd({ type: "set_session_name", name: "renamed on A" });
   await B.prompt("two");
   await A.prompt("three");
   assert.deepEqual(await userTexts(A), ["one", "two", "three"]);
+  assert.equal((await A.state()).sessionName, "renamed on A", "idle local changes are carried, not dropped");
   await B.prompt("four");
   assert.deepEqual(await userTexts(B), ["one", "two", "three", "four"]);
+  assert.equal((await B.state()).sessionName, "renamed on A");
+  assert.equal(sessionFiles("A").length, 1, "no spurious unsynced copy");
 });
 
 test("turns made while the server was down upload later, or fork if someone else moved on", { ...opts, timeout: 120_000 }, async () => {

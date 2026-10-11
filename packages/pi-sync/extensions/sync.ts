@@ -27,8 +27,8 @@ import {
 
 const HEARTBEAT_MS = Number(process.env.PI_SYNC_HEARTBEAT_MS) || 20_000;
 const REQUEST_TIMEOUT_MS = 8_000;
-// Entries that change what the model sees. Other entry types (model or thinking
-// changes, labels, names) are safe to drop when a newer canonical copy arrives.
+// Local-only entries of these types mean two devices really wrote the same conversation.
+// Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
@@ -339,14 +339,22 @@ export default function syncExtension(pi: ExtensionAPI) {
     local: SessionEnvelope | undefined,
     binding: SyncBinding,
     snapshot: SessionResponse,
-  ): Promise<{ binding: SyncBinding; copyPath?: string }> => {
+  ): Promise<{ binding: SyncBinding; headEntryId: string; copyPath?: string }> => {
     const remoteIds = new Set(snapshot.session.entries.map((entry: PiEntry) => entry.id));
-    const diverged = local?.entries.some((entry) => !remoteIds.has(entry.id) && CONTEXT_ENTRY_TYPES.has(entry.type));
+    const localOnly = local?.entries.filter((entry) => !remoteIds.has(entry.id)) ?? [];
+    const diverged = localOnly.some((entry) => CONTEXT_ENTRY_TYPES.has(entry.type));
     const copyPath = diverged && local ? await saveLocalCopy(ctx, local) : undefined;
-    await materializeSessionFile(target, snapshot.session, { cwd: ctx.cwd });
+    let headEntryId = snapshot.session.headEntryId;
+    const carried = (diverged ? [] : localOnly).map((entry) => {
+      const rebased = { ...entry, parentId: headEntryId };
+      headEntryId = entry.id;
+      return rebased;
+    });
+    await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...snapshot.session.entries, ...carried] }, { cwd: ctx.cwd });
+    // Recorded as the canonical copy, so carried entries count as local changes and upload on the next check.
     const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
     await store.set(next);
-    return { binding: next, copyPath };
+    return { binding: next, headEntryId, copyPath };
   };
 
   /** Re-opens `target` after it was rewritten, then optionally re-sends the prompt that triggered the refresh. */
@@ -440,7 +448,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       return { outcome: "unchanged", sessionId };
     }
     const message = mode === "manual" ? "Synchronized conversation refreshed." : replay ? undefined : "Updated with changes from another device.";
-    await reopen(ctx, result.target, result.snapshot.session.headEntryId, message, result.written.copyPath, replay);
+    await reopen(ctx, result.target, result.written.headEntryId, message, result.written.copyPath, replay);
     return { outcome: result.written.copyPath ? "conflict" : "refreshed", sessionId, switched: true };
   };
 
@@ -612,7 +620,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       return { kind: "written" as const, written: await materializeCanonical(ctx, target, local, binding, fetched.snapshot), snapshot: fetched.snapshot };
     }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
     if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);
-    await reopen(ctx, target, outcome.snapshot.session.headEntryId, `Opened “${row.item.title || "conversation"}”.`, outcome.written.copyPath, undefined);
+    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${row.item.title || "conversation"}”.`, outcome.written.copyPath, undefined);
   };
 
   const detachCurrent = async (ctx: ExtensionCommandContext) => {

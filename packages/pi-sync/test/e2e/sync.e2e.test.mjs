@@ -234,12 +234,12 @@ test("manual compaction syncs like a turn", { ...opts, timeout: 90_000 }, async 
   await B.prompt("two");
   const compacted = await A.cmd({ type: "compact" });
   if (process.env.PI_SYNC_E2E_VERBOSE) console.log("compact", JSON.stringify(compacted));
-  // The first attempt may be cancelled while A catches up; the second must succeed.
-  if (!compacted.success) {
-    await sleep(1500);
-    assert.ok((await A.cmd({ type: "compact" })).success);
-  }
-  await sleep(2500);
+  // If A was behind, the attempt is cancelled, A catches up, and compaction reruns by itself.
+  if (!compacted.success) assert.ok(A.notes.some((note) => /then compacting/.test(note)), JSON.stringify(compacted));
+  await sleep(4000);
+  const aEntries = (await A.cmd({ type: "get_entries" })).data.entries;
+  const at = (predicate) => aEntries.findIndex(predicate);
+  assert.ok(at((entry) => entry.type === "compaction") > at((entry) => JSON.stringify(entry.message?.content ?? "").includes("two")), "A compacted after catching up with B's turn");
   const entries = (await B.cmd({ type: "get_entries" })).data.entries;
   assert.ok(entries.some((entry) => entry.type === "compaction"), "B received the compaction");
   await B.prompt("three");

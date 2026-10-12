@@ -43,7 +43,7 @@ const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", 
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
-type Replay = { sessionId: string; text: string; images?: unknown[] };
+type Replay = { sessionId: string; text: string; images?: unknown[]; compact?: { customInstructions?: string } };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
 type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
@@ -480,7 +480,9 @@ export default function syncExtension(pi: ExtensionAPI) {
         if (copyTitle) replacement.ui.notify(`Turns from this device that never synchronized were kept as “${copyTitle}”. Open it with /resume.`, "warning");
         if (message) replacement.ui.notify(message, "info");
         await noticeCode(replacement.cwd, replacement.sessionManager.getSessionId(), (text) => replacement.ui.notify(text, "info")).catch(() => undefined);
-        if (replay) {
+        if (replay?.compact) {
+          replacement.compact(replay.compact);
+        } else if (replay) {
           const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
           await replacement.sendUserMessage(content as any);
         }
@@ -941,9 +943,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     await finishTurn(ctx);
   });
 
-  // Manual compaction rewrites context outside a turn, so it needs the lease and a current copy.
+  // Compaction outside a turn rewrites context, so it needs the lease and a current copy.
+  // Inside a turn (threshold or overflow while the lease is held) it is part of that turn's upload.
   pi.on("session_before_compact", async (event, ctx) => {
-    if (event.reason !== "manual" || lease || !currentSessionId) return;
+    if (lease || !currentSessionId) return;
     const binding = await store.get(currentSessionId);
     if (!binding) return;
     const reserved = await exclusive(() => acquire(ctx, binding));
@@ -953,7 +956,11 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     if (reserved.acquired.etag !== binding.lastEtag) {
       await release(binding, reserved.acquired.lease.token);
-      notify(ctx, "Another device changed this conversation; updating first. Run /compact again afterwards.", "warning");
+      // Catch up, then compact the current conversation; automatic compaction simply re-triggers later.
+      if (event.reason === "manual") {
+        pendingReplay = { sessionId: currentSessionId, text: "", compact: { customInstructions: event.customInstructions } };
+        notify(ctx, "Catching up with changes from another device, then compacting…", "info");
+      }
       dispatchRefresh();
       return { cancel: true as const };
     }

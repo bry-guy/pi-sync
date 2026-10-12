@@ -140,6 +140,7 @@ test("a device can take over from one that is stuck mid-turn; the stuck reply is
   assert.deepEqual(await userTexts(A), ["one", "took over"]);
   assert.equal(sessionFiles("A").length, 2, "A's stuck reply is saved as a separate copy");
   assert.ok(A.notes.some((note) => /took over/.test(note)));
+  assert.ok(A.notes.some((note) => /“sleep6000 stuck.*\(unsynced copy\)”.*\/resume/.test(note) || /\(unsynced copy\)”. Open it with \/resume/.test(note)), "the copy is named and findable");
   await A.prompt("back on A");
   await sleep(2500);
   assert.deepEqual(await userTexts(B), ["one", "took over", "back on A"]);
@@ -332,4 +333,16 @@ test("starting pi on another device offers the conversation it hasn't seen", { .
   await B.prompt("continued on B");
   await sleep(2500);
   assert.deepEqual(await userTexts(A), ["from A", "continued on B"]);
+});
+
+test("sending anyway while the server is down uploads the turn once it is back", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  await stopDaemon();
+  A.answers.push(true); // send anyway
+  await A.prompt("written offline");
+  assert.ok((await userTexts(A)).includes("written offline"));
+  await startDaemon(join(caseDir, "data"));
+  await sleep(5000);
+  assert.deepEqual(await userTexts(B), ["one", "written offline"]);
+  assert.equal(sessionFiles("A").length, 1, "no copy when nobody else moved on");
 });

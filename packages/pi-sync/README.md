@@ -52,6 +52,14 @@ says so. `/sync code` then fast-forwards (or creates) the branch and restores
 the shared changes as uncommitted work. It refuses rather than overwrite local
 uncommitted work or a branch that has diverged.
 
+When the server is unreachable, a prompt asks whether to send anyway; that turn
+uploads when the server is back, or is kept as a named "(unsynced copy)"
+session (find it with `/resume`) if another device moved on meanwhile.
+
+Catching up replaces the session in place, so Pi fires `session_start` with
+reason `resume` and `previousSessionFile` equal to the current file. Extensions
+that announce themselves on start can skip that case to stay quiet.
+
 `PI_SYNC_DEVICE_LABEL` overrides the device name shown to other devices; the
 default is the host name. Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.

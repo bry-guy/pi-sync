@@ -45,7 +45,7 @@ type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
 type Replay = { sessionId: string; text: string; images?: unknown[] };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
-type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string };
+type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
 
 function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
@@ -254,7 +254,8 @@ export default function syncExtension(pi: ExtensionAPI) {
         const holder = error instanceof SyncClientError && error.code === "active_lease"
           ? (typeof error.details?.holder === "string" ? error.details.holder : "another device")
           : undefined;
-        return { ok: false, message: await explainFailure(ctx, binding, error), holder };
+        const offline = error instanceof SyncClientError && (error.code === "network_error" || error.code === "timeout");
+        return { ok: false, message: await explainFailure(ctx, binding, error), holder, offline };
       }
     }
   };
@@ -430,8 +431,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     const sessionId = randomUUID();
     const title = `${local.title || firstUserText(local.entries as any[]) || "conversation"} (unsynced copy)`;
     const path = join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
-    await materializeSessionFile(path, { ...local, sessionId, title }, { cwd: ctx.cwd });
-    return path;
+    // A session_info entry makes the name show up in /resume and host session lists.
+    const named = { type: "session_info", id: randomUUID().slice(0, 8), parentId: local.headEntryId || null, timestamp: new Date().toISOString(), name: title } as PiEntry;
+    await materializeSessionFile(path, { ...local, sessionId, title, entries: [...local.entries, named], headEntryId: named.id }, { cwd: ctx.cwd });
+    return title;
   };
 
   /**
@@ -444,11 +447,11 @@ export default function syncExtension(pi: ExtensionAPI) {
     local: SessionEnvelope | undefined,
     binding: SyncBinding,
     snapshot: SessionResponse,
-  ): Promise<{ binding: SyncBinding; headEntryId: string; copyPath?: string }> => {
+  ): Promise<{ binding: SyncBinding; headEntryId: string; copyTitle?: string }> => {
     const remoteIds = new Set(snapshot.session.entries.map((entry: PiEntry) => entry.id));
     const localOnly = local?.entries.filter((entry) => !remoteIds.has(entry.id)) ?? [];
     const diverged = localOnly.some((entry) => CONTEXT_ENTRY_TYPES.has(entry.type));
-    const copyPath = diverged && local ? await saveLocalCopy(ctx, local) : undefined;
+    const copyTitle = diverged && local ? await saveLocalCopy(ctx, local) : undefined;
     let headEntryId = snapshot.session.headEntryId;
     const carried = (diverged ? [] : localOnly).map((entry) => {
       const rebased = { ...entry, parentId: headEntryId };
@@ -459,11 +462,11 @@ export default function syncExtension(pi: ExtensionAPI) {
     // Recorded as the canonical copy, so carried entries count as local changes and upload on the next check.
     const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
     await store.set(next);
-    return { binding: next, headEntryId, copyPath };
+    return { binding: next, headEntryId, copyTitle };
   };
 
   /** Re-opens `target` after it was rewritten, then optionally re-sends the prompt that triggered the refresh. */
-  const reopen = async (ctx: ExtensionCommandContext, target: string, headEntryId: string, message: string | undefined, copyPath: string | undefined, replay: Replay | undefined) => {
+  const reopen = async (ctx: ExtensionCommandContext, target: string, headEntryId: string, message: string | undefined, copyTitle: string | undefined, replay: Replay | undefined) => {
     const result = await ctx.switchSession(target, {
       withSession: async (replacement) => {
         try {
@@ -474,7 +477,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         } catch {
           // The materialized file's last entry remains a valid head.
         }
-        if (copyPath) replacement.ui.notify(`This device had turns that were never synchronized; they were saved as a separate session (${copyPath}).`, "warning");
+        if (copyTitle) replacement.ui.notify(`Turns from this device that never synchronized were kept as “${copyTitle}”. Open it with /resume.`, "warning");
         if (message) replacement.ui.notify(message, "info");
         await noticeCode(replacement.cwd, replacement.sessionManager.getSessionId(), (text) => replacement.ui.notify(text, "info")).catch(() => undefined);
         if (replay) {
@@ -559,8 +562,8 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     // Automatic catch-ups stay quiet: the new turns appearing is the signal.
     const message = mode === "manual" ? "Synchronized conversation refreshed." : undefined;
-    await reopen(ctx, result.target, result.written.headEntryId, message, result.written.copyPath, replay);
-    return { outcome: result.written.copyPath ? "conflict" : "refreshed", sessionId, switched: true };
+    await reopen(ctx, result.target, result.written.headEntryId, message, result.written.copyTitle, replay);
+    return { outcome: result.written.copyTitle ? "conflict" : "refreshed", sessionId, switched: true };
   };
 
   /** Host-driven (pi-ez-web) check: refresh when the canonical copy moved, otherwise report. */
@@ -742,7 +745,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
     if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);
     const opened = title || outcome.snapshot.session.title;
-    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyPath, undefined);
+    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyTitle, undefined);
   };
 
   /**
@@ -901,6 +904,16 @@ export default function syncExtension(pi: ExtensionAPI) {
         `This conversation is running on ${reserved.holder}. Take it over here? Anything ${reserved.holder} is still writing will be kept there as a separate copy.`,
       );
       if (takeOver) reserved = await exclusive(() => acquire(ctx, binding, true));
+    }
+    if (!reserved.ok && reserved.offline && ctx.hasUI) {
+      const sendAnyway = await ctx.ui.confirm(
+        "Sync server unreachable",
+        "Send anyway? This turn uploads when the server is back. If another device continues the conversation meanwhile, this turn is kept as a separate copy.",
+      );
+      if (sendAnyway) {
+        setStatus(ctx, "sync: offline; will upload later");
+        return { action: "continue" as const };
+      }
     }
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;

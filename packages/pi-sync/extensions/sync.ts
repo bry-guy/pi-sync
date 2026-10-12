@@ -40,6 +40,8 @@ const REQUEST_TIMEOUT_MS = 8_000;
 // Local-only entries of these types mean two devices really wrote the same conversation.
 // Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+// Module scope: a catch-up re-creates the extension instance for the reopened session.
+const keptSettings: { value?: { file: string; model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> } } = {};
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
@@ -490,6 +492,8 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   /** Re-opens `target` after it was rewritten, then optionally re-sends the prompt that triggered the refresh. */
   const reopen = async (ctx: ExtensionCommandContext, target: string, headEntryId: string, message: string | undefined, copyTitle: string | undefined, replay: Replay | undefined) => {
+    // Pi adopts the model of the last reply, which may be another device's; a catch-up must not change this device's choice.
+    keptSettings.value = { file: resolvePath(target), model: ctx.model, thinking: pi.getThinkingLevel() };
     const result = await ctx.switchSession(target, {
       withSession: async (replacement) => {
         try {
@@ -893,6 +897,13 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     currentSessionId = ctx.sessionManager.getSessionId();
+    const kept = keptSettings.value;
+    keptSettings.value = undefined;
+    const reopened = ctx.sessionManager.getSessionFile();
+    if (kept && reopened && resolvePath(reopened) === kept.file) {
+      if (kept.model && (ctx.model?.provider !== kept.model.provider || ctx.model?.id !== kept.model.id)) await pi.setModel(kept.model);
+      if (pi.getThinkingLevel() !== kept.thinking) pi.setThinkingLevel(kept.thinking);
+    }
     stopHeartbeat();
     lease = undefined;
     refreshDispatched = false;

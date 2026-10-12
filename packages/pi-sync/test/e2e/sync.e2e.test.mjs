@@ -160,7 +160,7 @@ test("idle model/thinking changes never wedge synchronization", { ...opts, timeo
   assert.equal(sessionFiles("A").length, 1, "no spurious unsynced copy");
 });
 
-test("turns made while the server was down upload later, or fork if someone else moved on", { ...opts, timeout: 120_000 }, async () => {
+test("a turn whose upload was lost to a server outage uploads once the server is back", { ...opts, timeout: 120_000 }, async () => {
   const { A, B } = await handoff();
   await stopDaemon();
   await A.prompt("offline-ish"); // lease held at input? no: acquisition fails, so prompt is refused
@@ -174,17 +174,15 @@ test("turns made while the server was down upload later, or fork if someone else
   await stopDaemon();
   await turn;
   await startDaemon(join(caseDir, "data"));
-  // Either A's background retry uploads the lost turn before B moves on, or B wins and A forks it aside.
+  // Nobody else moved on, so A's background retry must upload the lost turn before B continues.
+  await sleep(2500);
   await B.prompt("b moved on");
-  await sleep(2500);
   await A.prompt("a again");
+  const expected = ["one", "sleep1500 lost upload", "b moved on", "a again"];
+  assert.deepEqual(await userTexts(A), expected);
   await sleep(2500);
-  const texts = await userTexts(A);
-  assert.deepEqual(texts.slice(-2), ["b moved on", "a again"]);
-  assert.deepEqual(await userTexts(B), texts, "both devices converge");
-  if (!texts.includes("sleep1500 lost upload")) {
-    assert.equal(sessionFiles("A").length, 2, "the unsynced local turn is kept as a separate session");
-  }
+  assert.deepEqual(await userTexts(B), expected);
+  assert.equal(sessionFiles("A").length, 1, "the lost turn is uploaded, not saved aside");
 });
 
 test("a crashed mid-turn device does not hold the conversation after restart", { ...opts, timeout: 120_000 }, async () => {
@@ -423,4 +421,20 @@ test("a detached conversation stays detached after the bindings file is lost", {
   assert.match(A2.notes.at(-1), /not synchronized/);
   assert.deepEqual(await userTexts(A2), ["one"]);
   assert.equal(JSON.parse(readFileSync(join(caseDir, "agentA", "sync-bindings.json"), "utf8")).bindings.length, 0);
+});
+
+test("catching up keeps this device's model and thinking level", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  await B.cmd({ type: "set_model", provider: "fake", modelId: "other" });
+  await B.cmd({ type: "set_thinking_level", level: "high" });
+  await B.prompt("two from the other model");
+  await sleep(2500);
+  assert.deepEqual(await userTexts(A), ["one", "two from the other model"], "A caught up");
+  const state = await A.state();
+  assert.equal(state.model?.id, "echo", "A keeps its model");
+  assert.notEqual(state.thinkingLevel, "high", "A keeps its thinking level");
+  await A.prompt("three");
+  await sleep(2500);
+  assert.equal((await B.state()).model?.id, "other", "B keeps its model too");
+  assert.equal(sessionFiles("A").length, 1);
 });

@@ -438,3 +438,22 @@ test("catching up keeps this device's model and thinking level", { ...opts, time
   assert.equal((await B.state()).model?.id, "other", "B keeps its model too");
   assert.equal(sessionFiles("A").length, 1);
 });
+
+test("idle devices, including restarts, stop uploading", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  await A.cmd({ type: "set_thinking_level", level: "high" });
+  await B.prompt("two");
+  await sleep(3000);
+  const etag = async () => (await (await fetch(`${process.env.SYNC_URL}/v1/sessions`)).json()).sessions[0].etag;
+  const settled = await etag();
+  for (let round = 0; round < 2; round++) {
+    await B.stop();
+    peers.splice(peers.indexOf(B), 1);
+    const again = new Pi("B", { cwd: join(caseDir, "git", "b"), agentDir: join(caseDir, "agentB"), args: ["-c"] });
+    peers.push(again);
+    await ready(again);
+    await sleep(4000);
+  }
+  assert.equal(await etag(), settled, "nothing was uploaded while both devices sat idle");
+  assert.deepEqual(await userTexts(A), ["one", "two"]);
+});

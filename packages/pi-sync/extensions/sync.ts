@@ -100,6 +100,24 @@ function relativeAge(value: string | undefined): string {
 
 export default function syncExtension(pi: ExtensionAPI) {
   const store = new BindingStore(getAgentDir());
+  // Last binding seen per session in this process: an older pi-sync process sharing the file can
+  // rewrite it without ours, so a missing binding we still know about is written back.
+  const remembered = new Map<string, SyncBinding>();
+  const bindingFor = async (sessionId: string): Promise<SyncBinding | undefined> => {
+    const stored = await store.get(sessionId);
+    if (stored) {
+      remembered.set(sessionId, stored);
+      return stored;
+    }
+    const known = remembered.get(sessionId);
+    if (known) await store.set(known);
+    return known;
+  };
+  const LINK_ENTRY = "pi-sync-link";
+  const detachedHere = (ctx: ExtensionContext) => {
+    const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === LINK_ENTRY) as { data?: { detached?: boolean } } | undefined;
+    return marker?.data?.detached === true;
+  };
   const deviceLabel = defaultDeviceLabel();
   let currentSessionId: string | undefined;
   let lease: HeldLease | undefined;
@@ -348,7 +366,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         else setStatus(ctx, "sync: upload pending");
       } finally {
         await release(held.binding, held.token);
-        const stored = await store.get(held.binding.nativeSessionId);
+        const stored = await bindingFor(held.binding.nativeSessionId);
         if (stored?.leaseToken === held.token) {
           delete stored.leaseToken;
           await store.set(stored);
@@ -387,7 +405,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const lastCodeNotice = new Map<string, string>();
   /** Tells the user when this checkout doesn't have the conversation's code. */
   const noticeCode = async (cwd: string, sessionId: string, notifyUser: (message: string) => void) => {
-    const binding = await store.get(sessionId);
+    const binding = await bindingFor(sessionId);
     const workspace = binding?.workspace;
     if (!workspace) return;
     const key = workspace.wip?.commit ?? workspace.commit;
@@ -404,7 +422,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       notify(ctx, arg === "on" ? "Uncommitted code will be shared with your other devices after each turn." : "Uncommitted code will not be shared.", "info");
       return;
     }
-    const binding = await store.get(ctx.sessionManager.getSessionId());
+    const binding = await bindingFor(ctx.sessionManager.getSessionId());
     if (!binding?.workspace) {
       notify(ctx, "No code state is recorded for this conversation.", "info");
       return;
@@ -503,7 +521,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     currentSessionId = sessionId;
     const replay = pendingReplay?.sessionId === sessionId ? pendingReplay : undefined;
     pendingReplay = undefined;
-    const binding = await store.get(sessionId);
+    const binding = await bindingFor(sessionId);
     const restoreReplay = (message: string) => {
       notify(ctx, message, "warning");
       if (replay) {
@@ -576,7 +594,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   /** Host-driven (pi-ez-web) check: refresh when the canonical copy moved, otherwise report. */
   const checkCurrent = async (ctx: ExtensionCommandContext): Promise<CheckResult> => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const binding = await store.get(sessionId);
+    const binding = await bindingFor(sessionId);
     if (!binding) return { outcome: "unchanged", sessionId };
     if (lease || binding.state === "setup_required" || !ctx.isIdle()) return { outcome: "busy", sessionId };
     let metadata;
@@ -600,7 +618,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const poll = async (ctx: ExtensionContext, generation: number) => {
     if (generation !== pollGeneration || lease || busy || refreshDispatched || !currentSessionId) return;
     if (!ctx.isIdle() || hasPendingInput(ctx)) return;
-    const binding = await store.get(currentSessionId);
+    const binding = await bindingFor(currentSessionId);
     if (!binding || binding.state === "setup_required") return;
     let metadata;
     try {
@@ -648,7 +666,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (!path || !existsSync(path)) return fail(ctx, "sync_not_persistent", "Send at least one message before synchronizing this conversation.");
     const sessionId = ctx.sessionManager.getSessionId();
     currentSessionId = sessionId;
-    const existing = await store.get(sessionId);
+    const existing = await bindingFor(sessionId);
     const url = configuredUrl(args) ?? existing?.serverUrl;
     if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL or run /sync attach <server URL>.");
     if (existing && existing.state !== "setup_required") {
@@ -656,6 +674,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       startPoll(ctx);
       return;
     }
+    if (detachedHere(ctx)) pi.appendEntry(LINK_ENTRY, { detached: false });
     let envelope: SessionEnvelope;
     try {
       envelope = await normalizeCurrent(ctx, existing);
@@ -689,7 +708,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   const syncPick = async (ctx: ExtensionCommandContext) => {
-    const current = await store.get(ctx.sessionManager.getSessionId());
+    const current = await bindingFor(ctx.sessionManager.getSessionId());
     const url = configuredUrl() ?? current?.serverUrl;
     if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL before using /sync.");
     if (!ctx.hasUI) return fail(ctx, "sync_ui_required", "The synchronized-session picker requires an interactive UI.");
@@ -732,7 +751,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   /** Opens a shared conversation on this device, reusing its file when this device already has one. */
   const openSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
-    const existing = await store.get(sessionId);
+    const existing = await bindingFor(sessionId);
     const reusable = existing && existsSync(existing.materializedFile) ? existing : undefined;
     const target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
     const binding: SyncBinding = reusable ?? {
@@ -783,7 +802,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   const detachCurrent = async (ctx: ExtensionCommandContext) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const binding = await store.get(sessionId);
+    const binding = await bindingFor(sessionId);
     if (!binding) {
       notify(ctx, "This conversation is not synchronized.", "info");
       return;
@@ -791,13 +810,15 @@ export default function syncExtension(pi: ExtensionAPI) {
     await ctx.waitForIdle();
     await finishTurn(ctx);
     stopPoll();
+    remembered.delete(sessionId);
     await store.remove(sessionId);
+    pi.appendEntry(LINK_ENTRY, { detached: true });
     setStatus(ctx);
     notify(ctx, "Stopped synchronizing this conversation on this device. The server copy is unchanged.", "info");
   };
 
   const showStatus = async (ctx: ExtensionCommandContext) => {
-    const binding = await store.get(ctx.sessionManager.getSessionId());
+    const binding = await bindingFor(ctx.sessionManager.getSessionId());
     if (!binding) {
       notify(ctx, "This conversation is not synchronized. Use /sync attach to share it.", "info");
       return;
@@ -838,7 +859,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (command === "status") return showStatus(ctx);
       if (command === "code") return syncCode(ctx, rest[0] ?? "");
       if (command === "open" && rest[0]) {
-        const url = configuredUrl() ?? (await store.get(ctx.sessionManager.getSessionId()))?.serverUrl;
+        const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
         if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL before using /sync.");
         return openSynced(ctx, url, rest[0]);
       }
@@ -847,6 +868,29 @@ export default function syncExtension(pi: ExtensionAPI) {
     },
   });
 
+  /**
+   * Restores a binding lost from the shared file when the server holds a conversation with this
+   * session's own id. Copies have fresh ids and detached conversations carry a marker, so neither
+   * reconnects. The normal check then uploads local-only turns or keeps them as an unsynced copy.
+   */
+  const reconnect = async (ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const file = ctx.sessionManager.getSessionFile();
+    const url = configuredUrl();
+    if (!url || !file || !existsSync(file) || detachedHere(ctx)) return;
+    const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: file, state: "ready" };
+    let etag: string;
+    try {
+      etag = (await clientFor(url).get(sessionId, { timeoutMs: 5_000 })).etag;
+    } catch {
+      return; // Not on the server, or unreachable: stay unsynchronized and silent.
+    }
+    if (currentSessionId !== sessionId || (await store.get(sessionId))) return;
+    await store.set({ ...base, lastEtag: etag });
+    setStatus(ctx, "sync: reconnected");
+    startPoll(ctx);
+  };
+
   pi.on("session_start", async (event, ctx) => {
     currentSessionId = ctx.sessionManager.getSessionId();
     stopHeartbeat();
@@ -854,10 +898,11 @@ export default function syncExtension(pi: ExtensionAPI) {
     refreshDispatched = false;
     stopPoll();
     await store.load();
-    let binding = await store.get(currentSessionId);
+    let binding = await bindingFor(currentSessionId);
     if (!binding) {
       setStatus(ctx);
       if (event.reason === "startup" && !hasMessages(ctx)) void offerArrival(ctx).catch(() => undefined);
+      else void reconnect(ctx).catch(() => undefined);
       return;
     }
     if (binding.leaseToken) {
@@ -897,7 +942,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     if (!currentSessionId || lease) return { action: "continue" as const };
-    const binding = await store.get(currentSessionId);
+    const binding = await bindingFor(currentSessionId);
     if (!binding) return { action: "continue" as const };
     if (binding.state === "setup_required") {
       return refuse(ctx, event.text, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.");
@@ -952,7 +997,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   // Inside a turn (threshold or overflow while the lease is held) it is part of that turn's upload.
   pi.on("session_before_compact", async (event, ctx) => {
     if (lease || !currentSessionId) return;
-    const binding = await store.get(currentSessionId);
+    const binding = await bindingFor(currentSessionId);
     if (!binding) return;
     const reserved = await exclusive(() => acquire(ctx, binding));
     if (!reserved.ok) {

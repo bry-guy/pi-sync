@@ -379,3 +379,48 @@ test("automatic compaction during a turn syncs like the turn", { ...opts, timeou
   assert.equal((await userTexts(A)).at(-1), "three");
   assert.equal(sessionFiles("A").length, 1, "no spurious copy");
 });
+
+// Mimics an older pi-sync process rewriting the shared bindings file without this conversation.
+const eraseBindings = (name) => writeFileSync(join(caseDir, `agent${name}`, "sync-bindings.json"), JSON.stringify({ version: 1, bindings: [] }));
+
+test("erased bindings reconnect, mid-session and after a restart", { ...opts, timeout: 150_000 }, async () => {
+  const { A, B } = await handoff();
+  await A.prompt("a two");
+  await sleep(1500);
+  eraseBindings("A");
+  await B.prompt("b three");
+  await sleep(500);
+  await A.prompt("a four");
+  await sleep(2500);
+  assert.deepEqual(await userTexts(A), ["one", "a two", "b three", "a four"]);
+  assert.deepEqual(await userTexts(B), ["one", "a two", "b three", "a four"]);
+  await A.stop();
+  peers.splice(peers.indexOf(A), 1);
+  eraseBindings("A");
+  await B.prompt("b five");
+  await sleep(500);
+  const A2 = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["-c"] });
+  peers.push(A2);
+  await sleep(4000);
+  assert.deepEqual(await userTexts(A2), ["one", "a two", "b three", "a four", "b five"]);
+  await A2.prompt("a six");
+  await sleep(2500);
+  assert.equal((await userTexts(B)).at(-1), "a six");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+});
+
+test("a detached conversation stays detached after the bindings file is lost", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  await A.prompt("/sync detach");
+  await A.stop();
+  peers.splice(peers.indexOf(A), 1);
+  eraseBindings("A");
+  await B.prompt("b two");
+  const A2 = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["-c"] });
+  peers.push(A2);
+  await sleep(4000);
+  await A2.prompt("/sync status");
+  assert.match(A2.notes.at(-1), /not synchronized/);
+  assert.deepEqual(await userTexts(A2), ["one"]);
+  assert.equal(JSON.parse(readFileSync(join(caseDir, "agentA", "sync-bindings.json"), "utf8")).bindings.length, 0);
+});

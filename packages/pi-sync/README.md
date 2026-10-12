@@ -60,6 +60,12 @@ Catching up replaces the session in place, so Pi fires `session_start` with
 reason `resume` and `previousSessionFile` equal to the current file. Extensions
 that announce themselves on start can skip that case to stay quiet.
 
+If `sync-bindings.json` loses a conversation (for example, an older pi-sync
+process rewrote it), the running session writes it back. A new session
+reconnects on its own when the server has a conversation with the same id,
+unless it was stopped with `/sync detach`, which records that in the session.
+To stop older processes rewriting the file, restart them after updating.
+
 `PI_SYNC_DEVICE_LABEL` overrides the device name shown to other devices; the
 default is the host name. Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.

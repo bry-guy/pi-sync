@@ -17,7 +17,7 @@ http.createServer((req, res) => {
     send({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: "echo: " } }] });
     if (delay) await new Promise((r) => setTimeout(r, delay));
     send({ ...base, choices: [{ index: 0, delta: { content: last.slice(-200) } }] });
-    send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
+    send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: Number((last.match(/usage(\d+)/) || [])[1] || 1), completion_tokens: 1, total_tokens: 2 } });
     res.end("data: [DONE]\n\n");
   });
 }).listen(port, "127.0.0.1");

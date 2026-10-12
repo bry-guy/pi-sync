@@ -346,3 +346,36 @@ test("sending anyway while the server is down uploads the turn once it is back",
   assert.deepEqual(await userTexts(B), ["one", "written offline"]);
   assert.equal(sessionFiles("A").length, 1, "no copy when nobody else moved on");
 });
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+test("images survive the trip to another device", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  await A.prompt("look at this", { images: [{ type: "image", data: PNG, mimeType: "image/png" }] });
+  await sleep(2500);
+  const message = (await B.messages()).find((m) => m.role === "user" && JSON.stringify(m.content).includes("look at this"));
+  assert.ok(message, "B caught up with the image prompt");
+  assert.ok(message.content.some((part) => part.type === "image" && part.data === PNG), "the image bytes are identical");
+});
+
+test("automatic compaction during a turn syncs like the turn", { ...opts, timeout: 120_000 }, async () => {
+  const A = peer("A", "a", { PI_E2E_CONTEXT_WINDOW: "20000" }), B = peer("B");
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await ready(B);
+  B.answers.push((options) => options[0]);
+  await B.prompt("/sync");
+  await sleep(300);
+  // The fake model reports 19000 prompt tokens, crossing A's threshold, so Pi compacts after this turn.
+  await A.prompt("two usage19000");
+  await sleep(4000);
+  const aEntries = (await A.cmd({ type: "get_entries" })).data.entries;
+  assert.ok(aEntries.some((entry) => entry.type === "compaction"), "A compacted automatically");
+  const bEntries = (await B.cmd({ type: "get_entries" })).data.entries;
+  assert.ok(bEntries.some((entry) => entry.type === "compaction"), "B received the automatic compaction");
+  await B.prompt("three");
+  await sleep(2500);
+  assert.equal((await userTexts(A)).at(-1), "three");
+  assert.equal(sessionFiles("A").length, 1, "no spurious copy");
+});

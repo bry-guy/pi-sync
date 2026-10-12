@@ -9,7 +9,7 @@ export class Pi {
   constructor(name, { cwd, agentDir, args = [], env = {} }) {
     this.name = name; this.events = []; this.notes = []; this.status = {}; this.waiters = []; this.answers = []; this.pending = new Map(); this.seq = 0;
     mkdirSync(agentDir, { recursive: true });
-    writeFileSync(`${agentDir}/models.json`, JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${process.env.FAKE_LLM_PORT || 18081}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "echo" }] } } }));
+    writeFileSync(`${agentDir}/models.json`, JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${process.env.FAKE_LLM_PORT || 18081}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "echo", input: ["text", "image"], contextWindow: Number(env.PI_E2E_CONTEXT_WINDOW || 128000) }] } } }));
     writeFileSync(`${agentDir}/settings.json`, JSON.stringify({ compaction: { keepRecentTokens: 1 } }));
     this.proc = spawn(PI_BIN, ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-context-files", "--no-mcp", "--no-prompt-templates", "--no-themes", "-e", EXT, "--provider", "fake", "--model", "echo", ...args], {
       cwd, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_SYNC_SERVER_URL: process.env.SYNC_URL || "http://127.0.0.1:18080", PI_SYNC_HEARTBEAT_MS: "1000", PI_SYNC_DEVICE_LABEL: name, ...env }, stdio: ["pipe", "pipe", "pipe"],

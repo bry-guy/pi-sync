@@ -54,11 +54,20 @@ func New(clock Clock, duration time.Duration) *Registry {
 }
 
 func (r *Registry) Acquire(sessionID, holder string) (Lease, error) {
+	return r.acquire(sessionID, holder, false)
+}
+
+// TakeOver replaces any active lease, invalidating the previous holder's token.
+func (r *Registry) TakeOver(sessionID, holder string) (Lease, error) {
+	return r.acquire(sessionID, holder, true)
+}
+
+func (r *Registry) acquire(sessionID, holder string, takeOver bool) (Lease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock.Now()
 	r.removeExpiredLocked(now)
-	if current, ok := r.leases[sessionID]; ok {
+	if current, ok := r.leases[sessionID]; ok && !takeOver {
 		return current, ErrActive
 	}
 	token, err := newToken()

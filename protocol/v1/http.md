@@ -33,7 +33,11 @@ Lease tokens are returned only by acquisition and are sent in
 as compatibility aliases. Updates must also send `If-Match` with the exact ETag
 returned by acquisition or the previous update.
 
-Acquisition accepts `{ "holder": "display-only device label", "repository": "normalized repository identity" }`.
+Acquisition accepts `{ "holder": "display-only device label", "repository": "normalized repository identity", "takeOver": false }`.
+With `"takeOver": true` acquisition replaces an active lease instead of
+returning `423 active_lease`; the previous holder's token stops working, so its
+renewals and uploads fail with `423 lease_invalid`. Clients offer this only
+after the user confirms, for a device that is asleep or stuck mid-turn.
 The repository value is advisory and only validated for format: a
 conversation's upstream can appear, change, or disappear as the user pushes
 and switches branches, so acquisition and updates never reject a scope

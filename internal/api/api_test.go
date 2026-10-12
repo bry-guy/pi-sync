@@ -313,3 +313,55 @@ func TestHTTPSnapshotWithoutLease(t *testing.T) {
 		t.Fatalf("snapshot must not lease and list must report updatedAt: %+v", list.Sessions)
 	}
 }
+
+func TestHTTPTakeOverInvalidatesPreviousHolder(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := httptest.NewServer(New(filesystem, lease.New(nil, lease.DefaultExpiry)))
+	defer router.Close()
+	body, _ := json.Marshal(apiEnvelope())
+	created, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+	acquire := func(payload string) (int, string, string) {
+		response, err := http.Post(router.URL+"/v1/sessions/session-1/lease", "application/json", bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var result struct {
+			ETag  string `json:"etag"`
+			Lease struct {
+				Token string `json:"token"`
+			} `json:"lease"`
+		}
+		_ = json.NewDecoder(response.Body).Decode(&result)
+		return response.StatusCode, result.Lease.Token, result.ETag
+	}
+	if status, _, _ := acquire(`{"holder":"laptop"}`); status != http.StatusOK {
+		t.Fatalf("first acquire = %d", status)
+	}
+	if status, _, _ := acquire(`{"holder":"desktop"}`); status != http.StatusLocked {
+		t.Fatalf("plain acquire while held = %d", status)
+	}
+	status, token, etag := acquire(`{"holder":"desktop","takeOver":true}`)
+	if status != http.StatusOK || token == "" {
+		t.Fatalf("take over = %d", status)
+	}
+	// The sleeping holder's token no longer works, so its late upload cannot overwrite.
+	request, _ := http.NewRequest(http.MethodPut, router.URL+"/v1/sessions/session-1", bytes.NewReader(body))
+	request.Header.Set("X-Pi-Sync-Lease", "stale-token")
+	request.Header.Set("If-Match", etag)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusLocked {
+		t.Fatalf("stale holder upload = %d", response.StatusCode)
+	}
+}

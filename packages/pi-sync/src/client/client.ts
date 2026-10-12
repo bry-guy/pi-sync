@@ -123,11 +123,12 @@ export class SyncClient {
     return this.sessionRequest("/v1/sessions", "POST", envelope, options);
   }
 
-  async acquire(sessionId: string, holder: string, options: RepositoryRequestOptions = {}): Promise<AcquireResponse> {
+  /** `takeOver` replaces another device's lease; its later upload is refused. */
+  async acquire(sessionId: string, holder: string, options: RepositoryRequestOptions & { takeOver?: boolean } = {}): Promise<AcquireResponse> {
     const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/lease`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ holder, ...(options.repository === undefined ? {} : { repository: options.repository || "none" }) }),
+      body: JSON.stringify({ holder, ...(options.repository === undefined ? {} : { repository: options.repository || "none" }), ...(options.takeOver ? { takeOver: true } : {}) }),
     }, options);
     try {
       if (!isRecord(value)) throw new Error("object expected");

@@ -168,6 +168,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 	var request struct {
 		Holder     string  `json:"holder"`
 		Repository *string `json:"repository"`
+		TakeOver   bool    `json:"takeOver"`
 	}
 	if !s.readJSON(w, r, &request) {
 		return
@@ -189,7 +190,11 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 	}
-	current, err := s.leases.Acquire(id, request.Holder)
+	acquire := s.leases.Acquire
+	if request.TakeOver {
+		acquire = s.leases.TakeOver
+	}
+	current, err := acquire(id, request.Holder)
 	if err != nil {
 		if lease.IsActive(err) {
 			s.writeError(w, http.StatusLocked, "active_lease", "session is currently leased", map[string]any{

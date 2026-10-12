@@ -21,7 +21,9 @@ Once a conversation is shared, synchronization runs in the background:
 
 - Each prompt holds the conversation's lease only for that turn, so a second
   device is told which device is running it. Its prompt is put back in the
-  editor rather than lost.
+  editor rather than lost. If the other device is asleep or stuck mid-turn,
+  you can confirm a take-over; whatever that device was still writing is kept
+  there as a separate copy.
 - An idle device follows remote turns automatically.
 - If you type on a device that is behind, it catches up first and then sends
   your prompt.

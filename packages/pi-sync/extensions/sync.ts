@@ -35,7 +35,7 @@ type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
 type Replay = { sessionId: string; text: string; images?: unknown[] };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
-type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string };
+type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
 
 function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
@@ -220,10 +220,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     return error instanceof Error ? error.message : "Could not reach the synchronized conversation.";
   };
 
-  const acquire = async (ctx: ExtensionContext, binding: SyncBinding): Promise<Acquired> => {
+  const acquire = async (ctx: ExtensionContext, binding: SyncBinding, takeOver = false): Promise<Acquired> => {
     for (let attempt = 0; ; attempt++) {
       try {
-        const acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS });
+        const acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS, takeOver });
         return { ok: true, acquired };
       } catch (error) {
         // Another device's idle upload holds the lease for well under a second; wait that out.
@@ -231,7 +231,10 @@ export default function syncExtension(pi: ExtensionAPI) {
           await new Promise((resolve) => setTimeout(resolve, 400));
           continue;
         }
-        return { ok: false, message: await explainFailure(ctx, binding, error) };
+        const holder = error instanceof SyncClientError && error.code === "active_lease"
+          ? (typeof error.details?.holder === "string" ? error.details.holder : "another device")
+          : undefined;
+        return { ok: false, message: await explainFailure(ctx, binding, error), holder };
       }
     }
   };
@@ -302,6 +305,10 @@ export default function syncExtension(pi: ExtensionAPI) {
         const code = error instanceof SyncClientError ? error.code : "";
         if (code === "session_not_found") await markSetupRequired(ctx, held.binding);
         else if (code === "stale_etag") setStatus(ctx, "sync: newer copy elsewhere; will refresh");
+        else if (code === "lease_invalid" || code === "lease_not_found") {
+          setStatus(ctx, "sync: taken over elsewhere");
+          notify(ctx, "Another device took over this conversation. This reply will be kept as a separate copy when this copy catches up.", "warning");
+        }
         else setStatus(ctx, "sync: upload pending");
       } finally {
         await release(held.binding, held.token);
@@ -753,7 +760,15 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (binding.state === "setup_required") {
       return refuse(ctx, event.text, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.");
     }
-    const reserved = await exclusive(() => acquire(ctx, binding));
+    let reserved = await exclusive(() => acquire(ctx, binding));
+    if (!reserved.ok && reserved.holder && ctx.hasUI) {
+      // A sleeping or crashed device can hold the lease for up to two minutes; let the user take it.
+      const takeOver = await ctx.ui.confirm(
+        `Running on ${reserved.holder}`,
+        `This conversation is running on ${reserved.holder}. Take it over here? Anything ${reserved.holder} is still writing will be kept there as a separate copy.`,
+      );
+      if (takeOver) reserved = await exclusive(() => acquire(ctx, binding, true));
+    }
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;
     if (acquired.etag === binding.lastEtag && !missingCanonicalEntries(ctx.sessionManager.getEntries() as { id?: unknown }[], acquired.session.entries)) {

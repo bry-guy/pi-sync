@@ -128,6 +128,23 @@ test("simultaneous use is blocked with the prompt restored, then works once the 
   assert.deepEqual(await userTexts(B), ["one", "sleep2500 long", "after"]);
 });
 
+test("a device can take over from one that is stuck mid-turn; the stuck reply is kept as a copy", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  const running = A.prompt("sleep6000 stuck");
+  await sleep(800);
+  B.answers.push(true); // confirm the take-over
+  await B.prompt("took over");
+  assert.deepEqual(await userTexts(B), ["one", "took over"]);
+  await running;
+  await sleep(4000); // A's upload is refused; its next background check catches up and keeps the reply aside
+  assert.deepEqual(await userTexts(A), ["one", "took over"]);
+  assert.equal(sessionFiles("A").length, 2, "A's stuck reply is saved as a separate copy");
+  assert.ok(A.notes.some((note) => /took over/.test(note)));
+  await A.prompt("back on A");
+  await sleep(2500);
+  assert.deepEqual(await userTexts(B), ["one", "took over", "back on A"]);
+});
+
 test("idle model/thinking changes never wedge synchronization", { ...opts, timeout: 90_000 }, async () => {
   const { A, B } = await handoff();
   await A.cmd({ type: "set_thinking_level", level: "high" });

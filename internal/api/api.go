@@ -483,7 +483,7 @@ func (s *Server) readJSON(w http.ResponseWriter, r *http.Request, target any) bo
 }
 
 func (s *Server) writeHealth(w http.ResponseWriter) {
-	if _, err := s.store.List(); err != nil {
+	if err := s.store.Ready(); err != nil {
 		s.writeError(w, http.StatusServiceUnavailable, "store_unavailable", "session store is unavailable", nil)
 		return
 	}

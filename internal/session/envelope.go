@@ -275,13 +275,29 @@ func Validate(envelope Envelope) error {
 		if roots != 1 {
 			return invalid("entries", "must contain exactly one root entry")
 		}
-		for id := range ids {
-			seen := make(map[string]struct{})
-			for current := id; current != ""; current = parents[current] {
-				if _, ok := seen[current]; ok {
-					return invalid("entries", fmt.Sprintf("entry graph contains a cycle at %q", current))
+		// Ids are unique, parents exist and there is one root, so every entry the
+		// root cannot reach sits on a cycle. One walk keeps this linear.
+		children := make(map[string][]string, len(parents))
+		root := ""
+		for id, parent := range parents {
+			if parent == "" {
+				root = id
+			} else {
+				children[parent] = append(children[parent], id)
+			}
+		}
+		reached := map[string]struct{}{root: {}}
+		for queue := []string{root}; len(queue) > 0; queue = queue[1:] {
+			for _, child := range children[queue[0]] {
+				reached[child] = struct{}{}
+				queue = append(queue, child)
+			}
+		}
+		if len(reached) != len(ids) {
+			for id := range ids {
+				if _, ok := reached[id]; !ok {
+					return invalid("entries", fmt.Sprintf("entry graph contains a cycle at %q", id))
 				}
-				seen[current] = struct{}{}
 			}
 		}
 	}

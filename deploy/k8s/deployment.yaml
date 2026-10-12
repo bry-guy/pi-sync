@@ -40,6 +40,8 @@ spec:
               value: 0.0.0.0:8080
             - name: PI_SYNC_DATA_DIR
               value: /data
+            - name: GOMEMLIMIT
+              value: 200MiB
           ports:
             - name: http
               containerPort: 8080
@@ -63,7 +65,7 @@ spec:
               cpu: 10m
               memory: 32Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

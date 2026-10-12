@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,6 @@ func (e *StaleETagError) Error() string {
 type Record struct {
 	Envelope session.Envelope
 	ETag     string
-	Bytes    []byte
 	// UpdatedAt is the stored file's modification time; zero for records not read from disk.
 	UpdatedAt time.Time
 }
@@ -100,7 +100,7 @@ func (s *Store) Create(envelope session.Envelope) (Record, error) {
 	if err := writeAtomic(path, data); err != nil {
 		return Record{}, err
 	}
-	return Record{Envelope: envelope, ETag: etag(data), Bytes: data}, nil
+	return Record{Envelope: envelope, ETag: etag(data)}, nil
 }
 
 func (s *Store) Get(id string) (Record, error) {
@@ -143,7 +143,7 @@ func (s *Store) Update(id, expectedETag string, envelope session.Envelope) (Reco
 	if err := writeAtomic(path, data); err != nil {
 		return Record{}, err
 	}
-	return Record{Envelope: envelope, ETag: etag(data), Bytes: data}, nil
+	return Record{Envelope: envelope, ETag: etag(data)}, nil
 }
 
 func (s *Store) List() ([]Record, error) {
@@ -165,7 +165,7 @@ func (s *Store) List() ([]Record, error) {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("session file %q is a symlink", name)
 		}
-		record, err := s.readPath(filepath.Join(directory, name))
+		record, err := s.readPathSummary(filepath.Join(directory, name))
 		if err != nil {
 			return nil, fmt.Errorf("read session %q: %w", name, err)
 		}
@@ -174,7 +174,7 @@ func (s *Store) List() ([]Record, error) {
 	return records, nil
 }
 
-func (s *Store) readPath(path string) (Record, error) {
+func (s *Store) read(path string, summaryOnly bool) (Record, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Record{}, ErrNotFound
@@ -200,12 +200,38 @@ func (s *Store) readPath(path string) (Record, error) {
 	if len(data) > session.MaxEnvelopeBytes {
 		return Record{}, fmt.Errorf("stored session is too large")
 	}
-	envelope, err := session.Decode(data)
-	if err != nil {
-		return Record{}, fmt.Errorf("validate stored session: %w", err)
+	// Stored files were fully validated on write; reads only confirm the file is ours.
+	var envelope session.Envelope
+	if summaryOnly {
+		// No entries field, so the decoder skips them without copying.
+		var summary struct {
+			FormatVersion    int                `json:"formatVersion"`
+			SessionID        string             `json:"sessionId"`
+			PiSessionVersion int                `json:"piSessionVersion"`
+			CreatedAt        string             `json:"createdAt"`
+			ParentSessionID  *string            `json:"parentSessionId"`
+			HeadEntryID      string             `json:"headEntryId"`
+			Title            string             `json:"title"`
+			Workspace        *session.Workspace `json:"workspace,omitempty"`
+		}
+		err = json.Unmarshal(data, &summary)
+		envelope = session.Envelope{FormatVersion: summary.FormatVersion, SessionID: summary.SessionID, PiSessionVersion: summary.PiSessionVersion, CreatedAt: summary.CreatedAt, ParentSessionID: summary.ParentSessionID, HeadEntryID: summary.HeadEntryID, Title: summary.Title, Workspace: summary.Workspace}
+	} else {
+		err = json.Unmarshal(data, &envelope)
 	}
-	return Record{Envelope: envelope, ETag: etag(data), Bytes: data, UpdatedAt: info.ModTime().UTC()}, nil
+	if err != nil {
+		return Record{}, fmt.Errorf("decode stored session: %w", err)
+	}
+	if envelope.FormatVersion != session.FormatVersion || envelope.SessionID+".json" != filepath.Base(path) {
+		return Record{}, fmt.Errorf("stored session does not match its file")
+	}
+	return Record{Envelope: envelope, ETag: etag(data), UpdatedAt: info.ModTime().UTC()}, nil
 }
+
+func (s *Store) readPath(path string) (Record, error) { return s.read(path, false) }
+
+// readPathSummary skips entries: listing needs only titles, heads and etags.
+func (s *Store) readPathSummary(path string) (Record, error) { return s.read(path, true) }
 
 func writeAtomic(path string, data []byte) error {
 	directory := filepath.Dir(path)
@@ -267,4 +293,10 @@ func etag(data []byte) string {
 func IsStaleETag(err error) bool {
 	var stale *StaleETagError
 	return errors.As(err, &stale)
+}
+
+// Ready reports whether the sessions directory is readable without reading any session.
+func (s *Store) Ready() error {
+	_, err := os.ReadDir(filepath.Join(s.root, "sessions"))
+	return err
 }

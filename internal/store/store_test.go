@@ -34,7 +34,7 @@ func TestCreateUpdateAndList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ETag == "" || len(created.Bytes) == 0 {
+	if created.ETag == "" {
 		t.Fatal("create did not return stored bytes and ETag")
 	}
 	if _, err := filesystem.Create(storeEnvelope("session-1")); !errors.Is(err, ErrAlreadyExists) {

@@ -31,6 +31,13 @@ type Workspace struct {
 	GitRemote string `json:"gitRemote"`
 	Branch    string `json:"branch"`
 	Commit    string `json:"commit"`
+	// Wip is a working-tree snapshot pushed to refs/pi-sync/<session id>.
+	Wip *WorkspaceSnapshot `json:"wip,omitempty"`
+}
+
+type WorkspaceSnapshot struct {
+	Commit string `json:"commit"`
+	Branch string `json:"branch"`
 }
 
 const UnscopedRepository = "none"
@@ -288,6 +295,14 @@ func Validate(envelope Envelope) error {
 		}
 		if !hexCommit.MatchString(envelope.Workspace.Commit) {
 			return invalid("workspace.commit", "must be a hexadecimal commit identifier")
+		}
+		if wip := envelope.Workspace.Wip; wip != nil {
+			if !hexCommit.MatchString(wip.Commit) {
+				return invalid("workspace.wip.commit", "must be a hexadecimal commit identifier")
+			}
+			if !validBranch(wip.Branch) {
+				return invalid("workspace.wip.branch", "must be a portable branch name")
+			}
 		}
 	}
 	return nil

@@ -8,6 +8,8 @@ export interface WorkspacePointer {
   gitRemote: string;
   branch: string;
   commit: string;
+  /** Working-tree snapshot pushed to refs/pi-sync/<conversation id>; its parent is the local HEAD. */
+  wip?: { commit: string; branch: string };
 }
 
 export interface PiEntry {
@@ -132,7 +134,13 @@ export function validateWorkspace(value: unknown, field = "workspace"): Workspac
   if (branch.startsWith("-") || branch.includes("..")) fail("is not a portable branch name", `${field}.branch`);
   const workspaceCommit = stringField(value.commit, `${field}.commit`, 128);
   if (!commit.test(workspaceCommit)) fail("must be a hexadecimal commit identifier", `${field}.commit`);
-  return { gitRemote, branch, commit: workspaceCommit };
+  if (value.wip === undefined) return { gitRemote, branch, commit: workspaceCommit };
+  if (!isObject(value.wip)) fail("must be an object", `${field}.wip`);
+  const wipCommit = stringField(value.wip.commit, `${field}.wip.commit`, 128);
+  if (!commit.test(wipCommit)) fail("must be a hexadecimal commit identifier", `${field}.wip.commit`);
+  const wipBranch = stringField(value.wip.branch, `${field}.wip.branch`);
+  if (wipBranch.startsWith("-") || wipBranch.includes("..")) fail("is not a portable branch name", `${field}.wip.branch`);
+  return { gitRemote, branch, commit: workspaceCommit, wip: { commit: wipCommit, branch: wipBranch } };
 }
 
 export function validateEnvelope(value: unknown): SessionEnvelope {

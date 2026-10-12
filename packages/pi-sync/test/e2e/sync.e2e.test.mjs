@@ -3,7 +3,7 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,11 +173,17 @@ test("turns made while the server was down upload later, or fork if someone else
   await stopDaemon();
   await turn;
   await startDaemon(join(caseDir, "data"));
+  // Either A's background retry uploads the lost turn before B moves on, or B wins and A forks it aside.
   await B.prompt("b moved on");
+  await sleep(2500);
   await A.prompt("a again");
+  await sleep(2500);
   const texts = await userTexts(A);
-  assert.deepEqual(texts, ["one", "b moved on", "a again"]);
-  assert.equal(sessionFiles("A").length, 2, "the unsynced local turn is kept as a separate session");
+  assert.deepEqual(texts.slice(-2), ["b moved on", "a again"]);
+  assert.deepEqual(await userTexts(B), texts, "both devices converge");
+  if (!texts.includes("sleep1500 lost upload")) {
+    assert.equal(sessionFiles("A").length, 2, "the unsynced local turn is kept as a separate session");
+  }
 });
 
 test("a crashed mid-turn device does not hold the conversation after restart", { ...opts, timeout: 120_000 }, async () => {
@@ -280,4 +286,36 @@ test("resuming an older copy of the file catches up instead of rolling the conve
   assert.deepEqual(await userTexts(A2), ["one", "two", "three"]);
   await sleep(2500);
   assert.deepEqual(await userTexts(B), ["one", "two", "three"]);
+});
+
+test("uncommitted and unpushed code follows the conversation when sharing is enabled", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  const a = join(caseDir, "git", "a"), b = join(caseDir, "git", "b");
+  writeFileSync(join(a, "committed.txt"), "local commit\n");
+  git(a, "add", "committed.txt");
+  git(a, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "unpushed");
+  writeFileSync(join(a, "new.txt"), "untracked work\n");
+  writeFileSync(join(a, ".gitignore"), "secret.env\n");
+  writeFileSync(join(a, "secret.env"), "TOKEN=1\n");
+  A.answers.push(true); // share uncommitted code for this repository
+  await A.prompt("two");
+  assert.equal(git(a, "config", "--get", "pi-sync.shareWorkingTree"), "true");
+  assert.match(git(a, "status", "--porcelain"), /\?\? new\.txt/, "A's own index and worktree are untouched");
+  await sleep(4000);
+  assert.match(git(join(caseDir, "git", "origin.git"), "for-each-ref", "refs/pi-sync/"), /refs\/pi-sync\//, "the snapshot is on a hidden ref, not a branch");
+  assert.ok(B.notes.some((note) => /\/sync code/.test(note)), "B is told its checkout lacks the conversation's code");
+
+  writeFileSync(join(b, "scratch.txt"), "mine\n");
+  B.answers.push(true);
+  await B.prompt("/sync code");
+  assert.match(B.notes.at(-1), /uncommitted changes/, "local work is never overwritten");
+  rmSync(join(b, "scratch.txt"));
+
+  B.answers.push(true);
+  await B.prompt("/sync code");
+  assert.match(B.notes.at(-1), /Restored main/);
+  assert.equal(git(b, "rev-parse", "HEAD"), git(a, "rev-parse", "HEAD"));
+  assert.equal(readFileSync(join(b, "new.txt"), "utf8"), "untracked work\n");
+  assert.match(git(b, "status", "--porcelain"), /\?\? new\.txt/, "restored work stays uncommitted");
+  assert.throws(() => statSync(join(b, "secret.env")), "ignored files are never shared");
 });

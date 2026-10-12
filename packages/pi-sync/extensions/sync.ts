@@ -19,6 +19,16 @@ import {
   type PiEntry,
   deriveRepositoryIdentity,
   deriveWorkspacePointer,
+  captureWorkspace,
+  codeStatus,
+  deleteSnapshot,
+  hasUnsharedCode,
+  pushSnapshot,
+  restoreWorkspace,
+  setShareSetting,
+  shareSetting,
+  type Snapshot,
+  type WorkspacePointer,
   materializeSessionFile,
   normalizeSessionFile,
   repositoryIdentity,
@@ -166,7 +176,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   const remoteFingerprint = (envelope: SessionEnvelope) => entriesFingerprint(envelope.entries, envelope.headEntryId);
 
-  const normalizeCurrent = async (ctx: ExtensionContext, binding?: SyncBinding): Promise<SessionEnvelope> => {
+  const normalizeCurrent = async (ctx: ExtensionContext, binding?: SyncBinding, workspace?: WorkspacePointer): Promise<SessionEnvelope> => {
     const path = ctx.sessionManager.getSessionFile();
     if (!path) throw new Error("synchronization requires a persistent Pi session");
     return normalizeSessionFile(path, {
@@ -174,8 +184,15 @@ export default function syncExtension(pi: ExtensionAPI) {
       headEntryId: ctx.sessionManager.getLeafId() ?? "",
       title: conversationTitle(ctx, binding),
       parentSessionId: binding?.parentSessionId,
-      workspace: await deriveWorkspacePointer(ctx.cwd, gitRunnerFor(ctx)),
+      workspace: workspace ?? (await idleWorkspace(ctx, binding)),
     });
+  };
+
+  // Idle uploads (renames, model switches) keep the last turn's code snapshot until the next turn replaces it.
+  const idleWorkspace = async (ctx: ExtensionContext, binding?: SyncBinding): Promise<WorkspacePointer | undefined> => {
+    const derived = await deriveWorkspacePointer(ctx.cwd, gitRunnerFor(ctx));
+    const wip = binding?.workspace?.wip;
+    return wip ? { ...(derived ?? binding!.workspace!), wip } : derived;
   };
 
   const syncedBinding = (binding: SyncBinding, envelope: SessionEnvelope, etag: string, materializedFile = binding.materializedFile): SyncBinding => {
@@ -259,8 +276,8 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
   };
 
-  const upload = async (ctx: ExtensionContext, binding: SyncBinding, token: string): Promise<SyncBinding> => {
-    const envelope = await normalizeCurrent(ctx, binding);
+  const upload = async (ctx: ExtensionContext, binding: SyncBinding, token: string, workspace?: WorkspacePointer): Promise<SyncBinding> => {
+    const envelope = await normalizeCurrent(ctx, binding, workspace);
     const response = await clientFor(binding.serverUrl).update(binding.canonicalSessionId, envelope, token, binding.lastEtag);
     const next = syncedBinding(binding, envelope, response.etag, ctx.sessionManager.getSessionFile() ?? binding.materializedFile);
     await store.set(next);
@@ -297,9 +314,19 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (!held) return;
     stopHeartbeat();
     lease = undefined;
+    let snapshot: Snapshot | undefined;
+    if ((await shareSetting(ctx.cwd)) === true) {
+      try {
+        snapshot = await captureWorkspace(ctx.cwd);
+      } catch {
+        snapshot = undefined;
+      }
+    }
+    let uploaded = false;
     await exclusive(async () => {
       try {
-        await upload(ctx, held.binding, held.token);
+        await upload(ctx, held.binding, held.token, snapshot?.workspace);
+        uploaded = true;
         setStatus(ctx, "sync: up to date");
       } catch (error) {
         const code = error instanceof SyncClientError ? error.code : "";
@@ -319,6 +346,68 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
       }
     });
+    if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot);
+  };
+
+  /** Pushes (or clears) the turn's code snapshot after the lease is released, so it never delays the other device. */
+  const shareSnapshot = async (ctx: ExtensionContext, binding: SyncBinding, snapshot: Snapshot) => {
+    const id = binding.canonicalSessionId;
+    if (snapshot.kind === "skipped") {
+      notify(ctx, `Code for this turn was not shared: ${snapshot.reason}.`, "warning");
+      return;
+    }
+    if (snapshot.kind === "clean") {
+      if (binding.workspace?.wip) await deleteSnapshot(ctx.cwd, id, binding.workspace.gitRemote).catch(() => undefined);
+      return;
+    }
+    const pushed = await pushSnapshot(ctx.cwd, snapshot.remote, snapshot.workspace.wip!.commit, id);
+    if (pushed.code !== 0) notify(ctx, `Code for this turn was not shared: push to ${snapshot.remote} failed. ${pushed.stderr.trim().split("\n").at(-1) ?? ""}`, "warning");
+  };
+
+  /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
+  const askToShareCode = async (ctx: ExtensionContext) => {
+    if (!ctx.hasUI || ctx.mode === "json" || (await shareSetting(ctx.cwd)) !== undefined) return;
+    if (!(await hasUnsharedCode(ctx.cwd))) return;
+    const enabled = await ctx.ui.confirm(
+      "Share uncommitted code with your other devices?",
+      "After each turn, pi-sync can push this checkout's uncommitted and unpushed work to a hidden ref (refs/pi-sync/<conversation>) on this repository's remote, so another device can restore it with /sync code. Anyone who can read the remote can read that ref. Files in .gitignore are never included. Change later with /sync code on|off.",
+    );
+    await setShareSetting(ctx.cwd, enabled);
+  };
+
+  const lastCodeNotice = new Map<string, string>();
+  /** Tells the user when this checkout doesn't have the conversation's code. */
+  const noticeCode = async (cwd: string, sessionId: string, notifyUser: (message: string) => void) => {
+    const binding = await store.get(sessionId);
+    const workspace = binding?.workspace;
+    if (!workspace) return;
+    const key = workspace.wip?.commit ?? workspace.commit;
+    if (lastCodeNotice.get(sessionId) === key) return;
+    const status = await codeStatus(cwd, workspace).catch(() => ({ kind: "unknown" as const }));
+    if (status.kind !== "restorable") return;
+    lastCodeNotice.set(sessionId, key);
+    notifyUser(`This conversation's code is ${status.summary}; this checkout differs. Run /sync code to bring it here.`);
+  };
+
+  const syncCode = async (ctx: ExtensionCommandContext, arg: string) => {
+    if (arg === "on" || arg === "off") {
+      await setShareSetting(ctx.cwd, arg === "on");
+      notify(ctx, arg === "on" ? "Uncommitted code will be shared with your other devices after each turn." : "Uncommitted code will not be shared.", "info");
+      return;
+    }
+    const binding = await store.get(ctx.sessionManager.getSessionId());
+    if (!binding?.workspace) {
+      notify(ctx, "No code state is recorded for this conversation.", "info");
+      return;
+    }
+    const status = await codeStatus(ctx.cwd, binding.workspace);
+    if (status.kind === "matches") return notify(ctx, "This checkout already has the conversation's code.", "info");
+    if (status.kind !== "restorable") return notify(ctx, "This checkout is not the conversation's repository.", "warning");
+    const ok = !ctx.hasUI || await ctx.ui.confirm("Bring the conversation's code here?", `Switch this checkout to ${status.summary}. Local uncommitted work is never overwritten; if there is any, this stops and explains.`);
+    if (!ok) return;
+    const result = await restoreWorkspace(ctx.cwd, binding.workspace, binding.canonicalSessionId);
+    if (!result.ok) return fail(ctx, "sync_code_restore_failed", result.message);
+    notify(ctx, result.message, "info");
   };
 
   const dispatchRefresh = () => {
@@ -384,6 +473,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
         if (copyPath) replacement.ui.notify(`This device had turns that were never synchronized; they were saved as a separate session (${copyPath}).`, "warning");
         if (message) replacement.ui.notify(message, "info");
+        await noticeCode(replacement.cwd, replacement.sessionManager.getSessionId(), (text) => replacement.ui.notify(text, "info")).catch(() => undefined);
         if (replay) {
           const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
           await replacement.sendUserMessage(content as any);
@@ -702,8 +792,9 @@ export default function syncExtension(pi: ExtensionAPI) {
         return result as void;
       }
       if (command === "status") return showStatus(ctx);
+      if (command === "code") return syncCode(ctx, rest[0] ?? "");
       if (command === "") return syncPick(ctx);
-      notify(ctx, "Usage: /sync, /sync attach [server URL], /sync detach, /sync refresh, or /sync status", "error");
+      notify(ctx, "Usage: /sync, /sync attach [server URL], /sync detach, /sync refresh, /sync status, or /sync code [on|off]", "error");
     },
   });
 
@@ -760,6 +851,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (binding.state === "setup_required") {
       return refuse(ctx, event.text, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.");
     }
+    await askToShareCode(ctx).catch(() => undefined);
     let reserved = await exclusive(() => acquire(ctx, binding));
     if (!reserved.ok && reserved.holder && ctx.hasUI) {
       // A sleeping or crashed device can hold the lease for up to two minutes; let the user take it.

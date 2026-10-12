@@ -33,6 +33,11 @@ Lease tokens are returned only by acquisition and are sent in
 as compatibility aliases. Updates must also send `If-Match` with the exact ETag
 returned by acquisition or the previous update.
 
+A workspace pointer may carry `"wip": { "commit": "<hex>", "branch": "<local branch>" }`:
+a working-tree snapshot whose parent is the device's local HEAD, pushed by the
+client to `refs/pi-sync/<sessionId>` on the repository's remote. The server
+only stores and validates the pointer; it never touches Git.
+
 Acquisition accepts `{ "holder": "display-only device label", "repository": "normalized repository identity", "takeOver": false }`.
 With `"takeOver": true` acquisition replaces an active lease instead of
 returning `423 active_lease`; the previous holder's token stops working, so its

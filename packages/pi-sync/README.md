@@ -34,6 +34,21 @@ Once a conversation is shared, synchronization runs in the background:
   are saved as a separate local session, and the shared copy wins.
 - Each device keeps one session file per conversation.
 
+Code follows the conversation too. Each turn records the branch and commit.
+The first time a turn ends with uncommitted or unpushed work in a repository,
+pi-sync asks whether to share it. If you agree, every turn's working tree
+(tracked changes and untracked files, never `.gitignore`d ones) is captured
+without touching your index or stash, and pushed to the hidden ref
+`refs/pi-sync/<conversation id>` on the repository's remote. Anyone who can
+read the remote can read that ref. Snapshots over 20 MB, or with a file over
+5 MB, are skipped with a warning. The answer is stored per repository as
+`git config pi-sync.shareWorkingTree`; change it with `/sync code on|off`.
+
+When another device's checkout differs from the conversation's code, pi-sync
+says so. `/sync code` then fast-forwards (or creates) the branch and restores
+the shared changes as uncommitted work. It refuses rather than overwrite local
+uncommitted work or a branch that has diverged.
+
 `PI_SYNC_DEVICE_LABEL` overrides the device name shown to other devices; the
 default is the host name. Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.

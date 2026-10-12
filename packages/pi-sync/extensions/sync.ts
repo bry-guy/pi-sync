@@ -150,6 +150,9 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
   };
 
+  // Fresh sessions already hold model and thinking entries; only messages make a conversation.
+  const hasMessages = (ctx: ExtensionContext) => ctx.sessionManager.getEntries().some((entry) => entry.type === "message");
+
   const hasPendingInput = (ctx: ExtensionContext): boolean => {
     try {
       return ctx.hasPendingMessages() || (ctx.hasUI && typeof ctx.ui.getEditorText === "function" && ctx.ui.getEditorText().length > 0);
@@ -714,14 +717,18 @@ export default function syncExtension(pi: ExtensionAPI) {
       await refreshCurrent(ctx, "manual");
       return;
     }
+    await openSynced(ctx, url, row.item.sessionId, row.item.title);
+  };
 
-    const existing = bindings.get(row.item.sessionId);
+  /** Opens a shared conversation on this device, reusing its file when this device already has one. */
+  const openSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
+    const existing = await store.get(sessionId);
     const reusable = existing && existsSync(existing.materializedFile) ? existing : undefined;
-    const target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${row.item.sessionId}.jsonl`);
+    const target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
     const binding: SyncBinding = reusable ?? {
-      nativeSessionId: row.item.sessionId,
+      nativeSessionId: sessionId,
       serverUrl: url,
-      canonicalSessionId: row.item.sessionId,
+      canonicalSessionId: sessionId,
       lastEtag: "",
       materializedFile: target,
       state: "ready",
@@ -734,7 +741,34 @@ export default function syncExtension(pi: ExtensionAPI) {
       return { kind: "written" as const, written: await materializeCanonical(ctx, target, local, binding, fetched.snapshot), snapshot: fetched.snapshot };
     }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
     if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);
-    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${row.item.title || "conversation"}”.`, outcome.written.copyPath, undefined);
+    const opened = title || outcome.snapshot.session.title;
+    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyPath, undefined);
+  };
+
+  /**
+   * On a fresh start in a repository, offers the shared conversation this device hasn't caught up with.
+   * shortcut: only conversations updated in the last day are offered and a "no" isn't remembered; persist declines if it nags.
+   */
+  const offerArrival = async (ctx: ExtensionContext) => {
+    const url = configuredUrl();
+    if (!url || !ctx.hasUI || ctx.mode === "json") return;
+    const repository = await repositoryFor(ctx);
+    if (!repository) return;
+    const { sessions } = await clientFor(url).list({ timeoutMs: REQUEST_TIMEOUT_MS });
+    const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const candidate = sessions
+      .filter((item) => repositoryIdentity(item.workspace) === repository && (item.updatedAt ?? item.createdAt) > dayAgo)
+      .filter((item) => bindings.get(item.sessionId)?.lastEtag !== item.etag)
+      .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
+    if (!candidate) return;
+    // The user may have started typing meanwhile; never interrupt that.
+    if (hasMessages(ctx) || hasPendingInput(ctx)) return;
+    const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "a shared conversation";
+    const where = candidate.leaseHolder ? `running on ${candidate.leaseHolder}` : `updated ${relativeAge(candidate.updatedAt)}`;
+    const yes = await ctx.ui.confirm("Continue a synchronized conversation?", `“${title}” (${where}). Open it here?`);
+    // Slash commands sent as user messages only run with prompt expansion on.
+    if (yes && !hasMessages(ctx)) pi.sendUserMessage(`/sync open ${candidate.sessionId}`, { expandPromptTemplates: true });
   };
 
   const detachCurrent = async (ctx: ExtensionCommandContext) => {
@@ -793,12 +827,17 @@ export default function syncExtension(pi: ExtensionAPI) {
       }
       if (command === "status") return showStatus(ctx);
       if (command === "code") return syncCode(ctx, rest[0] ?? "");
+      if (command === "open" && rest[0]) {
+        const url = configuredUrl() ?? (await store.get(ctx.sessionManager.getSessionId()))?.serverUrl;
+        if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL before using /sync.");
+        return openSynced(ctx, url, rest[0]);
+      }
       if (command === "") return syncPick(ctx);
       notify(ctx, "Usage: /sync, /sync attach [server URL], /sync detach, /sync refresh, /sync status, or /sync code [on|off]", "error");
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     currentSessionId = ctx.sessionManager.getSessionId();
     stopHeartbeat();
     lease = undefined;
@@ -808,6 +847,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     let binding = await store.get(currentSessionId);
     if (!binding) {
       setStatus(ctx);
+      if (event.reason === "startup" && !hasMessages(ctx)) void offerArrival(ctx).catch(() => undefined);
       return;
     }
     if (binding.leaseToken) {
@@ -826,6 +866,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     setStatus(ctx, binding.state === "setup_required" ? "sync: server copy missing (/sync attach)" : "sync: on");
     startPoll(ctx);
+    if (event.reason === "startup") void noticeCode(ctx.cwd, currentSessionId, (text) => notify(ctx, text, "info")).catch(() => undefined);
   });
 
   pi.on("resources_discover", async () => {

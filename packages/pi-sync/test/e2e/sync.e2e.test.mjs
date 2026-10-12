@@ -319,3 +319,17 @@ test("uncommitted and unpushed code follows the conversation when sharing is ena
   assert.match(git(b, "status", "--porcelain"), /\?\? new\.txt/, "restored work stays uncommitted");
   assert.throws(() => statSync(join(b, "secret.env")), "ignored files are never shared");
 });
+
+test("starting pi on another device offers the conversation it hasn't seen", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A");
+  await ready(A);
+  await A.prompt("from A");
+  await A.prompt("/sync attach");
+  const B = peer("B");
+  B.answers.push(true); // accept the arrival offer
+  await sleep(4000);
+  assert.deepEqual(await userTexts(B), ["from A"]);
+  await B.prompt("continued on B");
+  await sleep(2500);
+  assert.deepEqual(await userTexts(A), ["from A", "continued on B"]);
+});

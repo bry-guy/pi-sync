@@ -233,6 +233,11 @@ export default function syncExtension(pi: ExtensionAPI) {
       setStatus(ctx, `sync: in use on ${holder}`);
       return `This conversation is running on ${holder}. Wait for it to finish, then send again.`;
     }
+    // Servers before the lease-free snapshot endpoint and advisory repository scope answer this way.
+    if (["not_found", "method_not_allowed", "workspace_required", "workspace_mismatch"].includes(code)) {
+      setStatus(ctx, "sync: server needs update");
+      return `The sync server at ${binding.serverUrl} is older than this pi-sync client. Update pi-syncd to keep syncing.`;
+    }
     if (code === "network_error" || code === "timeout") {
       setStatus(ctx, "sync: offline");
       return "The sync server is unreachable, so the prompt was not sent. Retry, or /sync detach to work on this copy alone.";

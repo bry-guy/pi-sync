@@ -83,6 +83,16 @@ function entriesFingerprint(entries: readonly { id?: unknown }[], headEntryId: s
  * How many of this device's synchronized entries the local copy still starts with: the binding's count when the copy
  * is intact, otherwise 0 (an older file reopened through /resume, or a binding from before counts were recorded).
  */
+/**
+ * Whether the local copy holds the whole canonical conversation. Bindings written before counts were recorded (or by
+ * hosts such as pi-ez-web) fall back to comparing ids.
+ */
+function holdsCanonical(local: readonly { id?: unknown }[], binding: SyncBinding, canonical: readonly { id?: unknown }[]): boolean {
+  if (binding.syncedCount !== undefined) return syncedPrefix(local, binding) === canonical.length;
+  const ids = new Set(local.map((entry) => entry.id));
+  return canonical.every((entry) => ids.has(entry.id));
+}
+
 function syncedPrefix(local: readonly { id?: unknown }[], binding: SyncBinding): number {
   const count = binding.syncedCount;
   if (!count || !binding.syncedLastId || local.length < count || local[count - 1]?.id !== binding.syncedLastId) return 0;
@@ -607,18 +617,25 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (!fetched.ok) return { kind: "refused" as const, message: fetched.message };
       const { snapshot } = fetched;
       // Uploading a copy that lacks canonical entries would roll the conversation back, so it catches up instead.
-      if (snapshot.etag === binding.lastEtag && syncedPrefix(localEntries, binding) === snapshot.session.entries.length) {
+      if (snapshot.etag === binding.lastEtag && holdsCanonical(localEntries, binding, snapshot.session.entries)) {
+        const canonical = snapshot.session.entries;
+let counted = binding;
+                // First check with a binding that has no count: record it, so later turns send only what they add.
+        if (binding.syncedCount === undefined && canonical.length > 0 && localEntries[canonical.length - 1]?.id === canonical.at(-1)?.id) {
+          counted = { ...binding, syncedCount: canonical.length, syncedLastId: canonical.at(-1)!.id };
+          await store.set(counted);
+        }
         // Already current; push idle local changes (renames, model switches) under a brief lease.
         if (localFingerprint(ctx) !== binding.lastFingerprint) {
-          const reserved = await acquire(ctx, binding);
+          const reserved = await acquire(ctx, counted);
           if (!reserved.ok) return { kind: "refused" as const, message: reserved.message };
           try {
-            await upload(ctx, binding, reserved.acquired.lease.token);
+            await upload(ctx, counted, reserved.acquired.lease.token);
             setStatus(ctx, "sync: up to date");
           } catch {
             setStatus(ctx, "sync: upload pending");
           } finally {
-            await release(binding, reserved.acquired.lease.token);
+            await release(counted, reserved.acquired.lease.token);
           }
         } else {
           setStatus(ctx, "sync: up to date");
@@ -1072,7 +1089,9 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;
     // The prefix check also refuses an older copy reopened through /resume, which would roll the conversation back.
-    if (acquired.etag === binding.lastEtag && (acquired.count === undefined || syncedPrefix(ctx.sessionManager.getEntries() as PiEntry[], binding) === acquired.count)) {
+    // A binding without a count has no cheap check; its first turn goes through a catch-up, which records the count.
+    const intact = acquired.count === undefined || (binding.syncedCount !== undefined && syncedPrefix(ctx.sessionManager.getEntries() as PiEntry[], binding) === acquired.count);
+    if (acquired.etag === binding.lastEtag && intact) {
       holdLease(ctx, binding, acquired.lease.token);
       return { action: "continue" as const };
     }

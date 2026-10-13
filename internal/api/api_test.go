@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -363,5 +364,73 @@ func TestHTTPTakeOverInvalidatesPreviousHolder(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusLocked {
 		t.Fatalf("stale holder upload = %d", response.StatusCode)
+	}
+}
+
+func TestHTTPAppendAndPagedEntries(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := httptest.NewServer(New(filesystem, lease.New(nil, lease.DefaultExpiry)))
+	defer router.Close()
+	call := func(method, path string, body any, headers map[string]string) (int, map[string]any) {
+		var reader *bytes.Reader
+		if body != nil {
+			data, _ := json.Marshal(body)
+			reader = bytes.NewReader(data)
+		} else {
+			reader = bytes.NewReader(nil)
+		}
+		request, _ := http.NewRequest(method, router.URL+path, reader)
+		request.Header.Set("Content-Type", "application/json")
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+	status, created := call("POST", "/v1/sessions", apiEnvelope(), nil)
+	if status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("create %d", status)
+	}
+	etag := created["etag"].(string)
+	head := apiEnvelope().HeadEntryID
+	next := json.RawMessage(fmt.Sprintf(`{"type":"message","id":"n1","parentId":%q,"timestamp":"2026-01-01T00:00:09Z"}`, head))
+	appendBody := map[string]any{"baseCount": 1, "entries": []json.RawMessage{next}, "headEntryId": "n1", "title": "t"}
+
+	if status, _ := call("POST", "/v1/sessions/session-1/entries", appendBody, map[string]string{"If-Match": etag}); status != http.StatusLocked {
+		t.Fatalf("append without a lease: %d", status)
+	}
+	status, acquired := call("POST", "/v1/sessions/session-1/lease?entries=none", map[string]any{"holder": "a"}, nil)
+	if status != http.StatusOK || len(acquired["session"].(map[string]any)["entries"].([]any)) != 0 || acquired["count"].(float64) != 1 {
+		t.Fatalf("metadata-only acquire: %d %v", status, acquired)
+	}
+	token := acquired["lease"].(map[string]any)["token"].(string)
+	lease := map[string]string{"X-Pi-Sync-Lease": token, "If-Match": etag}
+	status, appended := call("POST", "/v1/sessions/session-1/entries", appendBody, lease)
+	if status != http.StatusOK || appended["count"].(float64) != 2 {
+		t.Fatalf("append: %d %v", status, appended)
+	}
+	if status, _ := call("POST", "/v1/sessions/session-1/entries", appendBody, lease); status != http.StatusPreconditionFailed {
+		t.Fatalf("replaying an append with the old etag: %d", status)
+	}
+	status, page := call("GET", "/v1/sessions/session-1/entries?from=1", nil, nil)
+	if status != http.StatusOK || page["complete"] != true || len(page["session"].(map[string]any)["entries"].([]any)) != 1 || page["etag"] != appended["etag"] {
+		t.Fatalf("entries from 1: %d %v", status, page)
+	}
+	if status, _ := call("GET", "/v1/sessions/session-1/entries?from=9", nil, nil); status != http.StatusConflict {
+		t.Fatalf("from past the end: %d", status)
+	}
+	// Older clients still read and write the whole conversation.
+	status, full := call("GET", "/v1/sessions/session-1", nil, nil)
+	if status != http.StatusOK || len(full["session"].(map[string]any)["entries"].([]any)) != 2 {
+		t.Fatalf("full get: %d", status)
 	}
 }

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,7 @@ import {
 
 const HEARTBEAT_MS = Number(process.env.PI_SYNC_HEARTBEAT_MS) || 20_000;
 const REQUEST_TIMEOUT_MS = 8_000;
+const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
 // Local-only entries of these types mean two devices really wrote the same conversation.
 // Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
@@ -47,7 +48,7 @@ type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
 type Replay = { sessionId: string; text: string; images?: unknown[]; compact?: { customInstructions?: string } };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
-type Acquired = { ok: true; acquired: { etag: string; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean };
+type Acquired = { ok: true; acquired: { etag: string; count?: number; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
 
 function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
@@ -70,18 +71,22 @@ function conversationTitle(ctx: ExtensionContext, binding?: SyncBinding): string
     firstUserText(ctx.sessionManager.getEntries() as any[]);
 }
 
-/** Identifies the entry set and head so local-only changes can be detected cheaply. */
+/**
+ * Identifies the entry set and head in O(1). Entries only ever append, and the local file starts with the synchronized
+ * entries in canonical order, so the count and last id stand for the whole list.
+ */
 function entriesFingerprint(entries: readonly { id?: unknown }[], headEntryId: string | null | undefined): string {
-  const hash = createHash("sha256");
-  for (const entry of entries) hash.update(`${String(entry.id)}\n`);
-  hash.update(`head:${headEntryId ?? ""}`);
-  return `ids-${hash.digest("hex")}`;
+  return `ids-c${entries.length}-${String(entries.at(-1)?.id ?? "")}-${headEntryId ?? ""}`;
 }
 
-/** True when the local copy lacks canonical entries, e.g. an older file reopened through /resume. */
-function missingCanonicalEntries(local: readonly { id?: unknown }[], canonical: readonly { id?: unknown }[]): boolean {
-  const ids = new Set(local.map((entry) => entry.id));
-  return canonical.some((entry) => !ids.has(entry.id));
+/**
+ * How many of this device's synchronized entries the local copy still starts with: the binding's count when the copy
+ * is intact, otherwise 0 (an older file reopened through /resume, or a binding from before counts were recorded).
+ */
+function syncedPrefix(local: readonly { id?: unknown }[], binding: SyncBinding): number {
+  const count = binding.syncedCount;
+  if (!count || !binding.syncedLastId || local.length < count || local[count - 1]?.id !== binding.syncedLastId) return 0;
+  return count;
 }
 
 function defaultDeviceLabel(): string {
@@ -224,6 +229,8 @@ export default function syncExtension(pi: ExtensionAPI) {
       state: "ready",
       lastEtag: etag,
       lastFingerprint: remoteFingerprint(envelope),
+      syncedCount: envelope.entries.length,
+      syncedLastId: envelope.entries.at(-1)?.id ?? "",
       materializedFile,
       workspace: envelope.workspace,
       parentSessionId: envelope.parentSessionId,
@@ -268,7 +275,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const acquire = async (ctx: ExtensionContext, binding: SyncBinding, takeOver = false): Promise<Acquired> => {
     for (let attempt = 0; ; attempt++) {
       try {
-        const acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS, takeOver });
+        const acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS, takeOver, metadataOnly: true });
         return { ok: true, acquired };
       } catch (error) {
         // Another device's idle upload holds the lease for well under a second; wait that out.
@@ -285,11 +292,38 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
   };
 
-  const fetchCanonical = async (ctx: ExtensionContext, binding: SyncBinding): Promise<Fetched> => {
-    try {
-      return { ok: true, snapshot: await clientFor(binding.serverUrl).get(binding.canonicalSessionId) };
-    } catch (error) {
-      return { ok: false, message: await explainFailure(ctx, binding, error) };
+  /**
+   * The canonical conversation, downloading only the entries after this device's synchronized prefix. `local` is the
+   * copy that prefix is taken from (none for a conversation not yet on this device).
+   */
+  const fetchCanonical = async (ctx: ExtensionContext, binding: SyncBinding, local: readonly PiEntry[] = []): Promise<Fetched> => {
+    const client = clientFor(binding.serverUrl);
+    let from = syncedPrefix(local, binding);
+    for (;;) {
+      try {
+        const delta = await client.entriesSince(binding.canonicalSessionId, from);
+        // The server's copy must still start with the prefix this device holds; otherwise download it all.
+        if (from > 0 && delta.count < from) {
+          from = 0;
+          continue;
+        }
+        const entries = from === 0 ? delta.session.entries : [...local.slice(0, from), ...delta.session.entries];
+        return { ok: true, snapshot: { ...delta, session: { ...delta.session, entries } } };
+      } catch (error) {
+        if (error instanceof SyncClientError && error.code === "range_not_satisfiable" && from > 0) {
+          from = 0;
+          continue;
+        }
+        // Servers before appends serve only the whole conversation.
+        if (error instanceof SyncClientError && (error.code === "not_found" || error.code === "method_not_allowed")) {
+          try {
+            return { ok: true, snapshot: await client.get(binding.canonicalSessionId) };
+          } catch (legacyError) {
+            return { ok: false, message: await explainFailure(ctx, binding, legacyError) };
+          }
+        }
+        return { ok: false, message: await explainFailure(ctx, binding, error) };
+      }
     }
   };
 
@@ -305,10 +339,31 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
   };
 
+  /** Sends what this device added since it last synchronized; the whole conversation only to older servers. */
   const upload = async (ctx: ExtensionContext, binding: SyncBinding, token: string, workspace?: WorkspacePointer): Promise<SyncBinding> => {
+    const client = clientFor(binding.serverUrl);
+    const entries = ctx.sessionManager.getEntries() as PiEntry[];
+    const file = ctx.sessionManager.getSessionFile() ?? binding.materializedFile;
+    const base = syncedPrefix(entries, binding);
+    if (base > 0) {
+      const header = {
+        headEntryId: ctx.sessionManager.getLeafId() ?? entries.at(-1)?.id ?? "",
+        title: conversationTitle(ctx, binding),
+        workspace: workspace ?? (await idleWorkspace(ctx, binding)),
+      };
+      try {
+        const response = await client.append(binding.canonicalSessionId, token, binding.lastEtag, { baseCount: base, entries: entries.slice(base), ...header });
+        const envelope = { formatVersion: 1 as const, sessionId: binding.canonicalSessionId, piSessionVersion: 3, createdAt: "", parentSessionId: binding.parentSessionId ?? null, ...header, entries };
+        const next = syncedBinding(binding, envelope, response.etag, file);
+        await store.set(next);
+        return next;
+      } catch (error) {
+        if (!(error instanceof SyncClientError) || (error.code !== "not_found" && error.code !== "method_not_allowed")) throw error;
+      }
+    }
     const envelope = await normalizeCurrent(ctx, binding, workspace);
-    const response = await clientFor(binding.serverUrl).update(binding.canonicalSessionId, envelope, token, binding.lastEtag);
-    const next = syncedBinding(binding, envelope, response.etag, ctx.sessionManager.getSessionFile() ?? binding.materializedFile);
+    const response = await client.update(binding.canonicalSessionId, envelope, token, binding.lastEtag);
+    const next = syncedBinding(binding, envelope, response.etag, file);
     await store.set(next);
     return next;
   };
@@ -547,11 +602,12 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (lease) return { outcome: "busy", sessionId };
 
     const result = await exclusive(async () => {
-      const fetched = await fetchCanonical(ctx, binding);
+      const localEntries = ctx.sessionManager.getEntries() as PiEntry[];
+      const fetched = await fetchCanonical(ctx, binding, localEntries);
       if (!fetched.ok) return { kind: "refused" as const, message: fetched.message };
       const { snapshot } = fetched;
       // Uploading a copy that lacks canonical entries would roll the conversation back, so it catches up instead.
-      if (snapshot.etag === binding.lastEtag && !missingCanonicalEntries(ctx.sessionManager.getEntries() as { id?: unknown }[], snapshot.session.entries)) {
+      if (snapshot.etag === binding.lastEtag && syncedPrefix(localEntries, binding) === snapshot.session.entries.length) {
         // Already current; push idle local changes (renames, model switches) under a brief lease.
         if (localFingerprint(ctx) !== binding.lastFingerprint) {
           const reserved = await acquire(ctx, binding);
@@ -665,6 +721,39 @@ export default function syncExtension(pi: ExtensionAPI) {
     pollTimer.unref?.();
   };
 
+  /** Uploads a new conversation; one that does not fit in a request is sent as a first part plus appends. */
+  const enrollInBatches = async (url: string, envelope: SessionEnvelope): Promise<{ etag: string }> => {
+    const client = clientFor(url);
+    const batches: PiEntry[][] = [[]];
+    let size = 0;
+    for (const entry of envelope.entries) {
+      const bytes = Buffer.byteLength(JSON.stringify(entry));
+      if (size + bytes > ENROLL_BATCH_BYTES && batches.at(-1)!.length > 0) {
+        batches.push([]);
+        size = 0;
+      }
+      batches.at(-1)!.push(entry);
+      size += bytes;
+    }
+    const first = batches[0]!;
+    if (batches.length === 1) return client.enroll(envelope);
+    let { etag } = await client.enroll({ ...envelope, entries: first, headEntryId: first.at(-1)!.id });
+    const { lease: held } = await client.acquire(envelope.sessionId, deviceLabel, { metadataOnly: true });
+    try {
+      let count = first.length;
+      for (const batch of batches.slice(1)) {
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: batch, headEntryId: batch.at(-1)!.id, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}) }));
+        count += batch.length;
+      }
+      if (envelope.headEntryId !== batches.at(-1)!.at(-1)!.id) {
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: [], headEntryId: envelope.headEntryId, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}) }));
+      }
+    } finally {
+      await client.release(envelope.sessionId, held.token).catch(() => undefined);
+    }
+    return { etag };
+  };
+
   const enrollCurrent = async (ctx: ExtensionCommandContext, args: string) => {
     const path = ctx.sessionManager.getSessionFile();
     if (!path || !existsSync(path)) return fail(ctx, "sync_not_persistent", "Send at least one message before synchronizing this conversation.");
@@ -694,7 +783,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       state: "ready",
     };
     try {
-      const response = await clientFor(url).enroll(envelope);
+      const response = await enrollInBatches(url, envelope);
       await store.set(syncedBinding(base, envelope, response.etag, path));
       setStatus(ctx, "sync: up to date");
       notify(ctx, "Conversation synchronized. Open it elsewhere with /sync.", "info");
@@ -767,10 +856,10 @@ export default function syncExtension(pi: ExtensionAPI) {
       state: "ready",
     };
     const outcome = await exclusive(async () => {
-      const fetched = await fetchCanonical(ctx, binding);
-      if (!fetched.ok) return { kind: "failed" as const, message: fetched.message };
       let local: SessionEnvelope | undefined;
       if (reusable) local = await normalizeSessionFile(target).catch(() => undefined);
+      const fetched = await fetchCanonical(ctx, binding, local?.entries);
+      if (!fetched.ok) return { kind: "failed" as const, message: fetched.message };
       return { kind: "written" as const, written: await materializeCanonical(ctx, target, local, binding, fetched.snapshot), snapshot: fetched.snapshot };
     }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
     if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);
@@ -885,7 +974,9 @@ export default function syncExtension(pi: ExtensionAPI) {
     const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: file, state: "ready" };
     let etag: string;
     try {
-      etag = (await clientFor(url).get(sessionId, { timeoutMs: 5_000 })).etag;
+      const found = (await clientFor(url).list({ timeoutMs: 5_000 })).sessions.find((item) => item.sessionId === sessionId);
+      if (!found) return;
+      etag = found.etag;
     } catch {
       return; // Not on the server, or unreachable: stay unsynchronized and silent.
     }
@@ -980,7 +1071,8 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;
-    if (acquired.etag === binding.lastEtag && !missingCanonicalEntries(ctx.sessionManager.getEntries() as { id?: unknown }[], acquired.session.entries)) {
+    // The prefix check also refuses an older copy reopened through /resume, which would roll the conversation back.
+    if (acquired.etag === binding.lastEtag && (acquired.count === undefined || syncedPrefix(ctx.sessionManager.getEntries() as PiEntry[], binding) === acquired.count)) {
       holdLease(ctx, binding, acquired.lease.token);
       return { action: "continue" as const };
     }

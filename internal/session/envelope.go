@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	FormatVersion      = 1
-	MaxEnvelopeBytes   = 16 << 20
-	MaxEntries         = 100_000
-	MaxEntryBytes      = 1 << 20
+	FormatVersion = 1
+	// MaxRequestBytes bounds one request body; conversations themselves are unbounded and grow by appends.
+	MaxRequestBytes    = 64 << 20
+	MaxEntryBytes      = 32 << 20
 	MaxSessionIDLength = 128
 	MaxTitleLength     = 2_000
 	MaxWorkspaceField  = 4_096
@@ -120,7 +120,7 @@ func Decode(data []byte) (Envelope, error) {
 	if len(data) == 0 {
 		return Envelope{}, invalid("body", "request body is empty")
 	}
-	if len(data) > MaxEnvelopeBytes {
+	if len(data) > MaxRequestBytes {
 		return Envelope{}, invalid("body", "request body is too large")
 	}
 	if !json.Valid(data) {
@@ -162,7 +162,7 @@ func Decode(data []byte) (Envelope, error) {
 // reads at most one byte beyond the protocol limit and then delegates to
 // Decode for structural validation.
 func DecodeReader(r io.Reader) (Envelope, error) {
-	data, err := io.ReadAll(io.LimitReader(r, MaxEnvelopeBytes+1))
+	data, err := io.ReadAll(io.LimitReader(r, MaxRequestBytes+1))
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -198,57 +198,19 @@ func Validate(envelope Envelope) error {
 	if strings.IndexByte(envelope.Title, 0) >= 0 {
 		return invalid("title", "contains a NUL byte")
 	}
-	if len(envelope.Entries) > MaxEntries {
-		return invalid("entries", "contains too many entries")
-	}
 
 	ids := make(map[string]string, len(envelope.Entries))
 	parents := make(map[string]string, len(envelope.Entries))
 	for index, raw := range envelope.Entries {
-		field := fmt.Sprintf("entries[%d]", index)
-		if len(raw) == 0 || len(raw) > MaxEntryBytes {
-			return invalid(field, "entry is empty or too large")
+		entry, err := ParseEntry(fmt.Sprintf("entries[%d]", index), raw)
+		if err != nil {
+			return err
 		}
-		if !json.Valid(raw) {
-			return invalid(field, "entry is not valid JSON")
+		if _, exists := ids[entry.ID]; exists {
+			return invalid(fmt.Sprintf("entries[%d].id", index), "duplicates another entry id")
 		}
-		if jsonDepth(raw) > MaxParentDepth {
-			return invalid(field, "entry JSON nesting is too deep")
-		}
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-			return invalid(field, "entry must be a JSON object")
-		}
-		typeName, ok, err := rawString(object, "type")
-		if err != nil || !ok || typeName == "" || len(typeName) > 128 {
-			return invalid(field+".type", "must be a non-empty string")
-		}
-		entryID, ok, err := rawString(object, "id")
-		if err != nil || !ok || !validID(entryID, MaxEntryIDLength) {
-			return invalid(field+".id", "must be a unique portable identifier")
-		}
-		if _, exists := ids[entryID]; exists {
-			return invalid(field+".id", "duplicates another entry id")
-		}
-		ids[entryID] = typeName
-
-		parent, present := object["parentId"]
-		if !present {
-			return invalid(field+".parentId", "is required")
-		}
-		parentID, isNull, err := rawNullableString(parent)
-		if err != nil || (!isNull && !validID(parentID, MaxEntryIDLength)) {
-			return invalid(field+".parentId", "must be null or an entry identifier")
-		}
-		parents[entryID] = parentID
-
-		timestamp, ok, err := rawString(object, "timestamp")
-		if err != nil || !ok {
-			return invalid(field+".timestamp", "must be an ISO timestamp string")
-		}
-		if _, err := time.Parse(time.RFC3339Nano, timestamp); err != nil {
-			return invalid(field+".timestamp", "must be an RFC3339 timestamp")
-		}
+		ids[entry.ID] = entry.Type
+		parents[entry.ID] = entry.ParentID
 	}
 
 	if len(envelope.Entries) == 0 {
@@ -322,6 +284,89 @@ func Validate(envelope Envelope) error {
 		}
 	}
 	return nil
+}
+
+// Entry is the part of a Pi session entry the server checks; the rest is opaque.
+type Entry struct {
+	ID       string
+	ParentID string // empty for the root
+	Type     string
+}
+
+// ParseEntry validates one entry's shape without looking at the rest of the conversation.
+func ParseEntry(field string, raw json.RawMessage) (Entry, error) {
+	if len(raw) == 0 || len(raw) > MaxEntryBytes {
+		return Entry{}, invalid(field, "entry is empty or too large")
+	}
+	if !json.Valid(raw) {
+		return Entry{}, invalid(field, "entry is not valid JSON")
+	}
+	if jsonDepth(raw) > MaxParentDepth {
+		return Entry{}, invalid(field, "entry JSON nesting is too deep")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return Entry{}, invalid(field, "entry must be a JSON object")
+	}
+	typeName, ok, err := rawString(object, "type")
+	if err != nil || !ok || typeName == "" || len(typeName) > 128 {
+		return Entry{}, invalid(field+".type", "must be a non-empty string")
+	}
+	entryID, ok, err := rawString(object, "id")
+	if err != nil || !ok || !validID(entryID, MaxEntryIDLength) {
+		return Entry{}, invalid(field+".id", "must be a unique portable identifier")
+	}
+	parent, present := object["parentId"]
+	if !present {
+		return Entry{}, invalid(field+".parentId", "is required")
+	}
+	parentID, isNull, err := rawNullableString(parent)
+	if err != nil || (!isNull && !validID(parentID, MaxEntryIDLength)) {
+		return Entry{}, invalid(field+".parentId", "must be null or an entry identifier")
+	}
+	timestamp, ok, err := rawString(object, "timestamp")
+	if err != nil || !ok {
+		return Entry{}, invalid(field+".timestamp", "must be an ISO timestamp string")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, timestamp); err != nil {
+		return Entry{}, invalid(field+".timestamp", "must be an RFC3339 timestamp")
+	}
+	return Entry{ID: entryID, ParentID: parentID, Type: typeName}, nil
+}
+
+// ValidateAppend checks entries added to a conversation that already holds the ids `exists` reports.
+// Parents must already exist (or come earlier in the batch), so appends can never form a cycle.
+func ValidateAppend(entries []json.RawMessage, exists func(string) bool, empty bool) ([]Entry, error) {
+	parsed := make([]Entry, 0, len(entries))
+	added := make(map[string]struct{}, len(entries))
+	for index, raw := range entries {
+		field := fmt.Sprintf("entries[%d]", index)
+		entry, err := ParseEntry(field, raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := added[entry.ID]; dup || exists(entry.ID) {
+			return nil, invalid(field+".id", "duplicates another entry id")
+		}
+		if entry.ParentID == "" {
+			if !empty || index != 0 {
+				return nil, invalid(field+".parentId", "only the first entry of a conversation may be a root")
+			}
+		} else if _, ok := added[entry.ParentID]; !ok && !exists(entry.ParentID) {
+			return nil, invalid("entries", fmt.Sprintf("entry %q refers to missing parent %q", entry.ID, entry.ParentID))
+		}
+		added[entry.ID] = struct{}{}
+		parsed = append(parsed, entry)
+	}
+	return parsed, nil
+}
+
+// ValidateHeader checks everything in an envelope except its entries.
+func ValidateHeader(envelope Envelope) error {
+	header := envelope
+	header.Entries = nil
+	header.HeadEntryID = ""
+	return Validate(header)
 }
 
 func validID(value string, max int) bool {

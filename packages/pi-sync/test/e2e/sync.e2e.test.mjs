@@ -3,7 +3,7 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +39,15 @@ const peer = (name, sub = name.toLowerCase(), env = {}) => {
   return pi;
 };
 const userTexts = async (pi) => (await pi.messages()).filter((m) => m.role === "user").map((m) => typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join(""));
+/** Polls `read` until it deep-equals `expected` or 20 s pass, returning the last value for the assertion. */
+const eventually = async (read, expected) => {
+  let value;
+  for (const deadline = Date.now() + 20_000; Date.now() < deadline; await sleep(250)) {
+    value = await read();
+    if (JSON.stringify(value) === JSON.stringify(expected)) break;
+  }
+  return value;
+};
 const sessionFiles = (name) => {
   const dir = join(caseDir, `agent${name}`, "sessions");
   try {
@@ -179,9 +188,9 @@ test("a turn whose upload was lost to a server outage uploads once the server is
   await B.prompt("b moved on");
   await A.prompt("a again");
   const expected = ["one", "sleep1500 lost upload", "b moved on", "a again"];
-  assert.deepEqual(await userTexts(A), expected);
-  await sleep(2500);
-  assert.deepEqual(await userTexts(B), expected);
+  // A catches up and replays "a again"; under load that outlasts the prompt call, so wait for it rather than sample once.
+  assert.deepEqual(await eventually(() => userTexts(A), expected), expected);
+  assert.deepEqual(await eventually(() => userTexts(B), expected), expected);
   assert.equal(sessionFiles("A").length, 1, "the lost turn is uploaded, not saved aside");
 });
 
@@ -446,14 +455,64 @@ test("idle devices, including restarts, stop uploading", { ...opts, timeout: 120
   await sleep(3000);
   const etag = async () => (await (await fetch(`${process.env.SYNC_URL}/v1/sessions`)).json()).sessions[0].etag;
   const settled = await etag();
+  let current = B;
   for (let round = 0; round < 2; round++) {
-    await B.stop();
-    peers.splice(peers.indexOf(B), 1);
-    const again = new Pi("B", { cwd: join(caseDir, "git", "b"), agentDir: join(caseDir, "agentB"), args: ["-c"] });
-    peers.push(again);
-    await ready(again);
+    await current.stop();
+    peers.splice(peers.indexOf(current), 1);
+    current = new Pi("B", { cwd: join(caseDir, "git", "b"), agentDir: join(caseDir, "agentB"), args: ["-c"] });
+    peers.push(current);
+    await ready(current);
     await sleep(4000);
   }
   assert.equal(await etag(), settled, "nothing was uploaded while both devices sat idle");
   assert.deepEqual(await userTexts(A), ["one", "two"]);
+});
+
+test("a 40 MB conversation syncs, and each turn sends only what it added", { ...opts, timeout: 240_000 }, async () => {
+  // Observational-memory style: thousands of large custom entries that never reach the model.
+  const dir = join(caseDir, "agentA", "sessions", "big");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "big.jsonl");
+  const sessionId = "01a1b000-0000-7000-8000-000000000001";
+  const lines = [JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2026-10-01T00:00:00.000Z", cwd: join(caseDir, "git", "a") })];
+  let parent = null;
+  const pad = "o".repeat(20_000);
+  for (let i = 0; i < 2000; i++) {
+    const id = `om${String(i).padStart(6, "0")}`;
+    lines.push(JSON.stringify({ type: "custom", customType: "om.observations.recorded", data: { text: pad, i }, id, parentId: parent, timestamp: "2026-10-01T00:00:01.000Z" }));
+    parent = id;
+  }
+  writeFileSync(file, `${lines.join("\n")}\n`);
+  const A = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["--session", file] });
+  peers.push(A);
+  await ready(A);
+  await A.prompt("one");
+  let started = Date.now();
+  await A.prompt("/sync attach");
+  assert.match(A.notes.at(-1), /synchronized/i, A.notes.at(-1));
+  const attachMs = Date.now() - started;
+
+  const B = peer("B");
+  await ready(B);
+  B.answers.push((options) => options[0]);
+  started = Date.now();
+  await B.prompt("/sync");
+  await sleep(300);
+  const openMs = Date.now() - started;
+  assert.deepEqual(await userTexts(B), ["one"]);
+
+  const turns = [];
+  for (const [who, text] of [[B, "two"], [A, "three"], [B, "four"]]) {
+    started = Date.now();
+    await who.prompt(text);
+    turns.push(Date.now() - started);
+  }
+  await sleep(2500);
+  assert.deepEqual(await userTexts(A), ["one", "two", "three", "four"]);
+  assert.deepEqual(await userTexts(B), ["one", "two", "three", "four"]);
+  const stored = readdirSync(join(caseDir, "data", "sessions"));
+  assert.ok(stored.some((name) => name.endsWith(".log")), "stored as an append-only log");
+  const binding = JSON.parse(readFileSync(join(caseDir, "agentB", "sync-bindings.json"), "utf8")).bindings[0];
+  assert.ok(binding.syncedCount > 2000, "B records how much it has synchronized");
+  console.log(`# 40 MB: attach ${attachMs} ms, open on B ${openMs} ms, turns incl. catch-up ${turns.join(" / ")} ms`);
 });

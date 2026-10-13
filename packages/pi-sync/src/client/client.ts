@@ -119,20 +119,61 @@ export class SyncClient {
     }
   }
 
+  /**
+   * Reads entries from index `from` on (all pages), without a lease. The returned envelope holds only those entries;
+   * `count` is the conversation's total. Throws `not_found` on servers that predate appends.
+   */
+  async entriesSince(sessionId: string, from: number, options: RequestOptions = {}): Promise<SessionResponse & { count: number }> {
+    let first: SessionResponse & { count: number } | undefined;
+    const entries: SessionEnvelope["entries"] = [];
+    for (let next = from; ;) {
+      const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/entries?from=${next}`, { method: "GET" }, options);
+      let page: SessionResponse;
+      try {
+        page = validateSessionResponse(value, { partial: true });
+        if (page.count === undefined) throw new Error("count missing");
+      } catch {
+        throw new SyncClientError("invalid_response", "The sync server returned an invalid page of entries.");
+      }
+      // A page from a newer version than the first means another device wrote mid-download; start over.
+      if (first && page.etag !== first.etag) return this.entriesSince(sessionId, from, options);
+      first ??= { ...page, count: page.count! };
+      for (const entry of page.session.entries) entries.push(entry);
+      next += page.session.entries.length;
+      if (isRecord(value) && value.complete === true) break;
+      if (page.session.entries.length === 0) throw new SyncClientError("invalid_response", "The sync server returned an empty page.");
+    }
+    return { ...first, session: { ...first.session, entries } };
+  }
+
+  /** Appends entries under the lease; `baseCount` is the entry count this device last synchronized. */
+  async append(sessionId: string, token: string, etag: string, body: { baseCount: number; entries: SessionEnvelope["entries"]; headEntryId: string; title: string; workspace?: SessionEnvelope["workspace"] }, options: RequestOptions = {}): Promise<{ etag: string; count: number }> {
+    const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/entries`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...this.leaseHeaders(token), "If-Match": etag },
+      body: JSON.stringify(body),
+    }, options);
+    if (!isRecord(value) || typeof value.etag !== "string" || !Number.isInteger(value.count)) {
+      throw new SyncClientError("invalid_response", "The sync server returned an invalid append response.");
+    }
+    return { etag: value.etag, count: value.count as number };
+  }
+
   async enroll(envelope: SessionEnvelope, options: RequestOptions = {}): Promise<SessionResponse> {
     return this.sessionRequest("/v1/sessions", "POST", envelope, options);
   }
 
   /** `takeOver` replaces another device's lease; its later upload is refused. */
-  async acquire(sessionId: string, holder: string, options: RepositoryRequestOptions & { takeOver?: boolean } = {}): Promise<AcquireResponse> {
-    const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/lease`, {
+  async acquire(sessionId: string, holder: string, options: RepositoryRequestOptions & { takeOver?: boolean; metadataOnly?: boolean } = {}): Promise<AcquireResponse> {
+    // metadataOnly skips the entries; servers that predate appends ignore it and send them anyway.
+    const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/lease${options.metadataOnly ? "?entries=none" : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ holder, ...(options.repository === undefined ? {} : { repository: options.repository || "none" }), ...(options.takeOver ? { takeOver: true } : {}) }),
     }, options);
     try {
       if (!isRecord(value)) throw new Error("object expected");
-      const response = validateSessionResponse(value);
+      const response = validateSessionResponse(value, { partial: !!options.metadataOnly });
       const lease = validateLease(value.lease, true) as Lease & { token: string };
       return { ...response, lease };
     } catch {
@@ -182,7 +223,8 @@ export class SyncClient {
       body,
     }, options);
     try {
-      return validateSessionResponse(value);
+      // Servers that store conversations as logs answer writes with metadata only.
+      return validateSessionResponse(value, { partial: true });
     } catch {
       throw new SyncClientError("invalid_response", "The sync server returned invalid session data.");
     }
@@ -255,7 +297,7 @@ export class SyncClient {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 

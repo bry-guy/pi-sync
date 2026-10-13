@@ -1,8 +1,10 @@
 export const PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_HEARTBEAT_MS = 20_000;
 export const DEFAULT_LEASE_EXPIRY_MS = 120_000;
-export const MAX_ENVELOPE_BYTES = 16 * 1024 * 1024;
-export const MAX_ENTRIES = 100_000;
+/** Largest single request body; conversations themselves grow without bound through appends. */
+export const MAX_ENVELOPE_BYTES = 64 * 1024 * 1024;
+/** Kept for compatibility; conversations have no entry limit. */
+export const MAX_ENTRIES = Number.MAX_SAFE_INTEGER;
 
 export interface WorkspacePointer {
   gitRemote: string;
@@ -60,6 +62,8 @@ export interface SessionResponse {
   formatVersion: typeof PROTOCOL_VERSION;
   session: SessionEnvelope;
   etag: string;
+  /** Total entries in the conversation; servers before appends omit it. */
+  count?: number;
 }
 
 export interface AcquireResponse extends SessionResponse {
@@ -143,7 +147,11 @@ export function validateWorkspace(value: unknown, field = "workspace"): Workspac
   return { gitRemote, branch, commit: workspaceCommit, wip: { commit: wipCommit, branch: wipBranch } };
 }
 
-export function validateEnvelope(value: unknown): SessionEnvelope {
+/**
+ * `partial` validates a page of entries from the middle of a conversation: entry shapes only, because parents and
+ * the head may lie in entries the page does not include.
+ */
+export function validateEnvelope(value: unknown, options: { partial?: boolean } = {}): SessionEnvelope {
   if (!isObject(value)) fail("must be a JSON object");
   if (value.formatVersion !== PROTOCOL_VERSION) fail("unsupported format version", "formatVersion");
   const sessionId = stringField(value.sessionId, "sessionId", 128);
@@ -155,7 +163,7 @@ export function validateEnvelope(value: unknown): SessionEnvelope {
   const parentSessionId = nullableId(value.parentSessionId, "parentSessionId");
   const title = typeof value.title === "string" ? value.title : fail("must be a string", "title");
   if (title.length > 2_000 || /\u0000/.test(title)) fail("is too long or contains a NUL byte", "title");
-  if (!Array.isArray(value.entries) || value.entries.length > MAX_ENTRIES) fail("must be an array with a bounded length", "entries");
+  if (!Array.isArray(value.entries)) fail("must be an array", "entries");
 
   const entries: PiEntry[] = [];
   const ids = new Set<string>();
@@ -174,7 +182,9 @@ export function validateEnvelope(value: unknown): SessionEnvelope {
     parents.set(id, parentId ?? "");
   }
 
-  if (entries.length === 0) {
+  if (options.partial) {
+    if (typeof value.headEntryId !== "string") fail("must be a string", "headEntryId");
+  } else if (entries.length === 0) {
     if (value.headEntryId !== "") fail("must be empty when entries is empty", "headEntryId");
   } else {
     const headEntryId = stringField(value.headEntryId, "headEntryId", 128);
@@ -188,14 +198,27 @@ export function validateEnvelope(value: unknown): SessionEnvelope {
       }
     }
     if (roots !== 1) fail("must contain exactly one root entry", "entries");
-    for (const id of ids) {
-      const visited = new Set<string>();
-      let current = id;
-      while (current !== "") {
-        if (visited.has(current)) fail(`contains a cycle at ${current}`, "entries");
-        visited.add(current);
-        current = parents.get(current) ?? "";
+    // One root and every parent present, so anything the root cannot reach sits on a cycle. Linear, unlike a walk per entry.
+    const children = new Map<string, string[]>();
+    let root = "";
+    for (const [id, parentId] of parents) {
+      if (parentId === "") root = id;
+      else {
+        const siblings = children.get(parentId);
+        if (siblings) siblings.push(id);
+        else children.set(parentId, [id]);
       }
+    }
+    const reached = new Set([root]);
+    for (const queue = [root]; queue.length > 0;) {
+      for (const child of children.get(queue.pop()!) ?? []) {
+        reached.add(child);
+        queue.push(child);
+      }
+    }
+    if (reached.size !== ids.size) {
+      const stuck = [...ids].find((id) => !reached.has(id));
+      fail(`contains a cycle at ${stuck}`, "entries");
     }
   }
 
@@ -233,13 +256,14 @@ export function validateMetadata(value: unknown): SessionMetadata {
   return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), workspace: validateWorkspace(value.workspace) };
 }
 
-export function validateSessionResponse(value: unknown): SessionResponse {
+export function validateSessionResponse(value: unknown, options: { partial?: boolean } = {}): SessionResponse {
   assertProtocolVersion(value);
   if (!isObject(value)) fail("response must be an object");
   return {
     formatVersion: PROTOCOL_VERSION,
-    session: validateEnvelope(value.session),
+    session: validateEnvelope(value.session, options),
     etag: stringField(value.etag, "etag", 512),
+    ...(Number.isInteger(value.count) && (value.count as number) >= 0 ? { count: value.count as number } : {}),
   };
 }
 

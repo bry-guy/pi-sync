@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,6 +108,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			"formatVersion": session.FormatVersion,
 			"session":       record.Envelope,
 			"etag":          record.ETag,
+			"count":         record.Count,
 		})
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -122,7 +124,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// A request to any session operation first verifies that the canonical file
 	// exists. This keeps lease and update errors from revealing arbitrary paths.
-	if _, err := s.store.Get(id); err != nil {
+	if _, err := s.store.Meta(id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.writeError(w, http.StatusNotFound, "session_not_found", "session was not found", nil)
 			return
@@ -152,6 +154,16 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", "POST, DELETE")
 			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
 		}
+	case "entries":
+		switch r.Method {
+		case http.MethodGet:
+			s.entries(w, r, id)
+		case http.MethodPost:
+			s.appendEntries(w, r, id)
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
+		}
 	case "lease/renew":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")
@@ -177,7 +189,12 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusBadRequest, "invalid_holder", "holder label is invalid", nil)
 		return
 	}
-	record, err := s.store.Get(id)
+	// Clients that append ask for metadata only; older clients get the whole conversation.
+	getRecord := s.store.Get
+	if r.URL.Query().Get("entries") == "none" {
+		getRecord = s.store.Meta
+	}
+	record, err := getRecord(id)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
@@ -211,6 +228,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
 		"etag":          record.ETag,
+		"count":         record.Count,
 		"lease":         leaseJSON(current, true),
 	})
 }
@@ -228,6 +246,107 @@ func (s *Server) snapshot(w http.ResponseWriter, id string) {
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
 		"etag":          record.ETag,
+		"count":         record.Count,
+	})
+}
+
+// maxPageBytes bounds one page of entries so a first download of a huge conversation is streamed in pieces.
+const maxPageBytes = 16 << 20
+
+// entries returns the conversation's entries from ?from=N on, without a lease. A client that already holds the
+// first N entries downloads only what it lacks.
+func (s *Server) entries(w http.ResponseWriter, r *http.Request, id string) {
+	from := 0
+	if raw := r.URL.Query().Get("from"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", "from must be a non-negative integer", nil)
+			return
+		}
+		from = value
+	}
+	record, complete, err := s.store.Entries(id, from, maxPageBytes)
+	if err != nil {
+		var outside *store.RangeError
+		if errors.As(err, &outside) {
+			s.writeError(w, http.StatusConflict, "range_not_satisfiable", "the conversation has fewer entries than requested", map[string]any{"count": outside.Count})
+			return
+		}
+		s.writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("ETag", record.ETag)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"formatVersion": session.FormatVersion,
+		"session":       record.Envelope,
+		"etag":          record.ETag,
+		"count":         record.Count,
+		"from":          from,
+		"complete":      complete,
+	})
+}
+
+// appendEntries adds entries under the lease. baseCount is the count the client last saw; a mismatch is a stale
+// copy exactly like a stale ETag.
+func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string) {
+	token := leaseToken(r)
+	if token == "" {
+		s.writeError(w, http.StatusLocked, "lease_required", "an active lease token is required", nil)
+		return
+	}
+	if _, err := s.leases.Renew(id, token); err != nil {
+		s.writeError(w, http.StatusLocked, "lease_invalid", "lease token is invalid or expired", nil)
+		return
+	}
+	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
+	if ifMatch == "" {
+		s.writeError(w, http.StatusPreconditionRequired, "etag_required", "If-Match is required", nil)
+		return
+	}
+	var request struct {
+		BaseCount   *int               `json:"baseCount"`
+		Entries     []json.RawMessage  `json:"entries"`
+		HeadEntryID string             `json:"headEntryId"`
+		Title       string             `json:"title"`
+		Workspace   *session.Workspace `json:"workspace,omitempty"`
+	}
+	body := http.MaxBytesReader(w, r.Body, session.MaxRequestBytes)
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(&request); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large", nil)
+		} else {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", "request body must be valid JSON", nil)
+		}
+		return
+	}
+	if request.BaseCount == nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", "baseCount is required", nil)
+		return
+	}
+	header := session.Envelope{HeadEntryID: request.HeadEntryID, Title: request.Title, Workspace: request.Workspace}
+	record, err := s.store.Append(id, ifMatch, *request.BaseCount, request.Entries, header)
+	if err != nil {
+		var stale *store.StaleETagError
+		if errors.As(err, &stale) {
+			s.writeError(w, http.StatusPreconditionFailed, "stale_etag", "canonical session changed", map[string]any{
+				"currentEtag": stale.Current,
+			})
+			return
+		}
+		if session.IsValidationError(err) {
+			s.writeError(w, http.StatusBadRequest, "invalid_session", sanitizeError(err), nil)
+			return
+		}
+		s.writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("ETag", record.ETag)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"formatVersion": session.FormatVersion,
+		"session":       record.Envelope,
+		"etag":          record.ETag,
+		"count":         record.Count,
 	})
 }
 
@@ -242,7 +361,7 @@ func (s *Server) renew(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusLocked, "lease_invalid", "lease token is invalid or expired", nil)
 		return
 	}
-	record, err := s.store.Get(id)
+	record, err := s.store.Meta(id)
 	if err != nil {
 		s.writeStoreError(w, err)
 		return
@@ -251,6 +370,7 @@ func (s *Server) renew(w http.ResponseWriter, r *http.Request, id string) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
 		"etag":          record.ETag,
+		"count":         record.Count,
 		"lease":         leaseJSON(current, false),
 	})
 }
@@ -300,7 +420,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusBadRequest, "invalid_session", "envelope session id does not match URL", nil)
 		return
 	}
-	if _, err := s.store.Get(id); err != nil {
+	if _, err := s.store.Meta(id); err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
@@ -325,6 +445,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
 		"etag":          record.ETag,
+		"count":         record.Count,
 	})
 }
 
@@ -422,6 +543,9 @@ func parseSessionPath(path string) (string, string, bool) {
 	if len(parts) == 1 {
 		return id, "session", true
 	}
+	if len(parts) == 2 && parts[1] == "entries" {
+		return id, "entries", true
+	}
 	if len(parts) == 2 && parts[1] == "lease" {
 		return id, "lease", true
 	}
@@ -445,7 +569,7 @@ func leaseToken(r *http.Request) string {
 }
 
 func (s *Server) readEnvelope(w http.ResponseWriter, r *http.Request) (session.Envelope, bool) {
-	body := http.MaxBytesReader(w, r.Body, session.MaxEnvelopeBytes+1)
+	body := http.MaxBytesReader(w, r.Body, session.MaxRequestBytes+1)
 	data, err := io.ReadAll(body)
 	if err != nil {
 		if strings.Contains(err.Error(), "request body too large") {
@@ -455,7 +579,7 @@ func (s *Server) readEnvelope(w http.ResponseWriter, r *http.Request) (session.E
 		}
 		return session.Envelope{}, false
 	}
-	if len(data) > session.MaxEnvelopeBytes {
+	if len(data) > session.MaxRequestBytes {
 		s.writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large", nil)
 		return session.Envelope{}, false
 	}

@@ -15,6 +15,9 @@ export interface SyncBinding {
   leaseToken?: string;
   leaseExpiresAt?: string;
   lastFingerprint?: string;
+  /** Entries this device last synchronized, and the id of the last one: the local file's first syncedCount entries. */
+  syncedCount?: number;
+  syncedLastId?: string;
   workspace?: WorkspacePointer;
   parentSessionId?: string | null;
   title?: string;
@@ -141,6 +144,8 @@ function isBinding(value: unknown): value is SyncBinding {
     (value.leaseToken === undefined || typeof value.leaseToken === "string") &&
     (value.leaseExpiresAt === undefined || typeof value.leaseExpiresAt === "string") &&
     (value.lastFingerprint === undefined || typeof value.lastFingerprint === "string") &&
+    (value.syncedCount === undefined || Number.isInteger(value.syncedCount)) &&
+    (value.syncedLastId === undefined || typeof value.syncedLastId === "string") &&
     (value.workspace === undefined || isRecord(value.workspace)) &&
     (value.parentSessionId === undefined || value.parentSessionId === null || typeof value.parentSessionId === "string") &&
     (value.title === undefined || typeof value.title === "string") &&

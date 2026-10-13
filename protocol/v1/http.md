@@ -22,11 +22,39 @@ are not synchronized.
 | GET | `/v1/health` | protocol and lease timing |
 | GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
-| GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease |
+| GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease (older clients) |
 | POST | `/v1/sessions/:id/lease` | acquire lease and return complete snapshot |
 | POST | `/v1/sessions/:id/lease/renew` | renew lease |
 | PUT | `/v1/sessions/:id` | replace complete snapshot conditionally |
+| GET | `/v1/sessions/:id/entries?from=N` | entries from index `N` on, a page at a time, without a lease |
+| POST | `/v1/sessions/:id/entries` | append entries conditionally under the lease |
 | DELETE | `/v1/sessions/:id/lease` | release lease |
+
+## Appending
+
+Conversations grow without a size limit, so current clients never send or fetch the
+whole conversation once it is on both sides:
+
+- **`POST /v1/sessions/:id/entries`** sends `{ "baseCount": N, "entries": [...], "headEntryId": "...", "title": "...", "workspace": {...} }`
+  with the lease and `If-Match`. `baseCount` must equal the server's entry count, so a
+  device can only append to the copy it last saw; a mismatch is `412 stale_etag` like a
+  stale ETag. An empty `entries` list just moves the head or changes the title.
+  New entries must have unique ids, and their parents must already exist or come
+  earlier in the batch. The response carries the new `etag` and `count`.
+- **`GET /v1/sessions/:id/entries?from=N`** returns `{ session, etag, count, from, complete }`,
+  where `session.entries` holds entries `N…` up to about 16 MB. Clients repeat with
+  `from` advanced until `complete` is true. `from` past the end is `409 range_not_satisfiable`.
+- **`POST /v1/sessions/:id/lease?entries=none`** acquires the lease and returns the
+  header, `etag` and `count` without entries.
+- **Responses** to create and update carry `count` and may omit entries.
+
+Limits apply per request (64 MB body) and per entry (32 MB), never to the conversation.
+Clients enroll a conversation larger than one request as a first part followed by appends.
+
+The server stores each conversation as an append-only log, so an append costs the
+size of what it adds. A conversation stored by an older server as a single file is
+converted on first use. It keeps reporting the older ETag until the next write, so
+devices that already hold that ETag stay current through the upgrade.
 
 Lease tokens are returned only by acquisition and are sent in
 `X-Pi-Sync-Lease`. `Authorization: Bearer` and `X-Lease-Token` are accepted

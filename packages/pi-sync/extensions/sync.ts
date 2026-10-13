@@ -29,7 +29,9 @@ import {
   shareSetting,
   type Snapshot,
   type WorkspacePointer,
+  appendSessionFile,
   materializeSessionFile,
+  nativeHeaderLine,
   normalizeSessionFile,
   repositoryIdentity,
   restoreHead,
@@ -548,7 +550,15 @@ export default function syncExtension(pi: ExtensionAPI) {
       headEntryId = entry.id;
       return rebased;
     });
-    await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...snapshot.session.entries, ...carried] }, { cwd: ctx.cwd });
+    const entries = snapshot.session.entries;
+    const synced = binding.syncedCount ?? 0;
+    // A pure append onto the file this device last synchronized: add the new lines instead of rewriting it all.
+    const appended = !copyTitle && carried.length === 0 && binding.syncedLastId !== undefined && synced > 0
+      && synced <= entries.length && entries[synced - 1]?.id === binding.syncedLastId
+      && headEntryId === entries.at(-1)?.id
+      && resolvePath(target) === resolvePath(binding.materializedFile)
+      && await appendSessionFile(target, { headerLine: nativeHeaderLine(snapshot.session, { cwd: ctx.cwd }), count: synced, lastId: binding.syncedLastId }, entries.slice(synced));
+    if (!appended) await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...entries, ...carried] }, { cwd: ctx.cwd });
     // Recorded as the canonical copy, so carried entries count as local changes and upload on the next check.
     const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
     await store.set(next);

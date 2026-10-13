@@ -73,3 +73,34 @@ test("restores the canonical head through Pi navigation", async () => {
   }, "head");
   assert.deepEqual(calls, [{ id: "head", options: { summarize: false } }]);
 });
+
+test("appending to a session file matches a full rewrite and refuses a file that is not as expected", async () => {
+  const { appendSessionFile, materializeSessionFile, nativeHeaderLine } = await import("../dist/src/session/index.js");
+  const { mkdtemp, readFile, writeFile, readdir } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(join(tmpdir(), "pi-sync-append-"));
+  const entry = (id, parentId) => ({ type: "message", id, parentId, timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: `text ${id} "quoted"\nline` } });
+  const all = [entry("a", null), entry("b", "a"), entry("c", "b"), entry("d", "c")];
+  const envelope = (entries) => ({ formatVersion: 1, sessionId: "s", piSessionVersion: 3, createdAt: "2026-01-01T00:00:00Z", parentSessionId: null, headEntryId: entries.at(-1).id, title: "", entries });
+  const options = { cwd: dir };
+  const headerLine = nativeHeaderLine(envelope(all), options);
+  const fast = join(dir, "fast.jsonl");
+  const full = join(dir, "full.jsonl");
+  await materializeSessionFile(fast, envelope(all.slice(0, 2)), options);
+  await materializeSessionFile(full, envelope(all), options);
+  assert.equal(await appendSessionFile(fast, { headerLine, count: 2, lastId: "b" }, all.slice(2)), true);
+  assert.equal(await readFile(fast, "utf8"), await readFile(full, "utf8"), "byte-identical to a full rewrite");
+
+  const before = await readFile(fast, "utf8");
+  const refuse = async (expected, label) => assert.equal(await appendSessionFile(fast, expected, [entry("e", "d")]), false, label);
+  await refuse({ headerLine, count: 3, lastId: "c" }, "wrong count");
+  await refuse({ headerLine, count: 4, lastId: "x" }, "wrong last id");
+  await refuse({ headerLine: nativeHeaderLine(envelope(all), { cwd: "/elsewhere" }), count: 4, lastId: "d" }, "different header");
+  await writeFile(fast, before.slice(0, -5));
+  await refuse({ headerLine, count: 4, lastId: "d" }, "truncated last line");
+  await writeFile(fast, before);
+  assert.equal(await appendSessionFile(join(dir, "missing.jsonl"), { headerLine, count: 0, lastId: "" }, []), false, "missing file");
+  assert.equal(await readFile(fast, "utf8"), before, "refusals leave the file untouched");
+  assert.deepEqual((await readdir(dir)).filter((name) => name.includes(".tmp-")), [], "no temporary files left");
+});

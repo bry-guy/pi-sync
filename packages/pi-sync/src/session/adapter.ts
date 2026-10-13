@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { type PiEntry, type SessionEnvelope, type WorkspacePointer, validateEnvelope } from "../protocol.js";
@@ -96,17 +97,22 @@ export interface MaterializeOptions {
   parentSessionPath?: string;
 }
 
-export function materializeNativeJsonl(envelope: SessionEnvelope, options: MaterializeOptions): string {
-  const checked = validateEnvelope(envelope);
+/** The native header line `materializeNativeJsonl` writes for this envelope. */
+export function nativeHeaderLine(envelope: Pick<SessionEnvelope, "piSessionVersion" | "sessionId" | "createdAt">, options: MaterializeOptions): string {
   const header: NativeSessionHeader = {
     type: "session",
-    version: checked.piSessionVersion,
-    id: checked.sessionId,
-    timestamp: checked.createdAt,
+    version: envelope.piSessionVersion,
+    id: envelope.sessionId,
+    timestamp: envelope.createdAt,
     cwd: resolve(options.cwd),
     ...(options.parentSessionPath ? { parentSession: options.parentSessionPath } : {}),
   };
-  return `${JSON.stringify(header)}\n${checked.entries.map((entry) => JSON.stringify(entry)).join("\n")}${checked.entries.length ? "\n" : ""}`;
+  return JSON.stringify(header);
+}
+
+export function materializeNativeJsonl(envelope: SessionEnvelope, options: MaterializeOptions): string {
+  const checked = validateEnvelope(envelope);
+  return `${nativeHeaderLine(checked, options)}\n${checked.entries.map((entry) => JSON.stringify(entry)).join("\n")}${checked.entries.length ? "\n" : ""}`;
 }
 
 export const materializeSession = materializeNativeJsonl;
@@ -138,6 +144,65 @@ export async function materializeSessionFile(path: string, envelope: SessionEnve
 }
 
 export const writeMaterializedSession = materializeSessionFile;
+
+export interface AppendExpectation {
+  /** The exact header line the file must start with. */
+  headerLine: string;
+  /** Entries the file must hold after its header, and the id of the last one. */
+  count: number;
+  lastId: string;
+}
+
+/**
+ * Adds `entries` to a session file that holds exactly the expected entries, without re-serializing it: the file is
+ * copied (a clone where the filesystem supports it), the new lines appended and synced, then renamed into place.
+ * Returns false, leaving the file untouched, when the file is not exactly as expected; callers then rewrite it whole.
+ */
+export async function appendSessionFile(path: string, expected: AppendExpectation, entries: readonly PiEntry[]): Promise<boolean> {
+  const target = resolve(path);
+  let data: Buffer;
+  try {
+    if ((await lstat(target)).isSymbolicLink()) return false;
+    data = await readFile(target);
+  } catch {
+    return false;
+  }
+  if (!fileHolds(data, expected)) return false;
+  const temporary = `${target}.tmp-${randomBytes(12).toString("hex")}`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await copyFile(target, temporary, constants.COPYFILE_FICLONE);
+    await chmod(temporary, 0o600);
+    handle = await open(temporary, "a");
+    await handle.writeFile(entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, target);
+    return true;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+/** Whether `data` is the header line plus exactly `count` complete entry lines, the last with id `lastId`. */
+function fileHolds(data: Buffer, expected: AppendExpectation): boolean {
+  if (data.length === 0 || data[data.length - 1] !== 0x0a) return false;
+  const headerEnd = data.indexOf(0x0a);
+  if (data.subarray(0, headerEnd).toString("utf8") !== expected.headerLine) return false;
+  let lines = 0;
+  for (let at = headerEnd; (at = data.indexOf(0x0a, at + 1)) !== -1;) lines++;
+  if (lines !== expected.count) return false;
+  if (expected.count === 0) return expected.lastId === "";
+  const lastStart = data.lastIndexOf(0x0a, data.length - 2) + 1;
+  try {
+    const last = JSON.parse(data.subarray(lastStart, data.length - 1).toString("utf8")) as { id?: unknown };
+    return last.id === expected.lastId;
+  } catch {
+    return false;
+  }
+}
 
 export async function restoreHead(
   navigateTree: (entryId: string, options?: { summarize?: boolean }) => Promise<{ cancelled?: boolean } | void>,

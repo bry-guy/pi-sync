@@ -311,7 +311,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     let from = syncedPrefix(local, binding);
     for (;;) {
       try {
-        const delta = await client.entriesSince(binding.canonicalSessionId, from);
+        const delta = await client.entriesSince(binding.canonicalSessionId, from, { prevId: from > 0 ? String(local[from - 1]?.id ?? "") : undefined });
         // The server's copy must still start with the prefix this device holds; otherwise download it all.
         if (from > 0 && delta.count < from) {
           from = 0;
@@ -320,7 +320,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         const entries = from === 0 ? delta.session.entries : [...local.slice(0, from), ...delta.session.entries];
         return { ok: true, snapshot: { ...delta, session: { ...delta.session, entries } } };
       } catch (error) {
-        if (error instanceof SyncClientError && error.code === "range_not_satisfiable" && from > 0) {
+        if (error instanceof SyncClientError && ["range_not_satisfiable", "prefix_mismatch"].includes(error.code) && from > 0) {
           from = 0;
           continue;
         }

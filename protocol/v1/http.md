@@ -41,8 +41,11 @@ whole conversation once it is on both sides:
   stale ETag. An empty `entries` list just moves the head or changes the title.
   New entries must have unique ids, and their parents must already exist or come
   earlier in the batch. The response carries the new `etag` and `count`.
-- **`GET /v1/sessions/:id/entries?from=N`** returns `{ session, etag, count, from, complete }`,
-  where `session.entries` holds entries `N…` up to about 16 MB. Clients repeat with
+- **`GET /v1/sessions/:id/entries?from=N&prevId=ID`** returns `{ session, etag, count, from, complete, prevId }`,
+  where `session.entries` holds entries `N…` up to about 16 MB and `prevId` is the id of entry
+  `N-1`. A client that already holds `N` entries sends the id of its entry `N-1`; if it differs,
+  the server answers `409 prefix_mismatch` and the client downloads everything, because a
+  whole-conversation write can rewrite history without changing the count. Clients repeat with
   `from` advanced until `complete` is true. `from` past the end is `409 range_not_satisfiable`.
 - **`POST /v1/sessions/:id/lease?entries=none`** acquires the lease and returns the
   header, `etag` and `count` without entries.

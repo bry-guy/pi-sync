@@ -123,11 +123,14 @@ export class SyncClient {
    * Reads entries from index `from` on (all pages), without a lease. The returned envelope holds only those entries;
    * `count` is the conversation's total. Throws `not_found` on servers that predate appends.
    */
-  async entriesSince(sessionId: string, from: number, options: RequestOptions = {}): Promise<SessionResponse & { count: number }> {
+  async entriesSince(sessionId: string, from: number, options: RequestOptions & { prevId?: string } = {}): Promise<SessionResponse & { count: number }> {
     let first: SessionResponse & { count: number } | undefined;
     const entries: SessionEnvelope["entries"] = [];
+    const { prevId, ...requestOptions } = options;
     for (let next = from; ;) {
-      const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/entries?from=${next}`, { method: "GET" }, options);
+      const query = new URLSearchParams({ from: String(next) });
+      if (next === from && from > 0 && prevId) query.set("prevId", prevId);
+      const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/entries?${query}`, { method: "GET" }, requestOptions);
       let page: SessionResponse;
       try {
         page = validateSessionResponse(value, { partial: true });
@@ -137,6 +140,8 @@ export class SyncClient {
       }
       // A page from a newer version than the first means another device wrote mid-download; start over.
       if (first && page.etag !== first.etag) return this.entriesSince(sessionId, from, options);
+      // A server that does not echo the predecessor cannot vouch for this device's prefix; download it all.
+      if (!first && from > 0 && (!isRecord(value) || value.prevId !== prevId)) return this.entriesSince(sessionId, 0, requestOptions);
       first ??= { ...page, count: page.count! };
       for (const entry of page.session.entries) entries.push(entry);
       next += page.session.entries.length;

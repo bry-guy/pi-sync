@@ -265,25 +265,34 @@ func (s *Server) entries(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		from = value
 	}
-	record, complete, err := s.store.Entries(id, from, maxPageBytes)
+	record, complete, previousID, err := s.store.EntriesVerified(id, from, maxPageBytes, r.URL.Query().Get("prevId"))
 	if err != nil {
 		var outside *store.RangeError
 		if errors.As(err, &outside) {
 			s.writeError(w, http.StatusConflict, "range_not_satisfiable", "the conversation has fewer entries than requested", map[string]any{"count": outside.Count})
 			return
 		}
+		var mismatch *store.PrefixMismatchError
+		if errors.As(err, &mismatch) {
+			s.writeError(w, http.StatusConflict, "prefix_mismatch", "the entries before from differ from the stored conversation", map[string]any{"actualPrevId": mismatch.ActualPrevID})
+			return
+		}
 		s.writeStoreError(w, err)
 		return
 	}
 	w.Header().Set("ETag", record.ETag)
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
 		"etag":          record.ETag,
 		"count":         record.Count,
 		"from":          from,
 		"complete":      complete,
-	})
+	}
+	if previousID != "" {
+		response["prevId"] = previousID
+	}
+	s.writeJSON(w, http.StatusOK, response)
 }
 
 // appendEntries adds entries under the lease. baseCount is the count the client last saw; a mismatch is a stale

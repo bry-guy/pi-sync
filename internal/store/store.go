@@ -148,7 +148,13 @@ func (s *Store) Create(envelope session.Envelope) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return s.record(m, base), nil
+	return withEntries(s.record(m, base), envelope), nil
+}
+
+// withEntries answers a whole-conversation write with the whole conversation, as older clients expect.
+func withEntries(record Record, envelope session.Envelope) Record {
+	record.Envelope.Entries = envelope.Entries
+	return record
 }
 
 // Meta reads the conversation's header, count and ETag without touching its entries.
@@ -289,7 +295,7 @@ func (s *Store) Update(id, expectedETag string, envelope session.Envelope) (Reco
 	if err != nil {
 		return Record{}, err
 	}
-	return s.record(m, base), nil
+	return withEntries(s.record(m, base), envelope), nil
 }
 
 func (s *Store) List() ([]Record, error) {

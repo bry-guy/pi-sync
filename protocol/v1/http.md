@@ -41,9 +41,11 @@ whole conversation once it is on both sides:
   stale ETag. An empty `entries` list just moves the head or changes the title.
   New entries must have unique ids, and their parents must already exist or come
   earlier in the batch. The response carries the new `etag` and `count`.
-- **`GET /v1/sessions/:id/entries?from=N`** returns `{ session, etag, count, from, complete }`,
-  where `session.entries` holds entries `N…` up to about 16 MB. Clients repeat with
-  `from` advanced until `complete` is true. `from` past the end is `409 range_not_satisfiable`.
+- **`GET /v1/sessions/:id/entries?from=N&prevId=ID`** returns `{ session, etag, count, from, complete }`,
+  where `session.entries` holds entries `N…` up to about 64 MB. When `from > 0`, current
+  clients send `prevId`, the entry id at `from - 1`; a mismatch returns `409 prefix_mismatch`,
+  so a stale local prefix is never trusted by count alone. Clients repeat with `from` advanced
+  until `complete` is true. `from` past the end is `409 range_not_satisfiable`.
 - **`POST /v1/sessions/:id/lease?entries=none`** acquires the lease and returns the
   header, `etag` and `count` without entries.
 - **Responses** to create and update carry `count` and may omit entries.

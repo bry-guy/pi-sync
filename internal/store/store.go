@@ -182,37 +182,81 @@ func (s *Store) Get(id string) (Record, error) {
 // Entries returns entries from index `from` on, stopping before maxBytes of entries (at least one entry; -1 for no
 // limit). complete reports whether the page reached the end.
 func (s *Store) Entries(id string, from int, maxBytes int64) (Record, bool, error) {
+	record, complete, _, err := s.EntriesVerified(id, from, maxBytes, "")
+	return record, complete, err
+}
+
+// PrefixMismatchError reports a requested predecessor that is not the server's predecessor.
+type PrefixMismatchError struct{ ActualPrevID string }
+
+func (e *PrefixMismatchError) Error() string { return "entry prefix does not match server copy" }
+
+// EntriesVerified reads a page and, under the same session lock, verifies expectedPrevID as the id of entry from-1.
+func (s *Store) EntriesVerified(id string, from int, maxBytes int64, expectedPrevID string) (Record, bool, string, error) {
 	base, err := s.paths(id)
 	if err != nil {
-		return Record{}, false, err
+		return Record{}, false, "", err
 	}
 	lock := s.lockFor(id)
 	lock.Lock()
 	defer lock.Unlock()
 	m, err := s.load(base)
 	if err != nil {
-		return Record{}, false, err
+		return Record{}, false, "", err
 	}
 	record := s.record(m, base)
 	if from < 0 || from > m.Count {
-		return Record{}, false, &RangeError{Count: m.Count}
+		return Record{}, false, "", &RangeError{Count: m.Count}
+	}
+	previous := ""
+	if from > 0 {
+		previous, err = entryIDAt(base, from-1)
+		if err != nil {
+			return Record{}, false, "", err
+		}
+		if expectedPrevID != "" && previous != expectedPrevID {
+			return Record{}, false, previous, &PrefixMismatchError{ActualPrevID: previous}
+		}
 	}
 	start, err := offsetBefore(base, from)
 	if err != nil {
-		return Record{}, false, err
+		return Record{}, false, "", err
 	}
 	end := m.Bytes
 	if maxBytes >= 0 && end-start > maxBytes {
 		if end, err = pageEnd(base, from, m.Count, start, maxBytes); err != nil {
-			return Record{}, false, err
+			return Record{}, false, "", err
 		}
 	}
 	entries, err := readEntries(base+".log", start, end)
 	if err != nil {
-		return Record{}, false, err
+		return Record{}, false, "", err
 	}
 	record.Envelope.Entries = entries
-	return record, from+len(entries) == m.Count, nil
+	return record, from+len(entries) == m.Count, previous, nil
+}
+
+func entryIDAt(base string, index int) (string, error) {
+	start, err := offsetBefore(base, index)
+	if err != nil {
+		return "", err
+	}
+	end, err := readOffset(base, index)
+	if err != nil {
+		return "", err
+	}
+	entries, err := readEntries(base+".log", start, end)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) != 1 {
+		return "", fmt.Errorf("entry index read returned %d entries", len(entries))
+	}
+	entry, err := session.ParseEntry(fmt.Sprintf("entry %d", index), entries[0])
+	if err != nil {
+		return "", err
+	}
+	return entry.ID, nil
 }
 
 // RangeError reports a `from` beyond the conversation; the client's copy is not a prefix of the server's.

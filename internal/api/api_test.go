@@ -421,9 +421,12 @@ func TestHTTPAppendAndPagedEntries(t *testing.T) {
 	if status, _ := call("POST", "/v1/sessions/session-1/entries", appendBody, lease); status != http.StatusPreconditionFailed {
 		t.Fatalf("replaying an append with the old etag: %d", status)
 	}
-	status, page := call("GET", "/v1/sessions/session-1/entries?from=1", nil, nil)
-	if status != http.StatusOK || page["complete"] != true || len(page["session"].(map[string]any)["entries"].([]any)) != 1 || page["etag"] != appended["etag"] {
+	status, page := call("GET", "/v1/sessions/session-1/entries?from=1&prevId=a", nil, nil)
+	if status != http.StatusOK || page["complete"] != true || page["prevId"] != "a" || len(page["session"].(map[string]any)["entries"].([]any)) != 1 || page["etag"] != appended["etag"] {
 		t.Fatalf("entries from 1: %d %v", status, page)
+	}
+	if status, _ := call("GET", "/v1/sessions/session-1/entries?from=1&prevId=wrong", nil, nil); status != http.StatusConflict {
+		t.Fatalf("wrong predecessor: %d", status)
 	}
 	if status, _ := call("GET", "/v1/sessions/session-1/entries?from=9", nil, nil); status != http.StatusConflict {
 		t.Fatalf("from past the end: %d", status)

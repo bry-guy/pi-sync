@@ -35,9 +35,10 @@ import {
   normalizeSessionFile,
   repositoryIdentity,
   restoreHead,
+  configPath,
+  loadConfig,
 } from "../src/index.js";
 
-const HEARTBEAT_MS = Number(process.env.PI_SYNC_HEARTBEAT_MS) || 20_000;
 const REQUEST_TIMEOUT_MS = 8_000;
 const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
 // Local-only entries of these types mean two devices really wrote the same conversation.
@@ -102,8 +103,6 @@ function syncedPrefix(local: readonly { id?: unknown }[], binding: SyncBinding):
 }
 
 function defaultDeviceLabel(): string {
-  const configured = process.env.PI_SYNC_DEVICE_LABEL?.trim();
-  if (configured) return configured.slice(0, 64);
   return hostname().split(".")[0]?.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 64) || "pi";
 }
 
@@ -126,6 +125,9 @@ function relativeAge(value: string | undefined): string {
 
 export default function syncExtension(pi: ExtensionAPI) {
   const store = new BindingStore(getAgentDir());
+  // Read once per load; /reload picks up edits.
+  const config = loadConfig(configPath(getAgentDir()));
+  const HEARTBEAT_MS = config.heartbeatMs;
   // Last binding seen per session in this process: an older pi-sync process sharing the file can
   // rewrite it without ours, so a missing binding we still know about is written back.
   const remembered = new Map<string, SyncBinding>();
@@ -144,7 +146,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === LINK_ENTRY) as { data?: { detached?: boolean } } | undefined;
     return marker?.data?.detached === true;
   };
-  const deviceLabel = defaultDeviceLabel();
+  const deviceLabel = config.deviceLabel || defaultDeviceLabel();
   let currentSessionId: string | undefined;
   let lease: HeldLease | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -177,7 +179,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   const configuredUrl = (args = ""): string | undefined => {
     const candidate = args.trim().split(/\s+/).find((part) => /^https?:\/\//i.test(part));
-    return candidate ?? process.env.PI_SYNC_SERVER_URL ?? process.env.PI_SYNC_URL;
+    return candidate ?? config.serverUrl;
   };
 
   const clientFor = (url: string): SyncClient => new SyncClient({ baseUrl: url, timeoutMs: REQUEST_TIMEOUT_MS, device: deviceLabel });
@@ -418,7 +420,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     stopHeartbeat();
     lease = undefined;
     let snapshot: Snapshot | undefined;
-    if ((await shareSetting(ctx.cwd)) === true) {
+    if (await shareEnabled(ctx.cwd)) {
       try {
         snapshot = await captureWorkspace(ctx.cwd);
       } catch {
@@ -449,7 +451,37 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
       }
     });
-    if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot);
+    if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot).then(() => retryPushes(ctx, true)).catch(() => undefined);
+    else void retryPushes(ctx, true).catch(() => undefined);
+  };
+
+  /** The repository's own /sync code on|off wins; otherwise the configured default. */
+  const shareEnabled = async (cwd: string): Promise<boolean> => (await shareSetting(cwd)) ?? config.code === "auto";
+
+  // Snapshots whose push failed, by conversation. Only the latest matters: each push replaces the conversation's ref.
+  // shortcut: kept in memory, so a restart drops it; the next turn's snapshot covers the same work.
+  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number }>();
+  const PUSH_RETRY_MS = 60_000;
+
+  const tryPush = async (ctx: ExtensionContext, id: string, cwd: string, remote: string, commit: string) => {
+    const retrying = pendingPushes.has(id);
+    const pushed = await pushSnapshot(cwd, remote, commit, id);
+    if (pushed.code === 0) {
+      if (pendingPushes.get(id)?.commit === commit) pendingPushes.delete(id);
+      if (retrying) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
+      return;
+    }
+    const latest = pendingPushes.get(id);
+    if (latest && latest.commit !== commit) return; // a newer snapshot replaced this one meanwhile
+    pendingPushes.set(id, { cwd, remote, commit, nextAttempt: Date.now() + PUSH_RETRY_MS });
+    if (!retrying) notify(ctx, `Code for this turn was not shared yet: push to ${remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
+  };
+
+  /** Retries failed pushes from the poll, at most once a minute each, and after every turn. */
+  const retryPushes = async (ctx: ExtensionContext, force = false) => {
+    for (const [id, pending] of pendingPushes) {
+      if (force || Date.now() >= pending.nextAttempt) await tryPush(ctx, id, pending.cwd, pending.remote, pending.commit);
+    }
   };
 
   /** Pushes (or clears) the turn's code snapshot after the lease is released, so it never delays the other device. */
@@ -460,16 +492,18 @@ export default function syncExtension(pi: ExtensionAPI) {
       return;
     }
     if (snapshot.kind === "clean") {
+      pendingPushes.delete(id);
       if (binding.workspace?.wip) await deleteSnapshot(ctx.cwd, id, binding.workspace.gitRemote).catch(() => undefined);
       return;
     }
-    const pushed = await pushSnapshot(ctx.cwd, snapshot.remote, snapshot.workspace.wip!.commit, id);
-    if (pushed.code !== 0) notify(ctx, `Code for this turn was not shared: push to ${snapshot.remote} failed. ${pushed.stderr.trim().split("\n").at(-1) ?? ""}`, "warning");
+    const commit = snapshot.workspace.wip!.commit;
+    if (pendingPushes.has(id)) pendingPushes.set(id, { cwd: ctx.cwd, remote: snapshot.remote, commit, nextAttempt: 0 });
+    await tryPush(ctx, id, ctx.cwd, snapshot.remote, commit);
   };
 
   /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
   const askToShareCode = async (ctx: ExtensionContext) => {
-    if (!ctx.hasUI || ctx.mode === "json" || (await shareSetting(ctx.cwd)) !== undefined) return;
+    if (config.code !== "ask" || !ctx.hasUI || ctx.mode === "json" || (await shareSetting(ctx.cwd)) !== undefined) return;
     if (!(await hasUnsharedCode(ctx.cwd))) return;
     const enabled = await ctx.ui.confirm(
       "Share uncommitted code with your other devices?",
@@ -710,6 +744,7 @@ let counted = binding;
   };
 
   const poll = async (ctx: ExtensionContext, generation: number) => {
+    if (pendingPushes.size && !lease) void retryPushes(ctx).catch(() => undefined);
     if (generation !== pollGeneration || lease || busy || refreshDispatched || !currentSessionId) return;
     if (!ctx.isIdle() || hasPendingInput(ctx)) return;
     const binding = await bindingFor(currentSessionId);
@@ -795,7 +830,7 @@ let counted = binding;
     currentSessionId = sessionId;
     const existing = await bindingFor(sessionId);
     const url = configuredUrl(args) ?? existing?.serverUrl;
-    if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL or run /sync attach <server URL>.");
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL), or run /sync attach <server URL>.");
     if (existing && existing.state !== "setup_required") {
       notify(ctx, "This conversation is already synchronized.", "info");
       startPoll(ctx);
@@ -837,7 +872,7 @@ let counted = binding;
   const syncPick = async (ctx: ExtensionCommandContext) => {
     const current = await bindingFor(ctx.sessionManager.getSessionId());
     const url = configuredUrl() ?? current?.serverUrl;
-    if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL before using /sync.");
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
     if (!ctx.hasUI) return fail(ctx, "sync_ui_required", "The synchronized-session picker requires an interactive UI.");
     let sessions;
     try {
@@ -983,7 +1018,7 @@ let counted = binding;
       if (command === "code") return syncCode(ctx, rest[0] ?? "");
       if (command === "open" && rest[0]) {
         const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
-        if (!url) return fail(ctx, "sync_not_configured", "Set PI_SYNC_SERVER_URL before using /sync.");
+        if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
         return openSynced(ctx, url, rest[0]);
       }
       if (command === "") return syncPick(ctx);
@@ -1017,6 +1052,7 @@ let counted = binding;
   };
 
   pi.on("session_start", async (event, ctx) => {
+    if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
     currentSessionId = ctx.sessionManager.getSessionId();
     const kept = keptSettings.value;
     keptSettings.value = undefined;
@@ -1124,8 +1160,32 @@ let counted = binding;
     };
   });
 
+  /** With allSessions on, a conversation is synchronized once it has a reply, unless it was detached here. */
+  const autoEnroll = async (ctx: ExtensionContext) => {
+    const url = config.serverUrl;
+    const path = ctx.sessionManager.getSessionFile();
+    if (!config.allSessions || !url || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (await bindingFor(sessionId)) return;
+    const envelope = await normalizeCurrent(ctx);
+    try {
+      const response = await exclusive(() => enrollInBatches(url, envelope));
+      const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: path, state: "ready" };
+      await store.set(syncedBinding(base, envelope, response.etag, path));
+    } catch (error) {
+      // Already on the server (this copy was opened elsewhere and its binding lost): /sync attach adopts it deliberately.
+      if (error instanceof SyncClientError && error.code === "duplicate_enrollment") return;
+      setStatus(ctx, "sync: not synchronized yet (offline?)");
+      return;
+    }
+    currentSessionId = sessionId;
+    setStatus(ctx, "sync: up to date");
+    startPoll(ctx);
+  };
+
   pi.on("agent_settled", async (_event, ctx) => {
     await finishTurn(ctx);
+    await autoEnroll(ctx).catch(() => undefined);
   });
 
   // Compaction outside a turn rewrites context, so it needs the lease and a current copy.

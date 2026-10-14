@@ -5,8 +5,33 @@ synchronization protocol. It wraps and extends Pi from
 `@earendil-works/pi-coding-agent`. The package includes the native Pi JSONL adapter,
 `/sync` extension, and `synchronized-workspace` skill.
 
-The extension expects `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) and is intended
-to be installed as a trusted Pi package.
+The extension is intended to be installed as a trusted Pi package.
+
+## Settings
+
+Settings live in `~/.pi/agent/pi-sync.json` (or `$PI_CODING_AGENT_DIR/pi-sync.json`).
+Each one can be overridden by an environment variable. Edits take effect after
+`/reload` or a restart. Invalid values are ignored with a warning at startup.
+
+```json
+{
+  "serverUrl": "https://pi-sync.example",
+  "deviceLabel": "laptop",
+  "code": "ask",
+  "allSessions": false
+}
+```
+
+| Setting | Environment | Values | Default |
+|---|---|---|---|
+| `serverUrl` | `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) | http(s) URL of pi-syncd | none: sync is off |
+| `deviceLabel` | `PI_SYNC_DEVICE_LABEL` | name other devices see | host name |
+| `code` | `PI_SYNC_CODE` | `ask` once per repository, `auto` share without asking, `off` never | `ask` |
+| `allSessions` | `PI_SYNC_ALL_SESSIONS` | `on`: every conversation syncs after its first reply; `off`: only `/sync attach` | `off` |
+| `heartbeatMs` | `PI_SYNC_HEARTBEAT_MS` | lease heartbeat and poll interval | `20000` |
+
+A repository's own `/sync code on|off` wins over `code`. `/sync detach` keeps a
+conversation out of `allSessions`.
 
 ## Using it
 
@@ -47,6 +72,9 @@ without touching your index or stash, and pushed to the hidden ref
 read the remote can read that ref. Snapshots over 20 MB, or with a file over
 5 MB, are skipped with a warning. The answer is stored per repository as
 `git config pi-sync.shareWorkingTree`; change it with `/sync code on|off`.
+If a push fails (offline, remote unreachable), pi-sync says so and retries
+after the next turn and about once a minute while idle; only the newest
+snapshot is pushed.
 
 When another device's checkout differs from the conversation's code, pi-sync
 says so. `/sync code` then fast-forwards (or creates) the branch and restores
@@ -67,8 +95,7 @@ reconnects on its own when the server has a conversation with the same id,
 unless it was stopped with `/sync detach`, which records that in the session.
 To stop older processes rewriting the file, restart them after updating.
 
-`PI_SYNC_DEVICE_LABEL` overrides the device name shown to other devices; the
-default is the host name. Lease tokens are device-local state; they are never
+Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.
 
 Hosts such as pi-ez-web run the extension in JSON mode, which disables the

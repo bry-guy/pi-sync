@@ -3,7 +3,7 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +18,7 @@ process.env.FAKE_LLM_PORT = String(LLM_PORT);
 
 let root, daemonBin, daemon, llm, peers = [];
 
-const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+const git = (cwd, ...args) => { try { return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch (error) { if (args[0] === "config") return ""; throw error; } };
 
 const startDaemon = async (dataDir) => {
   daemon = spawn(daemonBin, [], { env: { ...process.env, PI_SYNC_LISTEN: `127.0.0.1:${SYNC_PORT}`, PI_SYNC_DATA_DIR: dataDir }, stdio: "ignore" });
@@ -352,6 +352,37 @@ test("sending anyway while the server is down uploads the turn once it is back",
   await sleep(5000);
   assert.deepEqual(await userTexts(B), ["one", "written offline"]);
   assert.equal(sessionFiles("A").length, 1, "no copy when nobody else moved on");
+});
+
+test("code: auto shares without asking, and a failed push is retried on a later turn", { ...opts, timeout: 120_000 }, async () => {
+  const A = peer("A", "a", { PI_SYNC_CODE: "auto" });
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  const a = join(caseDir, "git", "a"), origin = join(caseDir, "git", "origin.git");
+  writeFileSync(join(a, "wip.txt"), "work\n");
+  renameSync(origin, origin + ".away"); // the remote is unreachable
+  await A.prompt("two");
+  await sleep(1500);
+  assert.ok(A.notes.some((note) => /will retry/.test(note)), `told the push will be retried: ${JSON.stringify(A.notes)}`);
+  assert.equal(git(a, "config", "--get", "pi-sync.shareWorkingTree"), "", "auto never stored a per-repository answer");
+  renameSync(origin + ".away", origin);
+  await A.prompt("three");
+  await sleep(1500);
+  assert.match(git(origin, "for-each-ref", "refs/pi-sync/"), /refs\/pi-sync\//, "the snapshot reached the remote");
+});
+
+test("allSessions synchronizes a conversation after its first reply", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A", "a", { PI_SYNC_ALL_SESSIONS: "on" });
+  await ready(A);
+  await A.prompt("never attached");
+  await sleep(1500);
+  const B = peer("B");
+  await ready(B);
+  B.answers.push((options) => options[0]);
+  await B.prompt("/sync");
+  await sleep(500);
+  assert.deepEqual(await userTexts(B), ["never attached"]);
 });
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

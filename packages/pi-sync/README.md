@@ -14,9 +14,10 @@ to be installed as a trusted Pi package.
 - `/sync` opens a picker of shared conversations. It lists the current
   repository first, then sorts by most recent. Opening a conversation this
   device already has reuses its file.
-- Starting pi in a repository with no conversation open offers the shared
-  conversation for that repository that this device hasn't caught up with
-  (updated in the last day). `/sync open <id>` opens one directly.
+- Starting pi in a repository warns when a shared conversation for that
+  repository, updated in the last day, is ahead of this device, and names the
+  other clients it is on. Nothing opens by itself: use `/sync`, or
+  `/sync open <id>` to open one directly.
 - `/sync status`, `/sync refresh`, and `/sync detach` inspect, force-refresh,
   or stop syncing on this device. Detaching leaves the server copy unchanged.
 

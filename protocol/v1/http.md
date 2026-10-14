@@ -20,7 +20,7 @@ are not synchronized.
 | Method | Path | Response |
 | --- | --- | --- |
 | GET | `/v1/health` | protocol and lease timing |
-| GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers (optionally filtered by repository) |
+| GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
 | GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease (older clients) |
 | POST | `/v1/sessions/:id/lease` | acquire lease and return complete snapshot |
@@ -58,6 +58,12 @@ The server stores each conversation as an append-only log, so an append costs th
 size of what it adds. A conversation stored by an older server as a single file is
 converted on first use. It keeps reporting the older ETag until the next write, so
 devices that already hold that ETag stay current through the upgrade.
+
+Clients may send `X-Pi-Sync-Device: <label>` on every request. The server records
+which labels created, read, wrote, or leased each conversation and lists them as
+`devices: [{ "label", "lastSeen" }]`, most recent first (at most 32, refreshed at
+most hourly per label). The list is display-only; it never changes a conversation's
+ETag or `updatedAt`.
 
 Lease tokens are returned only by acquisition and are sent in
 `X-Pi-Sync-Lease`. `Authorization: Bearer` and `X-Lease-Token` are accepted

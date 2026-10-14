@@ -103,6 +103,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session could not be stored", nil)
 			return
 		}
+		s.noteReader(r, envelope.SessionID)
 		w.Header().Set("ETag", record.ETag)
 		s.writeJSON(w, http.StatusCreated, map[string]any{
 			"formatVersion": session.FormatVersion,
@@ -138,6 +139,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			s.snapshot(w, id)
+			s.noteReader(r, id)
 		case http.MethodPut:
 			s.update(w, r, id)
 		default:
@@ -223,6 +225,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeError(w, http.StatusInternalServerError, "lease_unavailable", "lease could not be acquired", nil)
 		return
 	}
+	s.store.NoteDevice(id, request.Holder, time.Now())
 	w.Header().Set("ETag", record.ETag)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
@@ -235,6 +238,17 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 
 // snapshot returns the canonical copy without a lease so idle clients can catch up
 // without briefly appearing to be "in use".
+// deviceHeader names the reading client so the conversation can list the clients it is on.
+const deviceHeader = "X-Pi-Sync-Device"
+
+func (s *Server) noteReader(r *http.Request, id string) {
+	label := r.Header.Get(deviceHeader)
+	if label == "" || len(label) > maxHolderLen || strings.ContainsAny(label, "\r\n\x00") {
+		return
+	}
+	s.store.NoteDevice(id, label, time.Now())
+}
+
 func (s *Server) snapshot(w http.ResponseWriter, id string) {
 	record, err := s.store.Get(id)
 	if err != nil {
@@ -265,6 +279,7 @@ func (s *Server) entries(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		from = value
 	}
+	defer s.noteReader(r, id)
 	record, complete, previousID, err := s.store.EntriesVerified(id, from, maxPageBytes, r.URL.Query().Get("prevId"))
 	if err != nil {
 		var outside *store.RangeError
@@ -298,6 +313,7 @@ func (s *Server) entries(w http.ResponseWriter, r *http.Request, id string) {
 // appendEntries adds entries under the lease. baseCount is the count the client last saw; a mismatch is a stale
 // copy exactly like a stale ETag.
 func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string) {
+	defer s.noteReader(r, id)
 	token := leaseToken(r)
 	if token == "" {
 		s.writeError(w, http.StatusLocked, "lease_required", "an active lease token is required", nil)
@@ -407,6 +423,7 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
+	defer s.noteReader(r, id)
 	token := leaseToken(r)
 	if token == "" {
 		s.writeError(w, http.StatusLocked, "lease_required", "an active lease token is required", nil)
@@ -496,6 +513,7 @@ func (s *Server) metadata(record store.Record) metadata {
 		HeadEntryID: record.Envelope.HeadEntryID,
 		ETag:        record.ETag,
 		Workspace:   record.Envelope.Workspace,
+		Devices:     record.Devices,
 	}
 	if !record.UpdatedAt.IsZero() {
 		updatedAt := record.UpdatedAt
@@ -518,6 +536,7 @@ type metadata struct {
 	LeaseExpiresAt *time.Time         `json:"leaseExpiresAt"`
 	UpdatedAt      *time.Time         `json:"updatedAt,omitempty"`
 	Workspace      *session.Workspace `json:"workspace,omitempty"`
+	Devices        []store.Device     `json:"devices,omitempty"`
 }
 
 type leaseResponse struct {

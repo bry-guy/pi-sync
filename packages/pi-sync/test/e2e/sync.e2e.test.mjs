@@ -328,18 +328,18 @@ test("uncommitted and unpushed code follows the conversation when sharing is ena
   assert.throws(() => statSync(join(b, "secret.env")), "ignored files are never shared");
 });
 
-test("starting pi on another device offers the conversation it hasn't seen", { ...opts, timeout: 90_000 }, async () => {
+test("starting pi on another device warns which clients the conversation is on", { ...opts, timeout: 90_000 }, async () => {
   const A = peer("A");
   await ready(A);
   await A.prompt("from A");
   await A.prompt("/sync attach");
   const B = peer("B");
-  B.answers.push(true); // accept the arrival offer
   await sleep(4000);
-  assert.deepEqual(await userTexts(B), ["from A"]);
-  await B.prompt("continued on B");
-  await sleep(2500);
-  assert.deepEqual(await userTexts(A), ["from A", "continued on B"]);
+  const warning = B.notes.find((note) => note.includes("is synchronized on other clients"));
+  assert.ok(warning, `B warned on start: ${JSON.stringify(B.notes)}`);
+  assert.match(warning, /: A\b/, "the warning names the client the conversation is on");
+  assert.doesNotMatch(warning, /\bB\b/, "and not this client");
+  assert.deepEqual(await userTexts(B), [], "nothing was opened without asking");
 });
 
 test("sending anyway while the server is down uploads the turn once it is back", { ...opts, timeout: 120_000 }, async () => {

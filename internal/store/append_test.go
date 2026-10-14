@@ -174,3 +174,36 @@ func TestAppendTimeIsFlatAsTheConversationGrows(t *testing.T) {
 		t.Fatalf("append slowed from %v to %v as the conversation grew", early, late)
 	}
 }
+
+func TestDevicesNeverChangeETagOrUpdatedAt(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.Create(session.Envelope{FormatVersion: session.FormatVersion, SessionID: "d", PiSessionVersion: 3, CreatedAt: "2026-01-01T00:00:00Z", HeadEntryID: "a", Entries: []json.RawMessage{json.RawMessage(`{"type":"message","id":"a","parentId":null,"timestamp":"2026-01-01T00:00:01Z"}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s.NoteDevice("d", "laptop", now)
+	s.NoteDevice("d", "web", now.Add(time.Second))
+	s.NoteDevice("d", "laptop", now.Add(2*time.Second)) // within the refresh window: no rewrite
+	s.NoteDevice("missing", "laptop", now)
+	record, err := s.Meta("d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ETag != created.ETag || !record.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("recording devices changed the conversation: %v %v", record.ETag, record.UpdatedAt)
+	}
+	if len(record.Devices) != 2 || record.Devices[0].Label != "web" || record.Devices[1].Label != "laptop" {
+		t.Fatalf("devices = %+v", record.Devices)
+	}
+	if list, err := s.List(); err != nil || len(list) != 1 {
+		t.Fatalf("list = %v %v", list, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sessions", ".missing.devices")); err == nil {
+		t.Fatal("recorded a device for a conversation that does not exist")
+	}
+}

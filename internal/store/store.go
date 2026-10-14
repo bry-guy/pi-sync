@@ -50,6 +50,14 @@ type Record struct {
 	// Count is the total number of entries in the conversation.
 	Count     int
 	UpdatedAt time.Time
+	// Devices are the clients that have read or written the conversation, most recent first.
+	Devices []Device
+}
+
+// Device is a client label and when it last used a conversation.
+type Device struct {
+	Label    string    `json:"label"`
+	LastSeen time.Time `json:"lastSeen"`
 }
 
 type meta struct {
@@ -382,7 +390,7 @@ func (s *Store) List() ([]Record, error) {
 }
 
 func (s *Store) record(m meta, base string) Record {
-	record := Record{Envelope: m.envelope(), ETag: m.currentETag(), Count: m.Count}
+	record := Record{Envelope: m.envelope(), ETag: m.currentETag(), Count: m.Count, Devices: readDevices(base)}
 	if info, err := os.Stat(base + ".meta.json"); err == nil {
 		record.UpdatedAt = info.ModTime().UTC()
 	}
@@ -743,4 +751,61 @@ func IsStaleETag(err error) bool {
 func (s *Store) Ready() error {
 	_, err := os.ReadDir(filepath.Join(s.root, "sessions"))
 	return err
+}
+
+// Devices live beside the conversation in a dot-file, which older servers skip when listing, and outside meta so
+// that recording one never changes the ETag or updatedAt.
+func devicesPath(base string) string {
+	return filepath.Join(filepath.Dir(base), "."+filepath.Base(base)+".devices")
+}
+
+func readDevices(base string) []Device {
+	data, err := readRegular(devicesPath(base))
+	if err != nil {
+		return nil
+	}
+	var devices []Device
+	if json.Unmarshal(data, &devices) != nil {
+		return nil
+	}
+	return devices
+}
+
+// deviceRefresh limits how often a device already on the list rewrites it.
+const deviceRefresh = time.Hour
+
+// maxDevices bounds the list; the least recently seen drop off.
+const maxDevices = 32
+
+// NoteDevice records that label used the conversation. Failures are ignored: the list is informational.
+func (s *Store) NoteDevice(id, label string, now time.Time) {
+	base, err := s.paths(id)
+	if err != nil || label == "" {
+		return
+	}
+	lock := s.lockFor(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, err := os.Stat(base + ".meta.json"); err != nil {
+		if _, legacy := os.Stat(base + ".json"); legacy != nil {
+			return
+		}
+	}
+	devices := readDevices(base)
+	next := []Device{{Label: label, LastSeen: now.UTC()}}
+	for _, device := range devices {
+		if device.Label == label {
+			if now.Sub(device.LastSeen) < deviceRefresh {
+				return
+			}
+			continue
+		}
+		next = append(next, device)
+	}
+	if len(next) > maxDevices {
+		next = next[:maxDevices]
+	}
+	if data, err := json.Marshal(next); err == nil {
+		_ = writeAtomic(devicesPath(base), data)
+	}
 }

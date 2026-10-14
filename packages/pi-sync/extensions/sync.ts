@@ -107,6 +107,13 @@ function defaultDeviceLabel(): string {
   return hostname().split(".")[0]?.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 64) || "pi";
 }
 
+/** “title” is synchronized on other clients: a, b. Open it with /sync. */
+export function arrivalWarning(title: string, item: { leaseHolder: string | null; devices?: { label: string }[] }, self: string): string {
+  const others = [...new Set([item.leaseHolder, ...(item.devices ?? []).map((device) => device.label)])].filter((label): label is string => !!label && label !== self);
+  const where = others.length ? `other clients: ${others.join(", ")}` : "other clients";
+  return `“${title}” is synchronized on ${where}. Open it with /sync.`;
+}
+
 function relativeAge(value: string | undefined): string {
   if (!value) return "";
   const seconds = Math.max(0, (Date.now() - Date.parse(value)) / 1000);
@@ -173,7 +180,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     return candidate ?? process.env.PI_SYNC_SERVER_URL ?? process.env.PI_SYNC_URL;
   };
 
-  const clientFor = (url: string): SyncClient => new SyncClient({ baseUrl: url, timeoutMs: REQUEST_TIMEOUT_MS });
+  const clientFor = (url: string): SyncClient => new SyncClient({ baseUrl: url, timeoutMs: REQUEST_TIMEOUT_MS, device: deviceLabel });
 
   /** Serializes network/file operations so a background upload never races a prompt's acquisition. */
   const exclusive = async <T>(task: () => Promise<T>): Promise<T> => {
@@ -895,10 +902,11 @@ let counted = binding;
   };
 
   /**
-   * On a fresh start in a repository, offers the shared conversation this device hasn't caught up with.
-   * shortcut: only conversations updated in the last day are offered and a "no" isn't remembered; persist declines if it nags.
+   * On a fresh start in a repository, warns about the shared conversation this client hasn't caught up with, naming
+   * the clients it is on. Opening it stays a deliberate /sync.
+   * shortcut: only conversations updated in the last day are mentioned.
    */
-  const offerArrival = async (ctx: ExtensionContext) => {
+  const warnArrival = async (ctx: ExtensionContext) => {
     const url = configuredUrl();
     if (!url || !ctx.hasUI || ctx.mode === "json") return;
     const repository = await repositoryFor(ctx);
@@ -911,13 +919,8 @@ let counted = binding;
       .filter((item) => bindings.get(item.sessionId)?.lastEtag !== item.etag)
       .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
     if (!candidate) return;
-    // The user may have started typing meanwhile; never interrupt that.
-    if (hasMessages(ctx) || hasPendingInput(ctx)) return;
-    const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "a shared conversation";
-    const where = candidate.leaseHolder ? `running on ${candidate.leaseHolder}` : `updated ${relativeAge(candidate.updatedAt)}`;
-    const yes = await ctx.ui.confirm("Continue a synchronized conversation?", `“${title}” (${where}). Open it here?`);
-    // Slash commands sent as user messages only run with prompt expansion on.
-    if (yes && !hasMessages(ctx)) pi.sendUserMessage(`/sync open ${candidate.sessionId}`, { expandPromptTemplates: true });
+    const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "A conversation";
+    notify(ctx, arrivalWarning(title, candidate, deviceLabel), "warning");
   };
 
   const detachCurrent = async (ctx: ExtensionCommandContext) => {
@@ -1030,7 +1033,7 @@ let counted = binding;
     let binding = await bindingFor(currentSessionId);
     if (!binding) {
       setStatus(ctx);
-      if (event.reason === "startup" && !hasMessages(ctx)) void offerArrival(ctx).catch(() => undefined);
+      if (event.reason === "startup" && !hasMessages(ctx)) void warnArrival(ctx).catch(() => undefined);
       else void reconnect(ctx).catch(() => undefined);
       return;
     }

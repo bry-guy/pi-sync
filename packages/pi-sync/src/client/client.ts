@@ -20,6 +20,8 @@ export interface SyncClientOptions {
   baseUrl: string;
   fetch?: typeof globalThis.fetch;
   timeoutMs?: number;
+  /** This client's label, sent so the server can list the clients a conversation is on. */
+  device?: string;
 }
 
 export interface RequestOptions {
@@ -68,10 +70,14 @@ const messages: Record<string, string> = {
   not_found: "The synchronization endpoint was not found.",
 };
 
+// A page holds up to one 32 MiB entry, and older servers answer with whole conversations up to a request's size.
+const MAX_RESPONSE_BYTES = MAX_ENVELOPE_BYTES + 1024 * 1024;
+
 export class SyncClient {
   readonly baseUrl: string;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly defaultTimeoutMs: number;
+  private readonly device: string | undefined;
 
   constructor(options: SyncClientOptions | string) {
     const config = typeof options === "string" ? { baseUrl: options } : options;
@@ -81,6 +87,7 @@ export class SyncClient {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
     this.fetchImpl = config.fetch ?? globalThis.fetch.bind(globalThis);
     this.defaultTimeoutMs = config.timeoutMs ?? 10_000;
+    this.device = config.device;
   }
 
   async health(options: RequestOptions = {}): Promise<HealthResponse> {
@@ -250,13 +257,14 @@ export class SyncClient {
       else signal.addEventListener("abort", abortFromCaller, { once: true });
     }
     try {
-      const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, signal: controller.signal });
+      const headers = this.device ? { ...(init.headers as Record<string, string> | undefined), "X-Pi-Sync-Device": this.device } : init.headers;
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
       const length = Number(response.headers.get("content-length") ?? 0);
-      if (Number.isFinite(length) && length > 16 * 1024 * 1024) {
+      if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
         throw new SyncClientError("response_too_large", "The sync server returned an oversized response.", { status: response.status });
       }
       const text = await response.text();
-      if (text.length > 16 * 1024 * 1024) {
+      if (text.length > MAX_RESPONSE_BYTES) {
         throw new SyncClientError("response_too_large", "The sync server returned an oversized response.", { status: response.status });
       }
       if (!response.ok) throw this.errorFromResponse(response.status, text);

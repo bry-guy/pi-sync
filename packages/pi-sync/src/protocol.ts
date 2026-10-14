@@ -44,6 +44,8 @@ export interface SessionMetadata {
   leaseExpiresAt: string | null;
   updatedAt?: string;
   workspace?: WorkspacePointer;
+  /** Clients that have used the conversation, most recent first (servers before 0.1.8 omit it). */
+  devices?: { label: string; lastSeen: string }[];
 }
 
 export interface Lease {
@@ -253,7 +255,11 @@ export function validateMetadata(value: unknown): SessionMetadata {
   const leaseHolder = value.leaseHolder === null || value.leaseHolder === undefined ? null : stringField(value.leaseHolder, "leaseHolder", 128);
   const leaseExpiresAt = value.leaseExpiresAt === null || value.leaseExpiresAt === undefined ? null : timestamp(value.leaseExpiresAt, "leaseExpiresAt");
   const updatedAt = value.updatedAt === undefined || value.updatedAt === null ? undefined : timestamp(value.updatedAt, "updatedAt");
-  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), workspace: validateWorkspace(value.workspace) };
+  // Informational only, so malformed items are dropped rather than failing the list.
+  const devices = Array.isArray(value.devices)
+    ? value.devices.flatMap((item: unknown) => isObject(item) && typeof item.label === "string" && item.label.length <= 128 && typeof item.lastSeen === "string" ? [{ label: item.label, lastSeen: item.lastSeen }] : [])
+    : undefined;
+  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), ...(devices ? { devices } : {}), workspace: validateWorkspace(value.workspace) };
 }
 
 export function validateSessionResponse(value: unknown, options: { partial?: boolean } = {}): SessionResponse {

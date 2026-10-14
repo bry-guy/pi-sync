@@ -26,11 +26,10 @@ Each one can be overridden by an environment variable. Edits take effect after
 |---|---|---|---|
 | `serverUrl` | `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) | http(s) URL of pi-syncd | none: sync is off |
 | `deviceLabel` | `PI_SYNC_DEVICE_LABEL` | name other devices see | host name |
-| `code` | `PI_SYNC_CODE` | `ask` once per repository, `auto` share without asking, `off` never | `ask` |
+| `code` | `PI_SYNC_CODE` | `ask` once per repository, `auto` share without asking (announced once per remote; anyone who can read the remote can read the code), `off` never, whatever a repository says | `ask` |
 | `allSessions` | `PI_SYNC_ALL_SESSIONS` | `on`: every conversation syncs after its first reply; `off`: only `/sync attach` | `off` |
-| `heartbeatMs` | `PI_SYNC_HEARTBEAT_MS` | lease heartbeat and poll interval | `20000` |
 
-A repository's own `/sync code on|off` wins over `code`. `/sync detach` keeps a
+With `ask` or `auto`, a repository's own `/sync code on|off` wins. `/sync detach` keeps a
 conversation out of `allSessions`.
 
 ## Using it

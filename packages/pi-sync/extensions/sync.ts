@@ -456,31 +456,42 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   /** The repository's own /sync code on|off wins; otherwise the configured default. */
-  const shareEnabled = async (cwd: string): Promise<boolean> => (await shareSetting(cwd)) ?? config.code === "auto";
+  const shareEnabled = async (cwd: string): Promise<boolean> => config.code !== "off" && ((await shareSetting(cwd)) ?? config.code === "auto");
+  const autoShareNoticed = new Set<string>();
 
   // Snapshots whose push failed, by conversation. Only the latest matters: each push replaces the conversation's ref.
   // shortcut: kept in memory, so a restart drops it; the next turn's snapshot covers the same work.
-  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number }>();
+  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number; failed: boolean }>();
   const PUSH_RETRY_MS = 60_000;
 
-  const tryPush = async (ctx: ExtensionContext, id: string, cwd: string, remote: string, commit: string) => {
-    const retrying = pendingPushes.has(id);
-    const pushed = await pushSnapshot(cwd, remote, commit, id);
+  // One push or delete at a time per conversation, so an older snapshot can never land after a newer one.
+  const pushChains = new Map<string, Promise<void>>();
+  const inOrder = (id: string, task: () => Promise<void>): Promise<void> => {
+    const next = (pushChains.get(id) ?? Promise.resolve()).then(task, task).catch(() => undefined);
+    pushChains.set(id, next);
+    void next.then(() => { if (pushChains.get(id) === next) pushChains.delete(id); });
+    return next;
+  };
+
+  /** Pushes the conversation's latest pending snapshot, if it is still the latest when its turn comes. */
+  const tryPush = (ctx: ExtensionContext, id: string, commit: string) => inOrder(id, async () => {
+    const pending = pendingPushes.get(id);
+    if (!pending || pending.commit !== commit) return; // superseded or cleared meanwhile
+    const pushed = await pushSnapshot(pending.cwd, pending.remote, commit, id);
+    if (pendingPushes.get(id)?.commit !== commit) return;
     if (pushed.code === 0) {
-      if (pendingPushes.get(id)?.commit === commit) pendingPushes.delete(id);
-      if (retrying) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
+      pendingPushes.delete(id);
+      if (pending.failed) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
       return;
     }
-    const latest = pendingPushes.get(id);
-    if (latest && latest.commit !== commit) return; // a newer snapshot replaced this one meanwhile
-    pendingPushes.set(id, { cwd, remote, commit, nextAttempt: Date.now() + PUSH_RETRY_MS });
-    if (!retrying) notify(ctx, `Code for this turn was not shared yet: push to ${remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
-  };
+    pendingPushes.set(id, { ...pending, failed: true, nextAttempt: Date.now() + PUSH_RETRY_MS });
+    if (!pending.failed) notify(ctx, `Code for this turn was not shared yet: push to ${pending.remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
+  });
 
   /** Retries failed pushes from the poll, at most once a minute each, and after every turn. */
   const retryPushes = async (ctx: ExtensionContext, force = false) => {
     for (const [id, pending] of pendingPushes) {
-      if (force || Date.now() >= pending.nextAttempt) await tryPush(ctx, id, pending.cwd, pending.remote, pending.commit);
+      if (pending.failed && (force || Date.now() >= pending.nextAttempt)) await tryPush(ctx, id, pending.commit);
     }
   };
 
@@ -493,12 +504,17 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     if (snapshot.kind === "clean") {
       pendingPushes.delete(id);
-      if (binding.workspace?.wip) await deleteSnapshot(ctx.cwd, id, binding.workspace.gitRemote).catch(() => undefined);
+      if (binding.workspace?.wip) await inOrder(id, () => deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote));
       return;
     }
+    if (config.code === "auto" && !autoShareNoticed.has(snapshot.remote)) {
+      autoShareNoticed.add(snapshot.remote);
+      notify(ctx, `Sharing uncommitted code to ${snapshot.remote} (refs/pi-sync/…); anyone who can read that remote can read it. /sync code off stops it for this repository.`, "info");
+    }
     const commit = snapshot.workspace.wip!.commit;
-    if (pendingPushes.has(id)) pendingPushes.set(id, { cwd: ctx.cwd, remote: snapshot.remote, commit, nextAttempt: 0 });
-    await tryPush(ctx, id, ctx.cwd, snapshot.remote, commit);
+    const failed = pendingPushes.get(id)?.failed ?? false;
+    pendingPushes.set(id, { cwd: ctx.cwd, remote: snapshot.remote, commit, nextAttempt: 0, failed });
+    await tryPush(ctx, id, commit);
   };
 
   /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
@@ -1164,7 +1180,8 @@ let counted = binding;
   const autoEnroll = async (ctx: ExtensionContext) => {
     const url = config.serverUrl;
     const path = ctx.sessionManager.getSessionFile();
-    if (!config.allSessions || !url || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
+    if (!config.allSessions || !url || !ctx.hasUI || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     const sessionId = ctx.sessionManager.getSessionId();
     if (await bindingFor(sessionId)) return;
     const envelope = await normalizeCurrent(ctx);

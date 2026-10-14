@@ -24,13 +24,18 @@ test("the file sets values and the environment overrides them", () => {
 
 test("bad values fall back to defaults and are reported", () => {
   const d = dir();
-  writeFileSync(configPath(d), JSON.stringify({ code: "always", allSessions: "maybe", serverUrl: "pi-sync.local", heartbeatMs: 5 }));
+  writeFileSync(configPath(d), JSON.stringify({ code: "always", allSessions: "maybe", serverUrl: "pi-sync.local", heartbeatMs: 500_000 }));
   const config = loadConfig(configPath(d), {});
   assert.equal(config.code, "ask");
   assert.equal(config.allSessions, false);
   assert.equal(config.serverUrl, undefined);
   assert.equal(config.heartbeatMs, 20_000);
-  assert.equal(config.problems.length, 4);
+  assert.equal(config.problems.length, 3, "heartbeatMs is not a file setting");
   writeFileSync(configPath(d), "{not json");
   assert.match(loadConfig(configPath(d), {}).problems[0], /could not be read/);
+});
+
+test("the test heartbeat stays inside the lease expiry", () => {
+  assert.equal(loadConfig(configPath(dir()), { PI_SYNC_HEARTBEAT_MS: "500000" }).heartbeatMs, 30_000);
+  assert.equal(loadConfig(configPath(dir()), { PI_SYNC_HEARTBEAT_MS: "1000" }).heartbeatMs, 1000);
 });

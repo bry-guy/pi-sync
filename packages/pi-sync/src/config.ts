@@ -7,10 +7,11 @@ export type CodeSharing = "ask" | "auto" | "off";
 export interface SyncConfig {
   serverUrl?: string;
   deviceLabel?: string;
-  /** Uncommitted code: ask once per repository, share without asking, or never share. A repository's `/sync code on|off` wins. */
+  /** Uncommitted code: ask once per repository, share without asking, or never share. `off` wins over a repository's answer. */
   code: CodeSharing;
   /** Synchronize every conversation after its first reply, not only ones attached with /sync attach. */
   allSessions: boolean;
+  /** Tests only (PI_SYNC_HEARTBEAT_MS): the heartbeat must stay well inside the server's 120 s lease expiry. */
   heartbeatMs: number;
   /** Settings that were ignored, for one warning at startup. */
   problems: string[];
@@ -56,16 +57,15 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
     problems.push(`${key} must be on or off`);
     return false;
   };
-  const heartbeat = Number(pick("heartbeatMs", "PI_SYNC_HEARTBEAT_MS") ?? 20_000);
-  if (!(heartbeat >= 250)) problems.push("heartbeatMs must be a number of milliseconds (at least 250)");
-  const serverUrl = text("serverUrl", "PI_SYNC_SERVER_URL") ?? (env.PI_SYNC_URL?.trim() || undefined);
+  const heartbeat = Math.min(30_000, Math.max(250, Number(env.PI_SYNC_HEARTBEAT_MS) || 20_000));
+  const serverUrl = env.PI_SYNC_SERVER_URL?.trim() || env.PI_SYNC_URL?.trim() || text("serverUrl", "PI_SYNC_SERVER_URL");
   if (serverUrl && !/^https?:\/\//i.test(serverUrl)) problems.push("serverUrl must start with http:// or https://");
   return {
     serverUrl: serverUrl && /^https?:\/\//i.test(serverUrl) ? serverUrl : undefined,
     deviceLabel: text("deviceLabel", "PI_SYNC_DEVICE_LABEL")?.slice(0, 64),
     code: choice("code", "PI_SYNC_CODE", ["ask", "auto", "off"] as const, "ask"),
     allSessions: onOff("allSessions", "PI_SYNC_ALL_SESSIONS"),
-    heartbeatMs: heartbeat >= 250 ? heartbeat : 20_000,
+    heartbeatMs: heartbeat,
     problems,
   };
 }

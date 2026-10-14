@@ -313,7 +313,6 @@ func (s *Server) entries(w http.ResponseWriter, r *http.Request, id string) {
 // appendEntries adds entries under the lease. baseCount is the count the client last saw; a mismatch is a stale
 // copy exactly like a stale ETag.
 func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string) {
-	defer s.noteReader(r, id)
 	token := leaseToken(r)
 	if token == "" {
 		s.writeError(w, http.StatusLocked, "lease_required", "an active lease token is required", nil)
@@ -367,6 +366,7 @@ func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 	w.Header().Set("ETag", record.ETag)
+	s.noteReader(r, id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
@@ -423,7 +423,6 @@ func (s *Server) release(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
-	defer s.noteReader(r, id)
 	token := leaseToken(r)
 	if token == "" {
 		s.writeError(w, http.StatusLocked, "lease_required", "an active lease token is required", nil)
@@ -467,6 +466,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	w.Header().Set("ETag", record.ETag)
+	s.noteReader(r, id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,

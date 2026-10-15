@@ -1197,7 +1197,8 @@ let counted = binding;
   // Marks where turns ran, so the agent can tell the conversation moved. Not part of the model's context.
   const DEVICE_ENTRY = "pi-sync-device";
   const lastDevice = (ctx: ExtensionContext): string | undefined => {
-    const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DEVICE_ENTRY) as { data?: { device?: unknown } } | undefined;
+    // The current branch only: after /tree, markers on abandoned branches say nothing about the previous turn.
+    const marker = [...ctx.sessionManager.getBranch()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DEVICE_ENTRY) as { data?: { device?: unknown } } | undefined;
     return typeof marker?.data?.device === "string" ? marker.data.device : undefined;
   };
 

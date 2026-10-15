@@ -413,6 +413,21 @@ export default function syncExtension(pi: ExtensionAPI) {
     setStatus(ctx, "sync: working");
   };
 
+  /** A failed git step is usually another git command holding a lock; try a few times before giving up on this turn. */
+  const captureWithRetry = async (cwd: string): Promise<Snapshot> => {
+    let snapshot: Snapshot = { kind: "skipped", reason: "could not capture the working tree", retryable: true };
+    for (const wait of [0, 500, 2000]) {
+      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        snapshot = await captureWorkspace(cwd);
+      } catch (error) {
+        snapshot = { kind: "skipped", reason: `could not capture the working tree (${error instanceof Error ? error.message : String(error)})`, retryable: true };
+      }
+      if (snapshot.kind !== "skipped" || !snapshot.retryable) return snapshot;
+    }
+    return snapshot;
+  };
+
   /** Uploads the settled conversation and releases the turn's lease. Never blocks the user. */
   const finishTurn = async (ctx: ExtensionContext) => {
     const held = lease;
@@ -420,13 +435,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     stopHeartbeat();
     lease = undefined;
     let snapshot: Snapshot | undefined;
-    if (await shareEnabled(ctx.cwd)) {
-      try {
-        snapshot = await captureWorkspace(ctx.cwd);
-      } catch {
-        snapshot = undefined;
-      }
-    }
+    if (await shareEnabled(ctx.cwd)) snapshot = await captureWithRetry(ctx.cwd);
     let uploaded = false;
     await exclusive(async () => {
       try {
@@ -499,7 +508,8 @@ export default function syncExtension(pi: ExtensionAPI) {
   const shareSnapshot = async (ctx: ExtensionContext, binding: SyncBinding, snapshot: Snapshot) => {
     const id = binding.canonicalSessionId;
     if (snapshot.kind === "skipped") {
-      notify(ctx, `Code for this turn was not shared: ${snapshot.reason}.`, "warning");
+      // A retryable failure is covered by the next turn's snapshot, which captures the whole working tree again.
+      notify(ctx, snapshot.retryable ? `Code for this turn was not shared yet: ${snapshot.reason}. pi-sync will try again after your next turn.` : `Code for this turn was not shared: ${snapshot.reason}.`, "warning");
       return;
     }
     if (snapshot.kind === "clean") {

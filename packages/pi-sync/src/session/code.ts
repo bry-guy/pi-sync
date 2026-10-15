@@ -84,7 +84,8 @@ async function remoteName(cwd: string, gitRemote?: string): Promise<string | und
 export type Snapshot =
   | { kind: "clean"; workspace?: WorkspacePointer }
   | { kind: "captured"; workspace: WorkspacePointer; remote: string }
-  | { kind: "skipped"; reason: string; workspace?: WorkspacePointer };
+  // retryable: a git step failed (a lock held by another git command, a timeout); trying again later can succeed.
+  | { kind: "skipped"; reason: string; retryable: boolean; workspace?: WorkspacePointer };
 
 /** Captures the working tree as a commit without touching the user's index, worktree, or stash. */
 export async function captureWorkspace(cwd: string): Promise<Snapshot> {
@@ -94,20 +95,28 @@ export async function captureWorkspace(cwd: string): Promise<Snapshot> {
   const branch = await out(cwd, ["symbolic-ref", "--short", "HEAD"]);
   const remote = await remoteName(cwd, pushed?.gitRemote);
   const gitRemote = pushed?.gitRemote ?? (remote ? await out(cwd, ["remote", "get-url", remote]) : undefined);
-  if (!head || !branch || !remote || !gitRemote) return { kind: "skipped", reason: "no branch or remote to share code through", workspace: pushed };
+  if (!head || !branch || !remote || !gitRemote) return { kind: "skipped", reason: "no branch or remote to share code through", retryable: false, workspace: pushed };
   const dir = await mkdtemp(join(tmpdir(), "pi-sync-index-"));
   try {
     const env = { GIT_INDEX_FILE: join(dir, "index") };
-    if ((await git(cwd, ["read-tree", "HEAD"], { env })).code !== 0) return { kind: "skipped", reason: "could not read HEAD", workspace: pushed };
-    if ((await git(cwd, ["add", "-A", "--", ":/"], { env, timeoutMs: 60_000 })).code !== 0) return { kind: "skipped", reason: "could not stage the working tree", workspace: pushed };
-    const tree = (await git(cwd, ["write-tree"], { env })).stdout.trim();
-    if (!tree) return { kind: "skipped", reason: "could not write the working tree", workspace: pushed };
+    const failed = (reason: string, result: GitResult): Snapshot => {
+      const detail = result.stderr.trim().split("\n").at(-1);
+      return { kind: "skipped", reason: detail ? `${reason} (${detail})` : reason, retryable: true, workspace: pushed };
+    };
+    const read = await git(cwd, ["read-tree", "HEAD"], { env });
+    if (read.code !== 0) return failed("could not read HEAD", read);
+    const added = await git(cwd, ["add", "-A", "--", ":/"], { env, timeoutMs: 60_000 });
+    if (added.code !== 0) return failed("could not stage the working tree", added);
+    const written = await git(cwd, ["write-tree"], { env });
+    const tree = written.stdout.trim();
+    if (!tree) return failed("could not write the working tree", written);
     const tooLarge = await oversized(cwd, head, tree);
-    if (tooLarge) return { kind: "skipped", reason: tooLarge, workspace: pushed };
-    const commit = (await git(cwd, ["commit-tree", tree, "-p", head, "-m", "pi-sync working tree snapshot"], {
+    if (tooLarge) return { kind: "skipped", reason: tooLarge, retryable: false, workspace: pushed };
+    const recorded = await git(cwd, ["commit-tree", tree, "-p", head, "-m", "pi-sync working tree snapshot"], {
       env: { GIT_AUTHOR_NAME: "pi-sync", GIT_AUTHOR_EMAIL: "pi-sync@localhost", GIT_COMMITTER_NAME: "pi-sync", GIT_COMMITTER_EMAIL: "pi-sync@localhost" },
-    })).stdout.trim();
-    if (!commit) return { kind: "skipped", reason: "could not record the snapshot", workspace: pushed };
+    });
+    const commit = recorded.stdout.trim();
+    if (!commit) return failed("could not record the snapshot", recorded);
     return {
       kind: "captured",
       remote,

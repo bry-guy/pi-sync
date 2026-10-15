@@ -94,6 +94,12 @@ reconnects on its own when the server has a conversation with the same id,
 unless it was stopped with `/sync detach`, which records that in the session.
 To stop older processes rewriting the file, restart them after updating.
 
+Each turn on a synchronized conversation tells the agent which machine it runs
+on (device label, platform, working directory). When the previous turn ran on
+another machine, it also warns that files, processes, and uncommitted work from
+there may not exist here. A small `pi-sync-device` entry records each move; it
+is not sent to the model.
+
 Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.
 

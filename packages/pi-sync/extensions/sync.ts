@@ -106,6 +106,22 @@ function defaultDeviceLabel(): string {
   return hostname().split(".")[0]?.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 64) || "pi";
 }
 
+/** Tells the agent which machine this turn runs on, and that earlier turns may have run elsewhere. */
+export function locationPrompt(input: { device: string; previous?: string; cwd: string; platform: string; workspace?: WorkspacePointer }): string {
+  const lines = [
+    `Location: this conversation is synchronized across machines with pi-sync. This turn runs on "${input.device}" (${input.platform}), in ${input.cwd}.`,
+  ];
+  if (input.previous && input.previous !== input.device) {
+    lines.push(`The previous turn ran on "${input.previous}". Files, running processes, uncommitted changes, and tool output from there may not exist here; check before relying on them, and don't assume this machine's state matches earlier messages.`);
+  } else {
+    lines.push("Earlier turns may have run on other machines; check local state before relying on what earlier messages describe.");
+  }
+  if (input.workspace) {
+    lines.push(`Synchronized workspace: upstream branch ${input.workspace.branch} at pushed commit ${input.workspace.commit}. Follow the synchronized-workspace skill before handing work to another runtime.`);
+  }
+  return lines.join("\n");
+}
+
 /** “title” is synchronized on other clients: a, b. Open it with /sync. */
 export function arrivalWarning(title: string, item: { leaseHolder: string | null; devices?: { label: string }[] }, self: string): string {
   const others = [...new Set([item.leaseHolder, ...(item.devices ?? []).map((device) => device.label)])].filter((label): label is string => !!label && label !== self);
@@ -1178,12 +1194,18 @@ let counted = binding;
     return { action: "handled" as const };
   });
 
-  pi.on("before_agent_start", async (event) => {
-    const workspace = lease?.binding.workspace;
-    if (!workspace) return;
-    return {
-      systemPrompt: `${event.systemPrompt}\n\nSynchronized workspace: upstream branch ${workspace.branch} at pushed commit ${workspace.commit}. Follow the synchronized-workspace skill before handing work to another runtime.`,
-    };
+  // Marks where turns ran, so the agent can tell the conversation moved. Not part of the model's context.
+  const DEVICE_ENTRY = "pi-sync-device";
+  const lastDevice = (ctx: ExtensionContext): string | undefined => {
+    const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DEVICE_ENTRY) as { data?: { device?: unknown } } | undefined;
+    return typeof marker?.data?.device === "string" ? marker.data.device : undefined;
+  };
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!lease) return;
+    const previous = lastDevice(ctx);
+    if (previous !== deviceLabel) pi.appendEntry(DEVICE_ENTRY, { device: deviceLabel });
+    return { systemPrompt: `${event.systemPrompt}\n\n${locationPrompt({ device: deviceLabel, previous, cwd: ctx.cwd, platform: process.platform, workspace: lease.binding.workspace })}` };
   });
 
   /** With allSessions on, a conversation is synchronized once it has a reply, unless it was detached here. */

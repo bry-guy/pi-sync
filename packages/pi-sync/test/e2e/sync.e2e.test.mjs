@@ -385,6 +385,19 @@ test("allSessions synchronizes a conversation after its first reply", { ...opts,
   assert.deepEqual(await userTexts(B), ["never attached"]);
 });
 
+test("the agent is told which machine it runs on and when the conversation moved", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  const reply = async (pi) => (await pi.messages()).filter((m) => m.role === "assistant").map((m) => typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join("")).at(-1);
+  await B.prompt("whereami");
+  assert.match(await reply(B), /runs on "B"/);
+  assert.doesNotMatch(await reply(B), /previous turn ran/, "A's first turn predates any marker");
+  await sleep(2500);
+  await A.prompt("whereami");
+  assert.match(await reply(A), /runs on "A".*previous turn ran on "B"/);
+  await A.prompt("whereami");
+  assert.doesNotMatch(await reply(A), /previous turn ran/, "no move, no warning");
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 test("images survive the trip to another device", { ...opts, timeout: 90_000 }, async () => {

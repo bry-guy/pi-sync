@@ -194,6 +194,20 @@ test("a turn whose upload was lost to a server outage uploads once the server is
   assert.equal(sessionFiles("A").length, 1, "the lost turn is uploaded, not saved aside");
 });
 
+test("a server restart mid-turn is not reported as a take-over, and the turn still uploads", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  const turn = A.prompt("sleep2500 across restart");
+  await sleep(700);
+  await stopDaemon();
+  await startDaemon(join(caseDir, "data")); // leases live in memory, so A's token is gone
+  await turn;
+  await sleep(500);
+  assert.ok(!A.notes.some((note) => /took over/.test(note)), `no take-over warning: ${JSON.stringify(A.notes)}`);
+  const expected = ["one", "sleep2500 across restart"];
+  assert.deepEqual(await eventually(() => userTexts(B), expected), expected);
+  assert.equal(sessionFiles("A").length, 1, "no separate copy");
+});
+
 test("a crashed mid-turn device does not hold the conversation after restart", { ...opts, timeout: 120_000 }, async () => {
   const { A, B } = await handoff();
   A.prompt("sleep5000 crash").catch(() => undefined);

@@ -463,8 +463,18 @@ export default function syncExtension(pi: ExtensionAPI) {
         if (code === "session_not_found") await markSetupRequired(ctx, held.binding);
         else if (code === "stale_etag") setStatus(ctx, "sync: newer copy elsewhere; will refresh");
         else if (code === "lease_invalid" || code === "lease_not_found") {
-          setStatus(ctx, "sync: taken over elsewhere");
-          notify(ctx, "Another device took over this conversation. This reply will be kept as a separate copy when this copy catches up.", "warning");
+          // The server forgets leases when it restarts. Only call it a take-over if someone else holds or wrote it.
+          const remote = await clientFor(held.binding.serverUrl).list().then(
+            (list) => list.sessions.find((item) => item.sessionId === held.binding.canonicalSessionId),
+            () => undefined,
+          );
+          const takenOver = remote && ((remote.leaseHolder && remote.leaseHolder !== deviceLabel) || remote.etag !== held.binding.lastEtag);
+          if (takenOver) {
+            setStatus(ctx, "sync: taken over elsewhere");
+            notify(ctx, "Another device took over this conversation. This reply will be kept as a separate copy when this copy catches up.", "warning");
+          } else {
+            setStatus(ctx, "sync: upload pending"); // the poll re-acquires and uploads
+          }
         }
         else setStatus(ctx, "sync: upload pending");
       } finally {

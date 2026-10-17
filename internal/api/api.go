@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -728,7 +729,17 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	rows, err := s.store.Usage(from, to)
+	var groupBy []string
+	if value := r.URL.Query().Get("groupBy"); value != "" {
+		for _, name := range strings.Split(value, ",") {
+			if !slices.Contains(store.UsageDimensions, name) {
+				s.writeError(w, http.StatusBadRequest, "invalid_group", "groupBy takes date, provider, model, device and repository", nil)
+				return
+			}
+			groupBy = append(groupBy, name)
+		}
+	}
+	rows, err := s.store.Usage(from, to, groupBy)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "store_unavailable", "usage is unavailable", nil)
 		return

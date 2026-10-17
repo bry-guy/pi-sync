@@ -103,6 +103,8 @@ type Store struct {
 	ids   *idCache
 	// usageMu guards usage.json, shared by every conversation.
 	usageMu sync.Mutex
+	// usageCache holds parsed months; the ledger is small enough to keep (about 30 MB for ten heavy years).
+	usageCache map[string]map[string]UsageRow
 }
 
 func New(root string) (*Store, error) {

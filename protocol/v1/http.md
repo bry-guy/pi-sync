@@ -20,7 +20,7 @@ are not synchronized.
 | Method | Path | Response |
 | --- | --- | --- |
 | GET | `/v1/health` | protocol and lease timing |
-| GET | `/v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD` | token usage rows `{date, provider, model, device, repository, input, output, cacheRead, cacheWrite, cost, turns}`, kept forever |
+| GET | `/v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&groupBy=model,device` | token usage rows; `groupBy` (any of date, provider, model, device, repository) sums the other dimensions away; `{date, provider, model, device, repository, input, output, cacheRead, cacheWrite, cost, turns}`, kept forever |
 | GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
 | GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease (older clients) |
@@ -124,7 +124,7 @@ and `/sync attach` re-enrolls the local session.
 pi-syncd deletes a conversation's entries once nobody has written, read, or leased it for
 `PI_SYNC_RETENTION_DAYS` days (default 14; `0` keeps everything). Leased conversations are
 never deleted. Before deleting, the conversation's token usage is added to the usage ledger,
-which is never deleted. Usage is attributed to the `X-Pi-Sync-Device` of the writer
+which is never deleted (`usage/YYYY-MM.json` in the data directory, one file per month). Usage is attributed to the `X-Pi-Sync-Device` of the writer
 (`unknown` for conversations stored before the ledger existed) and the normalized
 repository of the workspace pointer.
 

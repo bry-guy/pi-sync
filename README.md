@@ -14,6 +14,17 @@ mise run test
 PI_SYNC_DATA_DIR=.pi-sync-data go run ./cmd/pi-syncd
 ```
 
+## Deployment
+
+Every push to `main` runs `.github/workflows/publish-image.yml`: it builds and
+pushes `ghcr.io/bry-guy/pi-syncd`, then `scripts/deploy.sh production` pins the
+new digest in `deploy/k8s/deployment.yaml` with a `deploy(production): <sha7>`
+commit and waits until `https://pi-sync.bry-guy.net/v1/health` reports that
+commit as `buildId`. Argo CD syncs the pin from `main`. Feature branches and
+`v*.*.*` tags only publish images; they do not deploy.
+
+Roll back by reverting the `deploy(production)` commit on `main`.
+
 Set `PI_SYNC_SERVER_URL` for the Pi package, then install it directly from Git:
 
 ```sh

@@ -33,7 +33,7 @@ spec:
       containers:
         - name: pi-syncd
           # Replace this placeholder with the published immutable release digest before enabling Argo CD.
-          image: ghcr.io/bry-guy/pi-syncd@sha256:2ae51bdb002b9f001b1eba6356598088807f848c40f08b487d11b7d35820ff3a
+          image: ghcr.io/bry-guy/pi-syncd@sha256:c3c9d404d710a046f400e9ba1f7f80a892d23460e5fc5440ab171350ee6c3dac
           imagePullPolicy: IfNotPresent
           env:
             - name: PI_SYNC_LISTEN

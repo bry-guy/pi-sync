@@ -44,6 +44,8 @@ const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
 // Local-only entries of these types mean two devices really wrote the same conversation.
 // Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+// Module scope (survives the session replacement): the next new conversation continues a deleted synchronized one.
+const freshChat: { replay?: { text: string; images?: unknown[] }; enroll?: boolean } = {};
 // Module scope: a catch-up re-creates the extension instance for the reopened session.
 const keptSettings: { value?: { file: string; model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> } } = {};
 
@@ -286,8 +288,23 @@ export default function syncExtension(pi: ExtensionAPI) {
     setStatus(ctx, "sync: server copy missing (/sync attach)");
   };
 
+  const DELETED_MESSAGE = "This conversation's synchronized history was deleted from the sync server after a period without activity. Your next message starts a new synchronized chat; this local copy stays in /resume.";
+  const DELETED_ENTRY = "pi-sync-deleted";
+  const deletedHere = (ctx: ExtensionContext) => ctx.sessionManager.getEntries().some((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DELETED_ENTRY);
+
+  /** The server deleted the conversation: stop syncing this copy and remember to start a new chat on the next message. */
+  const forgetDeleted = async (ctx: ExtensionContext, binding: SyncBinding) => {
+    await store.remove(binding.nativeSessionId);
+    if (!deletedHere(ctx)) pi.appendEntry(DELETED_ENTRY, { at: new Date().toISOString() });
+    setStatus(ctx, "sync: history deleted; next message starts a new chat");
+  };
+
   const explainFailure = async (ctx: ExtensionContext, binding: SyncBinding, error: unknown): Promise<string> => {
     const code = error instanceof SyncClientError ? error.code : "";
+    if (code === "session_deleted") {
+      await forgetDeleted(ctx, binding);
+      return DELETED_MESSAGE;
+    }
     if (code === "session_not_found") {
       await markSetupRequired(ctx, binding);
       return "The sync server no longer has this conversation. Run /sync attach to upload this copy again.";
@@ -461,6 +478,10 @@ export default function syncExtension(pi: ExtensionAPI) {
       } catch (error) {
         const code = error instanceof SyncClientError ? error.code : "";
         if (code === "session_not_found") await markSetupRequired(ctx, held.binding);
+        else if (code === "session_deleted") {
+          await forgetDeleted(ctx, held.binding);
+          notify(ctx, DELETED_MESSAGE, "warning");
+        }
         else if (code === "stale_etag") setStatus(ctx, "sync: newer copy elsewhere; will refresh");
         else if (code === "lease_invalid" || code === "lease_not_found") {
           // The server forgets leases when it restarts. Only call it a take-over if someone else holds or wrote it.
@@ -772,6 +793,13 @@ let counted = binding;
   };
 
   /** Host-driven (pi-ez-web) check: refresh when the canonical copy moved, otherwise report. */
+  /** An unlisted conversation was either deleted for inactivity (410) or lost (404). */
+  const isDeleted = (binding: SyncBinding): Promise<boolean> =>
+    clientFor(binding.serverUrl).get(binding.canonicalSessionId, { timeoutMs: REQUEST_TIMEOUT_MS }).then(
+      () => false,
+      (error) => error instanceof SyncClientError && error.code === "session_deleted",
+    );
+
   const checkCurrent = async (ctx: ExtensionCommandContext): Promise<CheckResult> => {
     const sessionId = ctx.sessionManager.getSessionId();
     const binding = await bindingFor(sessionId);
@@ -783,7 +811,13 @@ let counted = binding;
     } catch {
       return { outcome: "busy", sessionId };
     }
-    if (!metadata) return { outcome: "busy", sessionId };
+    if (!metadata) {
+      if (await isDeleted(binding)) {
+        await forgetDeleted(ctx, binding);
+        notify(ctx, DELETED_MESSAGE, "warning");
+      }
+      return { outcome: "busy", sessionId };
+    }
     if (metadata.leaseHolder) {
       setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
       return { outcome: "busy", sessionId };
@@ -810,6 +844,11 @@ let counted = binding;
     }
     if (generation !== pollGeneration || lease || busy || !ctx.isIdle() || hasPendingInput(ctx)) return;
     if (!metadata) {
+      if (await isDeleted(binding)) {
+        await forgetDeleted(ctx, binding);
+        notify(ctx, DELETED_MESSAGE, "warning");
+        return;
+      }
       await markSetupRequired(ctx, binding);
       notify(ctx, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.", "warning");
       return;
@@ -1066,6 +1105,21 @@ let counted = binding;
         // SAFETY: Pi types command handlers as void, but host integrations (pi-ez-web) read the returned CheckResult.
         return result as void;
       }
+      if (command === "fresh") {
+        const replay = freshChat.replay;
+        freshChat.replay = undefined;
+        freshChat.enroll = true;
+        await ctx.waitForIdle();
+        const result = await ctx.newSession({
+          withSession: async (replacement) => {
+            if (!replay?.text && !replay?.images?.length) return;
+            const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
+            await replacement.sendUserMessage(content as any);
+          },
+        });
+        if (result.cancelled) freshChat.enroll = false;
+        return;
+      }
       if (command === "status") return showStatus(ctx);
       if (command === "code") return syncCode(ctx, rest[0] ?? "");
       if (command === "open" && rest[0]) {
@@ -1160,8 +1214,26 @@ let counted = binding;
     return { action: "handled" as const };
   };
 
+  const startFreshChat = (ctx: ExtensionContext, text: string, images?: unknown[]) => {
+    freshChat.replay = { text, images };
+    notify(ctx, "Starting a new synchronized chat; the deleted history is not restored.", "warning");
+    setTimeout(() => {
+      try {
+        pi.sendUserMessage("/sync fresh", { expandPromptTemplates: true });
+      } catch {
+        freshChat.replay = undefined;
+      }
+    }, 0);
+    return { action: "handled" as const };
+  };
+
   pi.on("input", async (event, ctx) => {
-    if (!currentSessionId || lease) return { action: "continue" as const };
+    if (lease) return { action: "continue" as const };
+    // Typing into a copy whose synchronized history was deleted starts a new chat, unless sync is off here.
+    if (deletedHere(ctx) && !detachedHere(ctx) && config.serverUrl && ctx.mode !== "json" && !event.text.startsWith("/")) {
+      return startFreshChat(ctx, event.text, event.images);
+    }
+    if (!currentSessionId) return { action: "continue" as const };
     const binding = await bindingFor(currentSessionId);
     if (!binding) return { action: "continue" as const };
     if (binding.state === "setup_required") {
@@ -1186,6 +1258,10 @@ let counted = binding;
         setStatus(ctx, "sync: offline; will upload later");
         return { action: "continue" as const };
       }
+    }
+    if (!reserved.ok && reserved.message === DELETED_MESSAGE && ctx.mode !== "json") {
+      notify(ctx, DELETED_MESSAGE, "warning");
+      return startFreshChat(ctx, event.text, event.images);
     }
     if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
     const { acquired } = reserved;
@@ -1224,7 +1300,7 @@ let counted = binding;
     const url = config.serverUrl;
     const path = ctx.sessionManager.getSessionFile();
     // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
-    if (!config.allSessions || !url || !ctx.hasUI || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    if (!(config.allSessions || freshChat.enroll) || !url || !ctx.hasUI || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     const sessionId = ctx.sessionManager.getSessionId();
     if (await bindingFor(sessionId)) return;
     const envelope = await normalizeCurrent(ctx);
@@ -1232,6 +1308,7 @@ let counted = binding;
       const response = await exclusive(() => enrollInBatches(url, envelope));
       const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: path, state: "ready" };
       await store.set(syncedBinding(base, envelope, response.etag, path));
+      freshChat.enroll = false;
     } catch (error) {
       // Already on the server (this copy was opened elsewhere and its binding lost): /sync attach adopts it deliberately.
       if (error instanceof SyncClientError && error.code === "duplicate_enrollment") return;

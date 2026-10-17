@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -30,6 +32,11 @@ func main() {
 		log.Fatalf("initialize store: %v", err)
 	}
 	leases := lease.New(lease.RealClock{}, lease.DefaultExpiry)
+	retention, err := retentionFromEnv(os.Getenv("PI_SYNC_RETENTION_DAYS"))
+	if err != nil {
+		log.Fatalf("PI_SYNC_RETENTION_DAYS: %v", err)
+	}
+	go maintain(filesystem, leases, retention)
 	handler := api.New(filesystem, leases)
 	server := &http.Server{
 		Addr:              listen,
@@ -54,5 +61,38 @@ func main() {
 	log.Printf("pi-syncd listening on %s", listen)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("serve: %v", err)
+	}
+}
+
+// retentionFromEnv reads the days a conversation may stay inactive before its entries are deleted; 0 keeps them forever.
+func retentionFromEnv(value string) (time.Duration, error) {
+	if value == "" {
+		return 14 * 24 * time.Hour, nil
+	}
+	days, err := strconv.Atoi(value)
+	if err != nil || days < 0 {
+		return 0, fmt.Errorf("must be a whole number of days (0 keeps conversations forever)")
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
+}
+
+// maintain counts usage stored before the ledger existed, then deletes inactive conversations hourly.
+func maintain(filesystem *store.Store, leases *lease.Registry, retention time.Duration) {
+	if err := filesystem.CountAllUsage(); err != nil {
+		log.Printf("count usage: %v", err)
+	}
+	if retention == 0 {
+		return
+	}
+	held := func(id string) bool { _, ok := leases.Current(id); return ok }
+	for {
+		deleted, err := filesystem.Sweep(retention, time.Now(), held)
+		if err != nil {
+			log.Printf("retention sweep: %v", err)
+		}
+		for _, id := range deleted {
+			log.Printf("deleted inactive conversation %s", id)
+		}
+		time.Sleep(time.Hour)
 	}
 }

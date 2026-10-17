@@ -76,6 +76,8 @@ type meta struct {
 	ETag  string `json:"etag"`
 	// LegacyETag is the whole-file ETag an older server reported; clients holding it stay current until the next write.
 	LegacyETag string `json:"legacyEtag,omitempty"`
+	// UsageCounted is how many entries the usage ledger has counted. Not part of the ETag.
+	UsageCounted int `json:"usageCounted,omitempty"`
 }
 
 func (m meta) envelope() session.Envelope {
@@ -99,6 +101,8 @@ type Store struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 	ids   *idCache
+	// usageMu guards usage.json, shared by every conversation.
+	usageMu sync.Mutex
 }
 
 func New(root string) (*Store, error) {
@@ -142,6 +146,9 @@ func (s *Store) Create(envelope session.Envelope) (Record, error) {
 	lock := s.lockFor(envelope.SessionID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := deletedError(base); err != nil {
+		return Record{}, err
+	}
 	for _, path := range []string{base + ".meta.json", base + ".json"} {
 		if info, statErr := os.Lstat(path); statErr == nil {
 			if info.Mode()&os.ModeSymlink != 0 {
@@ -349,6 +356,13 @@ func (s *Store) Update(id, expectedETag string, envelope session.Envelope) (Reco
 	if err != nil {
 		return Record{}, err
 	}
+	// shortcut: a whole-file rewrite keeps the counted prefix by position; a rewritten history is not recounted.
+	if current.UsageCounted > 0 {
+		m.UsageCounted = min(current.UsageCounted, m.Count)
+		if err := writeMeta(base, m); err != nil {
+			return Record{}, err
+		}
+	}
 	return withEntries(s.record(m, base), envelope), nil
 }
 
@@ -419,6 +433,9 @@ func (s *Store) load(base string) (meta, error) {
 func (s *Store) convert(base string) (meta, error) {
 	data, err := readRegular(base + ".json")
 	if errors.Is(err, os.ErrNotExist) {
+		if deleted := deletedError(base); deleted != nil {
+			return meta{}, deleted
+		}
 		return meta{}, ErrNotFound
 	}
 	if err != nil {
@@ -525,7 +542,7 @@ func openAppend(path string, size int64) (*os.File, error) {
 
 // etagFor covers the entries (through the chain) and every header field, so a head or title change is a new version.
 func etagFor(m meta) string {
-	m.ETag, m.LegacyETag = "", ""
+	m.ETag, m.LegacyETag, m.UsageCounted = "", "", 0
 	header, _ := json.Marshal(m)
 	sum := sha256.Sum256(header)
 	return fmt.Sprintf("\"sha256-%x\"", sum[:])

@@ -20,6 +20,7 @@ are not synchronized.
 | Method | Path | Response |
 | --- | --- | --- |
 | GET | `/v1/health` | protocol and lease timing |
+| GET | `/v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD` | token usage rows `{date, provider, model, device, repository, input, output, cacheRead, cacheWrite, cost, turns}`, kept forever |
 | GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
 | GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease (older clients) |
@@ -117,3 +118,16 @@ It first saves any conversation entries the canonical copy lacks as a separate,
 unsynchronized session. A missing server record is not recreated automatically
 in the background. The Pi extension marks the local binding as requiring setup,
 and `/sync attach` re-enrolls the local session.
+
+## Retention
+
+pi-syncd deletes a conversation's entries once nobody has written, read, or leased it for
+`PI_SYNC_RETENTION_DAYS` days (default 14; `0` keeps everything). Leased conversations are
+never deleted. Before deleting, the conversation's token usage is added to the usage ledger,
+which is never deleted. Usage is attributed to the `X-Pi-Sync-Device` of the writer
+(`unknown` for conversations stored before the ledger existed) and the normalized
+repository of the workspace pointer.
+
+The id stays reserved: every route for it, including enrollment (`POST /v1/sessions`),
+answers `410 session_deleted` with `details.deletedAt`, so an old local copy cannot upload
+the deleted history again. Deleted conversations are not listed.

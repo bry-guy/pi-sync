@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -45,6 +46,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeHealth(w)
+		return
+	}
+	if r.URL.Path == "/v1/usage" {
+		s.usage(w, r)
 		return
 	}
 	if r.URL.Path == "/v1/sessions" {
@@ -92,6 +97,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		record, err := s.store.Create(envelope)
 		if err != nil {
+			if store.IsDeleted(err) {
+				s.writeStoreError(w, err)
+				return
+			}
 			if errors.Is(err, store.ErrAlreadyExists) {
 				s.writeError(w, http.StatusConflict, "duplicate_enrollment", "session is already enrolled", nil)
 				return
@@ -103,7 +112,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session could not be stored", nil)
 			return
 		}
-		s.noteReader(r, envelope.SessionID)
+		s.afterWrite(r, envelope.SessionID)
 		w.Header().Set("ETag", record.ETag)
 		s.writeJSON(w, http.StatusCreated, map[string]any{
 			"formatVersion": session.FormatVersion,
@@ -126,8 +135,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	// A request to any session operation first verifies that the canonical file
 	// exists. This keeps lease and update errors from revealing arbitrary paths.
 	if _, err := s.store.Meta(id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, "session_not_found", "session was not found", nil)
+		if errors.Is(err, store.ErrNotFound) || store.IsDeleted(err) {
+			s.writeStoreError(w, err)
 			return
 		}
 		s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session store is unavailable", nil)
@@ -240,6 +249,18 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) {
 // without briefly appearing to be "in use".
 // deviceHeader names the reading client so the conversation can list the clients it is on.
 const deviceHeader = "X-Pi-Sync-Device"
+
+// afterWrite records the writing device and counts the usage the write added.
+func (s *Server) afterWrite(r *http.Request, id string) {
+	s.noteReader(r, id)
+	device := r.Header.Get(deviceHeader)
+	if device == "" || len(device) > maxHolderLen || strings.ContainsAny(device, "\r\n\x00") {
+		device = store.UnknownDevice
+	}
+	if err := s.store.CountUsage(id, device); err != nil {
+		log.Printf("count usage for %s: %v", id, err)
+	}
+}
 
 func (s *Server) noteReader(r *http.Request, id string) {
 	label := r.Header.Get(deviceHeader)
@@ -366,7 +387,7 @@ func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 	w.Header().Set("ETag", record.ETag)
-	s.noteReader(r, id)
+	s.afterWrite(r, id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
@@ -466,7 +487,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	w.Header().Set("ETag", record.ETag)
-	s.noteReader(r, id)
+	s.afterWrite(r, id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"formatVersion": session.FormatVersion,
 		"session":       record.Envelope,
@@ -649,6 +670,10 @@ func (s *Server) writeHealth(w http.ResponseWriter) {
 
 func (s *Server) writeStoreError(w http.ResponseWriter, err error) {
 	switch {
+	case store.IsDeleted(err):
+		var deleted *store.DeletedError
+		errors.As(err, &deleted)
+		s.writeError(w, http.StatusGone, "session_deleted", "session history was deleted after a period without activity", map[string]any{"deletedAt": deleted.DeletedAt})
 	case errors.Is(err, store.ErrNotFound):
 		s.writeError(w, http.StatusNotFound, "session_not_found", "session was not found", nil)
 	case session.IsValidationError(err):
@@ -688,4 +713,25 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 	// The response may already have started, so there is no safe second error
 	// response if the client disconnects during encoding.
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// usage lists token usage by day, provider, model, device and repository; it outlives deleted conversations.
+func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed", nil)
+		return
+	}
+	from, to := r.URL.Query().Get("from"), r.URL.Query().Get("to")
+	for _, value := range []string{from, to} {
+		if _, err := time.Parse(time.DateOnly, value); value != "" && err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_date", "from and to must be YYYY-MM-DD", nil)
+			return
+		}
+	}
+	rows, err := s.store.Usage(from, to)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "store_unavailable", "usage is unavailable", nil)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"formatVersion": session.FormatVersion, "rows": rows})
 }

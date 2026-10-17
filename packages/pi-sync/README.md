@@ -100,6 +100,12 @@ another machine, it also warns that files, processes, and uncommitted work from
 there may not exist here. A small `pi-sync-device` entry records each move; it
 is not sent to the model.
 
+The server deletes conversations nobody has used for 14 days (see the
+protocol's Retention section) but keeps their token usage. When a device
+reaches a deleted conversation, pi-sync warns that its synchronized history was
+deleted; the next message starts a new synchronized chat. The old local copy
+stays available through `/resume` and is never uploaded again.
+
 Lease tokens are device-local state; they are never
 written to synchronized session entries or Git metadata.
 

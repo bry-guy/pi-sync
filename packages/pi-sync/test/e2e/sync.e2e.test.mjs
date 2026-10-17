@@ -412,6 +412,29 @@ test("the agent is told which machine it runs on and when the conversation moved
   assert.doesNotMatch(await reply(A), /previous turn ran/, "no move, no warning");
 });
 
+test("a conversation deleted for inactivity starts a new synchronized chat, with a warning", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  const [{ sessionId: old }] = (await (await fetch(`${process.env.SYNC_URL}/v1/sessions`)).json()).sessions;
+  // What the retention sweep does: entries removed, a tombstone keeps the id.
+  await stopDaemon();
+  const sessions = join(caseDir, "data", "sessions");
+  for (const name of readdirSync(sessions)) if (name.includes(old)) rmSync(join(sessions, name));
+  writeFileSync(join(sessions, `.${old}.deleted`), JSON.stringify({ deletedAt: new Date().toISOString() }));
+  await startDaemon(join(caseDir, "data"));
+
+  await A.prompt("after deletion");
+  await sleep(2500);
+  assert.ok(A.notes.some((note) => /history was deleted/.test(note)), `A warned: ${JSON.stringify(A.notes)}`);
+  assert.deepEqual(await userTexts(A), ["after deletion"], "A is in a new chat that starts with the prompt");
+  const listed = (await (await fetch(`${process.env.SYNC_URL}/v1/sessions`)).json()).sessions;
+  assert.equal(listed.length, 1, "the new chat is synchronized");
+  assert.notEqual(listed[0].sessionId, old);
+  assert.equal(sessionFiles("A").length, 2, "the old local copy is kept");
+  assert.ok(B.notes.some((note) => /history was deleted/.test(note)), `idle B warned: ${JSON.stringify(B.notes)}`);
+  const usage = (await (await fetch(`${process.env.SYNC_URL}/v1/usage`)).json()).rows;
+  assert.ok(Array.isArray(usage), "usage is served");
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 test("images survive the trip to another device", { ...opts, timeout: 90_000 }, async () => {

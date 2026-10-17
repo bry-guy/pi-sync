@@ -35,6 +35,31 @@ func scopedAPIEnvelope(id, remote, branch string) session.Envelope {
 	return envelope
 }
 
+func TestHealthReportsBuildID(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := BuildID
+	BuildID = "0123456789abcdef0123456789abcdef01234567"
+	defer func() { BuildID = previous }()
+	router := httptest.NewServer(New(filesystem, nil))
+	defer router.Close()
+
+	response, err := http.Get(router.URL + "/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var health map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || health["buildId"] != BuildID || health["status"] != "ok" || health["formatVersion"] == nil {
+		t.Fatalf("health status %d body %v", response.StatusCode, health)
+	}
+}
+
 func TestHTTPRepositoryScope(t *testing.T) {
 	filesystem, err := store.New(t.TempDir())
 	if err != nil {

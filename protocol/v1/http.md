@@ -19,7 +19,7 @@ are not synchronized.
 
 | Method | Path | Response |
 | --- | --- | --- |
-| GET | `/v1/health` | protocol and lease timing |
+| GET | `/v1/health` | status, `buildId` (source commit), protocol and lease timing |
 | GET | `/v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&groupBy=model,device` | token usage rows; `groupBy` (any of date, provider, model, device, repository) sums the other dimensions away; `{date, provider, model, device, repository, input, output, cacheRead, cacheWrite, cost, turns}`, kept forever |
 | GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by repository) |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |

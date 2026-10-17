@@ -23,6 +23,9 @@ const (
 	maxHolderLen = 128
 )
 
+// BuildID is the source revision the daemon was built from; set with -ldflags -X at image build time.
+var BuildID = "unknown"
+
 type Server struct {
 	store  *store.Store
 	leases *lease.Registry
@@ -663,6 +666,7 @@ func (s *Server) writeHealth(w http.ResponseWriter) {
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status":             "ok",
+		"buildId":            BuildID,
 		"formatVersion":      session.FormatVersion,
 		"heartbeatSeconds":   int(lease.DefaultHeartbeat / time.Second),
 		"leaseExpirySeconds": int(lease.DefaultExpiry / time.Second),

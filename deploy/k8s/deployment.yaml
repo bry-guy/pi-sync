@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: pi-syncd
-          # Replace this placeholder with the published immutable release digest before enabling Argo CD.
+          # Pinned by scripts/deploy.sh on each push to main; roll back by reverting that deploy commit.
           image: ghcr.io/bry-guy/pi-syncd@sha256:c3c9d404d710a046f400e9ba1f7f80a892d23460e5fc5440ab171350ee6c3dac
           imagePullPolicy: IfNotPresent
           env:

@@ -3,17 +3,28 @@ name: publish-image
 on:
   push:
     branches:
+      - main
       - 'feature/**'
     tags: ['v*.*.*']
+    # Deploy commits touch only deploy/k8s; ignoring them stops the pin from re-triggering the pipeline.
+    paths-ignore:
+      - 'deploy/k8s/**'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   packages: write
+
+concurrency:
+  group: pi-sync-image-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -45,7 +56,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/pi-syncd
           tags: |
-            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ startsWith(github.ref, 'refs/heads/feature/') }}
+            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ startsWith(github.ref, 'refs/heads/feature/') || github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - id: build
@@ -55,44 +66,49 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PI_SYNC_BUILD_ID=${{ steps.source.outputs.sha }}
           provenance: true
           sbom: true
 
-      - name: Update deployment digest
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          python3 - "$IMAGE_DIGEST" <<'PY'
-          import pathlib
-          import re
-          import sys
+  # Push to main deploys production: the digest is pinned in deploy/k8s by a bot commit on main, which Argo CD syncs.
+  # Roll back by reverting that commit.
+  deploy:
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+    concurrency:
+      group: pi-sync-deploy
+      cancel-in-progress: false
+    env:
+      SHA: ${{ needs.image.outputs.sha }}
+      DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      # deploy.sh comes from the pushed commit; the pin it edits lives on main.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: src
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main
+          fetch-depth: 0
 
-          digest = sys.argv[1]
-          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-              raise SystemExit(f"unexpected image digest: {digest!r}")
-          path = pathlib.Path("deploy/k8s/deployment.yaml")
-          text = path.read_text()
-          updated, count = re.subn(
-              r"ghcr\.io/bry-guy/pi-syncd@sha256:[^\s]+",
-              f"ghcr.io/bry-guy/pi-syncd@{digest}",
-              text,
-          )
-          if count != 1:
-              raise SystemExit("expected one pi-syncd image reference")
-          path.write_text(updated)
-          PY
+      - name: Validate digest
+        run: '[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$SHA" =~ ^[0-9a-f]{40}$ ]]'
 
-      - name: Commit deployment digest
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- deploy/k8s/deployment.yaml; then
-            exit 0
-          fi
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add deploy/k8s/deployment.yaml
-          git commit -m "chore(deploy): pin image digest [skip ci]"
-          git push origin HEAD:main
+      # The production hostname is tailnet-only.
+      - uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ vars.TAILSCALE_FEDERATED_CLIENT_ID }}
+          audience: ${{ vars.TAILSCALE_FEDERATED_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Deploy production
+        working-directory: main
+        run: ../src/scripts/deploy.sh production

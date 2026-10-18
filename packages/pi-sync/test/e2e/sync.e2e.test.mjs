@@ -310,9 +310,16 @@ test("resuming an older copy of the file catches up instead of rolling the conve
   assert.deepEqual(await userTexts(B), ["one", "two", "three"]);
 });
 
-test("uncommitted and unpushed code follows the conversation when sharing is enabled", { ...opts, timeout: 120_000 }, async () => {
+const waitFor = async (check, ms = 15_000) => {
+  for (let i = 0; i < ms / 250; i++) { if (check()) return true; await sleep(250); }
+  return check();
+};
+const readOr = (path) => { try { return readFileSync(path, "utf8"); } catch { return undefined; } };
+
+test("code follows the conversation: automatically onto a clean, latest main; after asking over local work; between turns", { ...opts, timeout: 180_000 }, async () => {
   const { A, B } = await handoff();
-  const a = join(caseDir, "git", "a"), b = join(caseDir, "git", "b");
+  const a = join(caseDir, "git", "a"), b = join(caseDir, "git", "b"), origin = join(caseDir, "git", "origin.git");
+  git(a, "checkout", "-q", "-b", "feat");
   writeFileSync(join(a, "committed.txt"), "local commit\n");
   git(a, "add", "committed.txt");
   git(a, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "unpushed");
@@ -321,25 +328,52 @@ test("uncommitted and unpushed code follows the conversation when sharing is ena
   writeFileSync(join(a, "secret.env"), "TOKEN=1\n");
   A.answers.push(true); // share uncommitted code for this repository
   await A.prompt("two");
-  assert.equal(git(a, "config", "--get", "pi-sync.shareWorkingTree"), "true");
   assert.match(git(a, "status", "--porcelain"), /\?\? new\.txt/, "A's own index and worktree are untouched");
-  await sleep(4000);
-  assert.match(git(join(caseDir, "git", "origin.git"), "for-each-ref", "refs/pi-sync/"), /refs\/pi-sync\//, "the snapshot is on a hidden ref, not a branch");
-  assert.ok(B.notes.some((note) => /\/sync code/.test(note)), "B is told its checkout lacks the conversation's code");
+  assert.ok(await waitFor(() => /refs\/pi-sync\//.test(git(origin, "for-each-ref", "refs/pi-sync/"))), "the snapshot is on a hidden ref, not a branch");
 
-  writeFileSync(join(b, "scratch.txt"), "mine\n");
-  B.answers.push(true);
-  await B.prompt("/sync code");
-  assert.match(B.notes.at(-1), /uncommitted changes/, "local work is never overwritten");
-  rmSync(join(b, "scratch.txt"));
-
-  B.answers.push(true);
-  await B.prompt("/sync code");
-  assert.match(B.notes.at(-1), /Restored main/);
+  // B sits on a clean, latest main: it follows without asking.
+  assert.ok(await waitFor(() => readOr(join(b, "new.txt")) === "untracked work\n"), `B got the code: ${JSON.stringify(B.notes)}`);
+  assert.equal(git(b, "symbolic-ref", "--short", "HEAD"), "feat");
   assert.equal(git(b, "rev-parse", "HEAD"), git(a, "rev-parse", "HEAD"));
-  assert.equal(readFileSync(join(b, "new.txt"), "utf8"), "untracked work\n");
   assert.match(git(b, "status", "--porcelain"), /\?\? new\.txt/, "restored work stays uncommitted");
   assert.throws(() => statSync(join(b, "secret.env")), "ignored files are never shared");
+
+  // B has its own uncommitted work: it is asked, and its work is stashed, not lost.
+  writeFileSync(join(b, "scratch.txt"), "mine\n");
+  writeFileSync(join(a, "new.txt"), "more work\n");
+  B.answers.push(true);
+  await A.prompt("three");
+  assert.ok(await waitFor(() => readOr(join(b, "new.txt")) === "more work\n"), `B updated after asking: ${JSON.stringify(B.notes)}`);
+  assert.equal(B.answers.length, 0, "B was asked");
+  assert.match(git(b, "stash", "list"), /pi-sync: local changes/);
+  assert.equal(readOr(join(b, "scratch.txt")), undefined);
+
+  // Hand edits between turns travel too, and replace the previous snapshot on B without asking.
+  writeFileSync(join(a, "new.txt"), "edited by hand\n");
+  assert.ok(await waitFor(() => readOr(join(b, "new.txt")) === "edited by hand\n", 30_000), `hand edit arrived: ${JSON.stringify(B.notes)}`);
+
+  // Once everything is committed and pushed, the snapshot goes away and B fast-forwards to the branch.
+  git(a, "add", "-A");
+  git(a, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "done");
+  git(a, "push", "-q", "-u", "origin", "feat");
+  assert.ok(await waitFor(() => git(origin, "for-each-ref", "refs/pi-sync/") === "", 30_000), "snapshot cleared");
+  assert.ok(await waitFor(() => { try { return git(b, "rev-parse", "HEAD") === git(a, "rev-parse", "HEAD"); } catch { return false; } }, 30_000), `B fast-forwarded: ${JSON.stringify(B.notes)}`);
+  assert.equal(git(b, "status", "--porcelain"), "", "B is clean at the pushed commit");
+});
+
+test("code waits for confirmation when this checkout is on another branch", { ...opts, timeout: 120_000 }, async () => {
+  const { A, B } = await handoff();
+  const a = join(caseDir, "git", "a"), b = join(caseDir, "git", "b");
+  git(b, "checkout", "-q", "-b", "elsewhere");
+  writeFileSync(join(a, "new.txt"), "work\n");
+  A.answers.push(true);
+  await A.prompt("two");
+  await waitFor(() => B.notes.some((note) => /Kept this checkout/.test(note)));
+  assert.equal(git(b, "symbolic-ref", "--short", "HEAD"), "elsewhere", "declining keeps the checkout");
+  B.answers.push(true);
+  await B.prompt("/sync code");
+  assert.equal(readOr(join(b, "new.txt")), "work\n");
+  assert.equal(git(b, "symbolic-ref", "--short", "HEAD"), "main");
 });
 
 test("starting pi on another device warns which clients the conversation is on", { ...opts, timeout: 90_000 }, async () => {

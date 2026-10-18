@@ -20,11 +20,15 @@ import {
   deriveRepositoryIdentity,
   deriveWorkspacePointer,
   captureWorkspace,
-  codeStatus,
+  applyCode,
+  git as gitRun,
+  planCode,
+  rememberSnapshot,
+  shareIdle,
+  snapshotRef,
   deleteSnapshot,
   hasUnsharedCode,
   pushSnapshot,
-  restoreWorkspace,
   setShareSetting,
   shareSetting,
   type Snapshot,
@@ -537,6 +541,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (pendingPushes.get(id)?.commit !== commit) return;
     if (pushed.code === 0) {
       pendingPushes.delete(id);
+      await rememberSnapshot(pending.cwd, id, commit);
       if (pending.failed) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
       return;
     }
@@ -561,7 +566,13 @@ export default function syncExtension(pi: ExtensionAPI) {
     }
     if (snapshot.kind === "clean") {
       pendingPushes.delete(id);
-      if (binding.workspace?.wip) await inOrder(id, () => deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote));
+      const sharedIdle = (await gitOut(ctx.cwd, ["rev-parse", "--verify", "--quiet", snapshotRef(id)])) !== undefined;
+      if (binding.workspace?.wip || sharedIdle) {
+        await inOrder(id, async () => {
+          await deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote);
+          await gitOut(ctx.cwd, ["update-ref", "-d", snapshotRef(id)]);
+        });
+      }
       return;
     }
     if (config.code === "auto" && !autoShareNoticed.has(snapshot.remote)) {
@@ -585,18 +596,74 @@ export default function syncExtension(pi: ExtensionAPI) {
     await setShareSetting(ctx.cwd, enabled);
   };
 
-  const lastCodeNotice = new Map<string, string>();
-  /** Tells the user when this checkout doesn't have the conversation's code. */
-  const noticeCode = async (cwd: string, sessionId: string, notifyUser: (message: string) => void) => {
-    const binding = await bindingFor(sessionId);
-    const workspace = binding?.workspace;
-    if (!workspace) return;
-    const key = workspace.wip?.commit ?? workspace.commit;
-    if (lastCodeNotice.get(sessionId) === key) return;
-    const status = await codeStatus(cwd, workspace).catch(() => ({ kind: "unknown" as const }));
-    if (status.kind !== "restorable") return;
-    lastCodeNotice.set(sessionId, key);
-    notifyUser(`This conversation's code is ${status.summary}; this checkout differs. Run /sync code to bring it here.`);
+  const gitOut = (cwd: string, args: string[]) => gitRun(cwd, args).then((result) => (result.code === 0 ? result.stdout.trim() : undefined));
+
+  // Per conversation: the code target the user declined or that could not be applied, so it is not asked again.
+  const codeSettled = new Map<string, string>();
+  let arriving: Promise<void> | undefined;
+
+  /**
+   * Brings this checkout to the conversation's latest code after another device worked on it: automatically when
+   * nothing local can be lost and the checkout is on the latest default branch (or behind on the same branch),
+   * otherwise after asking, stashing local changes first. Never runs while the agent works.
+   */
+  const arriveCode = (ctx: ExtensionContext, options: { force?: boolean } = {}): Promise<void> => {
+    arriving ??= (async () => {
+      if (config.code === "off" || !ctx.isIdle()) return;
+      const id = ctx.sessionManager.getSessionId();
+      const binding = await bindingFor(id);
+      if (!binding?.workspace) return;
+      // This device wrote the latest turn: its checkout is the source, not a destination.
+      if (!options.force && lastDevice(ctx) === deviceLabel) return;
+      const plan = await planCode(ctx.cwd, binding.workspace, binding.canonicalSessionId);
+      if (plan.kind === "none") return;
+      if (plan.kind === "matches") {
+        if (options.force) notify(ctx, "This checkout already has the conversation's code.", "info");
+        return;
+      }
+      if (plan.kind === "blocked") {
+        if (codeSettled.get(id) !== plan.message || options.force) notify(ctx, plan.message, "warning");
+        codeSettled.set(id, plan.message);
+        return;
+      }
+      const key = `${plan.target.wip ?? plan.target.base}:${plan.stash}`;
+      if (!options.force && codeSettled.get(id) === key) return;
+      if (!plan.automatic) {
+        if (!ctx.hasUI || ctx.mode === "json") {
+          codeSettled.set(id, key);
+          notify(ctx, `This conversation's code is ${plan.summary}; this checkout is on ${plan.here}. Run /sync code to bring it here.`, "info");
+          return;
+        }
+        const ok = await ctx.ui.confirm(
+          "Bring this conversation's code here?",
+          `The conversation is on ${plan.summary}; this checkout is on ${plan.here}. ${plan.stash ? "Your uncommitted changes will be stashed (git stash list), then " : ""}this checkout switches to ${plan.target.branch}${plan.target.wip ? " with the other device's uncommitted changes" : ""}.`,
+        );
+        if (!ok) {
+          codeSettled.set(id, key);
+          notify(ctx, "Kept this checkout as it is. Run /sync code to bring the conversation's code here later.", "info");
+          return;
+        }
+      }
+      const result = await applyCode(ctx.cwd, plan.target, { stash: plan.stash });
+      codeSettled.set(id, key);
+      notify(ctx, result.message, result.ok ? "info" : "warning");
+    })().catch(() => undefined).finally(() => { arriving = undefined; });
+    return arriving;
+  };
+
+  /** Between turns, the device that wrote the latest turn keeps sharing hand edits (and clears the snapshot once pushed). */
+  let lastIdleShare = 0;
+  // Three polls apart: 60 s by default.
+  const IDLE_SHARE_MS = 3 * HEARTBEAT_MS;
+  const shareBetweenTurns = async (ctx: ExtensionContext, binding: SyncBinding, force = false) => {
+    if (!force && Date.now() - lastIdleShare < IDLE_SHARE_MS) return;
+    if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
+    lastIdleShare = Date.now();
+    const id = binding.canonicalSessionId;
+    await inOrder(id, async () => {
+      if (pendingPushes.has(id)) return; // a turn's push is still due; it covers this
+      await shareIdle(ctx.cwd, id);
+    });
   };
 
   const syncCode = async (ctx: ExtensionCommandContext, arg: string) => {
@@ -610,14 +677,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       notify(ctx, "No code state is recorded for this conversation.", "info");
       return;
     }
-    const status = await codeStatus(ctx.cwd, binding.workspace);
-    if (status.kind === "matches") return notify(ctx, "This checkout already has the conversation's code.", "info");
-    if (status.kind !== "restorable") return notify(ctx, "This checkout is not the conversation's repository.", "warning");
-    const ok = !ctx.hasUI || await ctx.ui.confirm("Bring the conversation's code here?", `Switch this checkout to ${status.summary}. Local uncommitted work is never overwritten; if there is any, this stops and explains.`);
-    if (!ok) return;
-    const result = await restoreWorkspace(ctx.cwd, binding.workspace, binding.canonicalSessionId);
-    if (!result.ok) return fail(ctx, "sync_code_restore_failed", result.message);
-    notify(ctx, result.message, "info");
+    await arriveCode(ctx, { force: true });
   };
 
   const dispatchRefresh = () => {
@@ -695,7 +755,8 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
         if (copyTitle) replacement.ui.notify(`Turns from this device that never synchronized were kept as “${copyTitle}”. Open it with /resume.`, "warning");
         if (message) replacement.ui.notify(message, "info");
-        await noticeCode(replacement.cwd, replacement.sessionManager.getSessionId(), (text) => replacement.ui.notify(text, "info")).catch(() => undefined);
+        // Before any replayed prompt, so the agent works on the conversation's code.
+        await arriveCode(replacement);
         if (replay?.compact) {
           replacement.compact(replay.compact);
         } else if (replay) {
@@ -862,7 +923,14 @@ let counted = binding;
       return;
     }
     setStatus(ctx, "sync: up to date");
+    // Code moves without turns too: hand edits here, or another device's between-turn snapshot.
+    if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS) {
+      lastCodeCheck = Date.now();
+      await shareBetweenTurns(ctx, binding);
+      if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx);
+    }
   };
+  let lastCodeCheck = 0;
 
   const stopPoll = () => {
     pollGeneration++;
@@ -1195,7 +1263,7 @@ let counted = binding;
     }
     setStatus(ctx, binding.state === "setup_required" ? "sync: server copy missing (/sync attach)" : "sync: on");
     startPoll(ctx);
-    if (event.reason === "startup") void noticeCode(ctx.cwd, currentSessionId, (text) => notify(ctx, text, "info")).catch(() => undefined);
+    if (event.reason === "startup" || event.reason === "resume") void arriveCode(ctx);
   });
 
   pi.on("resources_discover", async () => {
@@ -1354,5 +1422,8 @@ let counted = binding;
   pi.on("session_shutdown", async (_event, ctx) => {
     stopPoll();
     await finishTurn(ctx);
+    // Leaving: share hand edits made since the last turn, without holding up exit for long.
+    const binding = currentSessionId ? await bindingFor(currentSessionId) : undefined;
+    if (binding) await Promise.race([shareBetweenTurns(ctx, binding, true).catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 15_000).unref?.())]);
   });
 }

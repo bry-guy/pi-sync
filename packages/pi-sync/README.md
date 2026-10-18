@@ -75,10 +75,28 @@ If a push fails (offline, remote unreachable), pi-sync says so and retries
 after the next turn and about once a minute while idle; only the newest
 snapshot is pushed.
 
-When another device's checkout differs from the conversation's code, pi-sync
-says so. `/sync code` then fast-forwards (or creates) the branch and restores
-the shared changes as uncommitted work. It refuses rather than overwrite local
-uncommitted work or a branch that has diverged.
+Between turns, the device that wrote the latest turn keeps sharing: about once
+a minute (and when Pi exits) it pushes hand edits made since the last snapshot,
+and deletes the snapshot once everything is committed and pushed.
+
+When another device worked on the conversation, pi-sync brings its code here:
+on catching up (before a replayed prompt runs), at startup, and about once a
+minute while idle. The newest code is the snapshot when there is one, otherwise
+the tip of the conversation's branch on the remote.
+
+- **Automatically** when nothing local can be lost and this checkout is on the
+  default branch at its remote tip, or on the conversation's branch behind it.
+  A working tree that only holds the snapshot this checkout last received
+  counts as nothing to lose.
+- **After asking** otherwise (another branch, or uncommitted work of your own).
+  Your uncommitted work is stashed first (`git stash list`), never discarded.
+  Declining is remembered until the code moves again; `/sync code` brings it
+  later.
+- **Never** over a local branch with commits the conversation's code lacks;
+  pi-sync says so instead.
+
+`code: off` turns all of this off. Committing and pushing feature branches
+often keeps snapshots small and makes every move a plain fast-forward.
 
 When the server is unreachable, a prompt asks whether to send anyway; that turn
 uploads when the server is back, or is kept as a named "(unsynced copy)"

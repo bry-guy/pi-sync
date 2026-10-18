@@ -112,7 +112,7 @@ export async function captureWorkspace(cwd: string): Promise<Snapshot> {
     if (!tree) return failed("could not write the working tree", written);
     const tooLarge = await oversized(cwd, head, tree);
     if (tooLarge) return { kind: "skipped", reason: tooLarge, retryable: false, workspace: pushed };
-    const recorded = await git(cwd, ["commit-tree", tree, "-p", head, "-m", "pi-sync working tree snapshot"], {
+    const recorded = await git(cwd, ["commit-tree", tree, "-p", head, "-m", `pi-sync working tree snapshot\n\nBranch: ${branch}`], {
       env: { GIT_AUTHOR_NAME: "pi-sync", GIT_AUTHOR_EMAIL: "pi-sync@localhost", GIT_COMMITTER_NAME: "pi-sync", GIT_COMMITTER_EMAIL: "pi-sync@localhost" },
     });
     const commit = recorded.stdout.trim();
@@ -216,4 +216,154 @@ export async function restoreWorkspace(cwd: string, workspace: WorkspacePointer,
   const restored = await git(cwd, ["restore", `--source=${workspace.wip.commit}`, "--worktree", "--", ":/"]);
   if (restored.code !== 0) return { ok: false, message: `Could not apply the shared changes: ${restored.stderr.trim()}` };
   return { ok: true, message: `Restored ${branch} with the other device's uncommitted changes.` };
+}
+
+/** The working tree as a tree object (non-ignored files, untracked included), without touching the user's index. */
+async function workingTree(cwd: string): Promise<string | undefined> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-sync-index-"));
+  try {
+    const env = { GIT_INDEX_FILE: join(dir, "index") };
+    if ((await git(cwd, ["read-tree", "HEAD"], { env })).code !== 0) return undefined;
+    if ((await git(cwd, ["add", "-A", "--", ":/"], { env, timeoutMs: 60_000 })).code !== 0) return undefined;
+    return (await git(cwd, ["write-tree"], { env })).stdout.trim() || undefined;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const treeOf = (cwd: string, commit: string) => out(cwd, ["rev-parse", `${commit}^{tree}`]);
+
+/**
+ * Shares the working tree between turns: pushes a fresh snapshot when it changed since the last one this checkout
+ * shared or received, or deletes the conversation's snapshot once everything is committed and pushed.
+ * Returns what happened, for status and tests.
+ */
+export async function shareIdle(cwd: string, conversationId: string): Promise<"unchanged" | "pushed" | "cleared" | "failed"> {
+  const ref = snapshotRef(conversationId);
+  const known = await out(cwd, ["rev-parse", "--verify", "--quiet", ref]);
+  const snapshot = await captureWorkspace(cwd);
+  if (snapshot.kind === "skipped") return "failed";
+  if (snapshot.kind === "clean") {
+    if (!known) return "unchanged";
+    await deleteSnapshot(cwd, conversationId, snapshot.workspace?.gitRemote);
+    await git(cwd, ["update-ref", "-d", ref]);
+    return "cleared";
+  }
+  const commit = snapshot.workspace.wip!.commit;
+  if (known && (await treeOf(cwd, known)) === (await treeOf(cwd, commit)) && (await out(cwd, ["rev-parse", `${known}^`])) === (await out(cwd, ["rev-parse", `${commit}^`]))) return "unchanged";
+  const pushed = await pushSnapshot(cwd, snapshot.remote, commit, conversationId);
+  if (pushed.code !== 0) return "failed";
+  await git(cwd, ["update-ref", ref, commit]);
+  return "pushed";
+}
+
+/** Records a snapshot this checkout pushed, so later checks know its working tree holds nothing new. */
+export async function rememberSnapshot(cwd: string, conversationId: string, commit: string): Promise<void> {
+  await git(cwd, ["update-ref", snapshotRef(conversationId), commit]);
+}
+
+export type CodeTarget = { branch: string; base: string; wip?: string; remote: string };
+
+export type CodePlan =
+  | { kind: "none" } // nothing recorded, another repository, or not reachable
+  | { kind: "matches" }
+  | { kind: "apply"; automatic: boolean; stash: boolean; target: CodeTarget; summary: string; here: string }
+  | { kind: "blocked"; message: string };
+
+async function defaultBranch(cwd: string, remote: string): Promise<string> {
+  const head = await out(cwd, ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`]);
+  if (head) return head.slice(remote.length + 1);
+  for (const name of ["main", "master"]) if (await out(cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${name}`])) return name;
+  return "main";
+}
+
+/**
+ * Decides how to bring this checkout to the conversation's latest code. The newest state is the conversation's
+ * snapshot ref when it exists (it is replaced on every change and deleted once everything is pushed), otherwise
+ * the tip of the conversation's branch on the remote.
+ *
+ * Automatic only when nothing local can be lost and the checkout is either on the default branch at its remote
+ * tip, or on the conversation's branch behind it. Otherwise the caller asks, and stashes local changes if needed.
+ */
+export async function planCode(cwd: string, workspace: WorkspacePointer | undefined, conversationId: string): Promise<CodePlan> {
+  if (!workspace) return { kind: "none" };
+  const remote = await remoteName(cwd, workspace.gitRemote);
+  if (!remote) return { kind: "none" };
+  const ref = snapshotRef(conversationId);
+  const previous = await out(cwd, ["rev-parse", "--verify", "--quiet", ref]);
+  const fetchedRef = await git(cwd, ["fetch", "--no-tags", "--quiet", remote, `+${ref}:${ref}`], { timeoutMs: 60_000 });
+  let wip: string | undefined;
+  let branch = workspace.branch;
+  if (fetchedRef.code === 0) {
+    wip = await out(cwd, ["rev-parse", ref]);
+    const message = (await out(cwd, ["log", "-1", "--format=%B", ref])) ?? "";
+    branch = /^Branch: (.+)$/m.exec(message)?.[1] ?? workspace.wip?.branch ?? branch;
+  } else if (/couldn't find remote ref|no such ref/i.test(fetchedRef.stderr)) {
+    if (previous) await git(cwd, ["update-ref", "-d", ref]);
+  } else {
+    return { kind: "none" }; // offline: try again later
+  }
+  const fetched = await git(cwd, ["fetch", "--no-tags", "--quiet", remote], { timeoutMs: 60_000 });
+  if (fetched.code !== 0) return { kind: "none" };
+  let base: string | undefined;
+  if (wip) base = await out(cwd, ["rev-parse", `${wip}^`]);
+  else {
+    const tip = await out(cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${branch}`]);
+    const recorded = (await git(cwd, ["cat-file", "-e", `${workspace.commit}^{commit}`])).code === 0 ? workspace.commit : undefined;
+    base = tip && (!recorded || (await git(cwd, ["merge-base", "--is-ancestor", recorded, tip])).code === 0) ? tip : recorded;
+  }
+  if (!base) return { kind: "blocked", message: `The conversation's code (${branch}) is not on ${remote} yet. Push it from the other device.` };
+
+  const head = await out(cwd, ["rev-parse", "HEAD"]);
+  const current = await out(cwd, ["symbolic-ref", "--short", "HEAD"]);
+  const tree = await workingTree(cwd);
+  const headTree = head ? await treeOf(cwd, head) : undefined;
+  const targetTree = await treeOf(cwd, wip ?? base);
+  if (current === branch && head === base && tree === targetTree) return { kind: "matches" };
+
+  const dirty = tree !== headTree;
+  // A working tree equal to the snapshot this checkout last shared or received holds nothing new.
+  const onlyKnown = dirty && previous !== undefined && tree === (await treeOf(cwd, previous));
+  const local = await out(cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (local && (await git(cwd, ["merge-base", "--is-ancestor", local, base])).code !== 0) {
+    return { kind: "blocked", message: `Local ${branch} has commits the conversation's code does not. Reconcile ${branch}, then run /sync code.` };
+  }
+  const main = await defaultBranch(cwd, remote);
+  const onLatestMain = current === main && head === (await out(cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${main}`]));
+  const behindOnBranch = current === branch && !!head && (await git(cwd, ["merge-base", "--is-ancestor", head, base])).code === 0;
+  const summary = wip ? `${branch} with uncommitted changes` : `${branch} at ${base.slice(0, 7)}`;
+  const here = `${current ?? "a detached HEAD"}${dirty && !onlyKnown ? " with uncommitted changes" : ""}`;
+  return {
+    kind: "apply",
+    automatic: (!dirty || onlyKnown) && (onLatestMain || behindOnBranch),
+    stash: dirty && !onlyKnown,
+    target: { branch, base, wip, remote },
+    summary,
+    here,
+  };
+}
+
+/** Applies a plan: stashes local changes if asked, switches to the branch at the base, then lays the snapshot on top. */
+export async function applyCode(cwd: string, target: CodeTarget, options: { stash: boolean }): Promise<{ ok: true; message: string; stashed: boolean } | { ok: false; message: string }> {
+  let stashed = false;
+  if (options.stash) {
+    const saved = await git(cwd, ["stash", "push", "--include-untracked", "-m", `pi-sync: local changes before switching to ${target.branch}`], { timeoutMs: 60_000 });
+    if (saved.code !== 0) return { ok: false, message: `Could not stash local changes: ${saved.stderr.trim()}` };
+    stashed = true;
+  } else {
+    // Only reached when the working tree is clean or equals a snapshot that is still on its ref.
+    await git(cwd, ["reset", "--hard", "--quiet"], { timeoutMs: 60_000 });
+    await git(cwd, ["clean", "-fd", "--quiet"], { timeoutMs: 60_000 });
+  }
+  const local = await out(cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${target.branch}`]);
+  const switched = local ? await git(cwd, ["checkout", "--quiet", target.branch]) : await git(cwd, ["checkout", "--quiet", "-b", target.branch, target.base]);
+  if (switched.code !== 0) return { ok: false, message: `Could not switch to ${target.branch}: ${switched.stderr.trim()}` };
+  if (local && (await git(cwd, ["merge", "--ff-only", "--quiet", target.base])).code !== 0) return { ok: false, message: `Could not fast-forward ${target.branch}.` };
+  if (!local) await git(cwd, ["branch", "--quiet", "--set-upstream-to", `${target.remote}/${target.branch}`]);
+  const stashNote = stashed ? " Your local changes are in git stash (git stash list)." : "";
+  if (!target.wip) return { ok: true, stashed, message: `Checked out ${target.branch} at ${target.base.slice(0, 7)}.${stashNote}` };
+  // Worktree-only: modified files become unstaged changes, new files untracked, deletions apply.
+  const restored = await git(cwd, ["restore", `--source=${target.wip}`, "--worktree", "--", ":/"], { timeoutMs: 60_000 });
+  if (restored.code !== 0) return { ok: false, message: `Could not apply the shared changes: ${restored.stderr.trim()}` };
+  return { ok: true, stashed, message: `Brought ${target.branch} here with the other device's uncommitted changes.${stashNote}` };
 }

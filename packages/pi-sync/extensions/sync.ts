@@ -48,10 +48,19 @@ const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
 // Local-only entries of these types mean two devices really wrote the same conversation.
 // Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
-// Module scope (survives the session replacement): the next new conversation continues a deleted synchronized one.
-const freshChat: { replay?: { text: string; images?: unknown[] }; enroll?: boolean } = {};
-// Module scope: a catch-up re-creates the extension instance for the reopened session.
-const keptSettings: { value?: { file: string; model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> } } = {};
+// State that must outlive this extension instance: session replacement re-creates it, and hosts may re-evaluate
+// this module per session (pi-ez-web loads extensions without a module cache). One process may also host many
+// sessions, so entries are keyed by the session or file they are meant for, never a single shared slot.
+const shared = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.shared")] ??= {
+  // New sessions that continue a deleted synchronized conversation and should enroll after their first reply.
+  freshEnroll: new Set<string>(),
+  // A catch-up re-opens the session file; this device's model and thinking level to restore, by file.
+  keptSettings: new Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>(),
+}) as {
+  freshEnroll: Set<string>;
+  keptSettings: Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>;
+};
+const { freshEnroll, keptSettings } = shared;
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
@@ -587,7 +596,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
   const askToShareCode = async (ctx: ExtensionContext) => {
-    if (config.code !== "ask" || !ctx.hasUI || ctx.mode === "json" || (await shareSetting(ctx.cwd)) !== undefined) return;
+    if (config.code !== "ask" || !ctx.hasUI || (await shareSetting(ctx.cwd)) !== undefined) return;
     if (!(await hasUnsharedCode(ctx.cwd))) return;
     const enabled = await ctx.ui.confirm(
       "Share uncommitted code with your other devices?",
@@ -631,7 +640,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (!options.force && codeSettled.get(id) === key) return;
       if (!plan.automatic) {
         // Never a dialog from the background poll: the user may be typing into it.
-        if (!ctx.hasUI || ctx.mode === "json" || options.ask === false) {
+        if (!ctx.hasUI || options.ask === false) {
           codeSettled.set(id, key);
           notify(ctx, `This conversation's code is ${plan.summary}; this checkout is on ${plan.here}. Run /sync code to bring it here.`, "info");
           return;
@@ -744,7 +753,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   /** Re-opens `target` after it was rewritten, then optionally re-sends the prompt that triggered the refresh. */
   const reopen = async (ctx: ExtensionCommandContext, target: string, headEntryId: string, message: string | undefined, copyTitle: string | undefined, replay: Replay | undefined) => {
     // Pi adopts the model of the last reply, which may be another device's; a catch-up must not change this device's choice.
-    keptSettings.value = { file: resolvePath(target), model: ctx.model, thinking: pi.getThinkingLevel() };
+    keptSettings.set(resolvePath(target), { model: ctx.model, thinking: pi.getThinkingLevel() });
     const result = await ctx.switchSession(target, {
       withSession: async (replacement) => {
         try {
@@ -942,10 +951,19 @@ let counted = binding;
 
   const startPoll = (ctx: ExtensionContext) => {
     stopPoll();
-    // pi-ez-web drives checks itself through /sync auto-check.
-    if (ctx.mode === "json") return;
+    // Print-mode runs and headless subagents end before a poll matters; hosts with a UI (TUI, RPC, pi-ez-web) follow.
+    if (!ctx.hasUI) return;
     const generation = pollGeneration;
-    const tick = () => void poll(ctx, generation).catch(() => undefined);
+    const tick = () => {
+      try {
+        ctx.sessionManager.getSessionId();
+      } catch {
+        // Stale ctx: the host disposed this session without a shutdown event (pi-ez-web does); stop polling it.
+        if (generation === pollGeneration) stopPoll();
+        return;
+      }
+      void poll(ctx, generation).catch(() => undefined);
+    };
     setTimeout(tick, 250).unref?.();
     pollTimer = setInterval(tick, HEARTBEAT_MS);
     pollTimer.unref?.();
@@ -1104,7 +1122,7 @@ let counted = binding;
    */
   const warnArrival = async (ctx: ExtensionContext) => {
     const url = configuredUrl();
-    if (!url || !ctx.hasUI || ctx.mode === "json") return;
+    if (!url || !ctx.hasUI) return;
     const repository = await repositoryFor(ctx);
     if (!repository) return;
     const { sessions } = await clientFor(url).list({ timeoutMs: REQUEST_TIMEOUT_MS });
@@ -1176,18 +1194,17 @@ let counted = binding;
         return result as void;
       }
       if (command === "fresh") {
-        const replay = freshChat.replay;
-        freshChat.replay = undefined;
-        freshChat.enroll = true;
+        const replay = freshReplay;
+        freshReplay = undefined;
         await ctx.waitForIdle();
-        const result = await ctx.newSession({
+        await ctx.newSession({
           withSession: async (replacement) => {
+            freshEnroll.add(replacement.sessionManager.getSessionId());
             if (!replay?.text && !replay?.images?.length) return;
             const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
             await replacement.sendUserMessage(content as any);
           },
         });
-        if (result.cancelled) freshChat.enroll = false;
         return;
       }
       if (command === "status") return showStatus(ctx);
@@ -1230,10 +1247,10 @@ let counted = binding;
   pi.on("session_start", async (event, ctx) => {
     if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
     currentSessionId = ctx.sessionManager.getSessionId();
-    const kept = keptSettings.value;
-    keptSettings.value = undefined;
     const reopened = ctx.sessionManager.getSessionFile();
-    if (kept && reopened && resolvePath(reopened) === kept.file) {
+    const kept = reopened ? keptSettings.get(resolvePath(reopened)) : undefined;
+    if (reopened) keptSettings.delete(resolvePath(reopened));
+    if (kept) {
       if (kept.model && (ctx.model?.provider !== kept.model.provider || ctx.model?.id !== kept.model.id)) await pi.setModel(kept.model);
       if (pi.getThinkingLevel() !== kept.thinking) pi.setThinkingLevel(kept.thinking);
     }
@@ -1284,14 +1301,16 @@ let counted = binding;
     return { action: "handled" as const };
   };
 
+  // The prompt that hit a deleted conversation, for /sync fresh (same instance: the command runs here).
+  let freshReplay: { text: string; images?: unknown[] } | undefined;
   const startFreshChat = (ctx: ExtensionContext, text: string, images?: unknown[]) => {
-    freshChat.replay = { text, images };
+    freshReplay = { text, images };
     notify(ctx, "Starting a new synchronized chat; the deleted history is not restored.", "warning");
     setTimeout(() => {
       try {
         pi.sendUserMessage("/sync fresh", { expandPromptTemplates: true });
       } catch {
-        freshChat.replay = undefined;
+        freshReplay = undefined;
       }
     }, 0);
     return { action: "handled" as const };
@@ -1300,7 +1319,7 @@ let counted = binding;
   pi.on("input", async (event, ctx) => {
     if (lease) return { action: "continue" as const };
     // Typing into a copy whose synchronized history was deleted starts a new chat, unless sync is off here.
-    if (deletedHere(ctx) && !detachedHere(ctx) && config.serverUrl && ctx.mode !== "json" && !event.text.startsWith("/")) {
+    if (deletedHere(ctx) && !detachedHere(ctx) && config.serverUrl && ctx.hasUI && !event.text.startsWith("/")) {
       return startFreshChat(ctx, event.text, event.images);
     }
     if (!currentSessionId) return { action: "continue" as const };
@@ -1329,7 +1348,7 @@ let counted = binding;
         return { action: "continue" as const };
       }
     }
-    if (!reserved.ok && reserved.message === DELETED_MESSAGE && ctx.mode !== "json") {
+    if (!reserved.ok && reserved.message === DELETED_MESSAGE && ctx.hasUI) {
       notify(ctx, DELETED_MESSAGE, "warning");
       return startFreshChat(ctx, event.text, event.images);
     }
@@ -1370,15 +1389,15 @@ let counted = binding;
     const url = config.serverUrl;
     const path = ctx.sessionManager.getSessionFile();
     // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
-    if (!(config.allSessions || freshChat.enroll) || !url || !ctx.hasUI || ctx.mode === "json" || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     const sessionId = ctx.sessionManager.getSessionId();
+    if (!(config.allSessions || freshEnroll.has(sessionId)) || !url || !ctx.hasUI || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     if (await bindingFor(sessionId)) return;
     const envelope = await normalizeCurrent(ctx);
     try {
       const response = await exclusive(() => enrollInBatches(url, envelope));
       const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: path, state: "ready" };
       await store.set(syncedBinding(base, envelope, response.etag, path));
-      freshChat.enroll = false;
+      freshEnroll.delete(sessionId);
     } catch (error) {
       // Already on the server (this copy was opened elsewhere and its binding lost): /sync attach adopts it deliberately.
       if (error instanceof SyncClientError && error.code === "duplicate_enrollment") return;

@@ -70,6 +70,8 @@ jobs:
             PI_SYNC_BUILD_ID=${{ steps.source.outputs.sha }}
           provenance: true
           sbom: true
+          cache-from: type=gha,scope=pi-sync
+          cache-to: type=gha,mode=max,scope=pi-sync
 
   # Push to main deploys production: the digest is pinned in deploy/k8s by a bot commit on main, which Argo CD syncs.
   # Roll back by reverting that commit.

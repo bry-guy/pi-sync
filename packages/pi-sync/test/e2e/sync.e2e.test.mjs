@@ -352,6 +352,21 @@ test("code follows the conversation: automatically onto a clean, latest main; af
   writeFileSync(join(a, "new.txt"), "edited by hand\n");
   assert.ok(await waitFor(() => readOr(join(b, "new.txt")) === "edited by hand\n", 30_000), `hand edit arrived: ${JSON.stringify(B.notes)}`);
 
+  // The snapshot vanishes while the branch moves on: B's copy of the shared work is stashed, never discarded.
+  const c = join(caseDir, "git", "c");
+  git(join(caseDir, "git"), "clone", "-q", "origin.git", "c");
+  git(c, "fetch", "-q", "origin", "+refs/pi-sync/*:refs/shared/*");
+  git(c, "checkout", "-q", "-b", "feat", `${git(c, "for-each-ref", "--format=%(refname)", "refs/shared/")}^`);
+  writeFileSync(join(c, "other.txt"), "from elsewhere\n");
+  git(c, "add", "other.txt");
+  git(c, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "elsewhere");
+  git(c, "push", "-q", "origin", "feat");
+  for (const ref of git(origin, "for-each-ref", "--format=%(refname)", "refs/pi-sync/").split("\n").filter(Boolean)) git(origin, "update-ref", "-d", ref);
+  assert.ok(await waitFor(() => readOr(join(b, "other.txt")) === "from elsewhere\n", 30_000), `B moved to the new tip: ${JSON.stringify(B.notes)}`);
+  assert.match(git(b, "stash", "show", "--include-untracked", "-p", "stash@{0}"), /edited by hand/, "B's copy of the work is in the stash");
+  git(a, "fetch", "-q", "origin");
+  git(a, "merge", "-q", "--ff-only", "origin/feat");
+
   // Once everything is committed and pushed, the snapshot goes away and B fast-forwards to the branch.
   git(a, "add", "-A");
   git(a, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "done");

@@ -607,7 +607,8 @@ export default function syncExtension(pi: ExtensionAPI) {
    * nothing local can be lost and the checkout is on the latest default branch (or behind on the same branch),
    * otherwise after asking, stashing local changes first. Never runs while the agent works.
    */
-  const arriveCode = (ctx: ExtensionContext, options: { force?: boolean } = {}): Promise<void> => {
+  const arriveCode = async (ctx: ExtensionContext, options: { force?: boolean; ask?: boolean } = {}): Promise<void> => {
+    if (options.force) await arriving; // /sync code must run, not join a background check
     arriving ??= (async () => {
       if (config.code === "off" || !ctx.isIdle()) return;
       const id = ctx.sessionManager.getSessionId();
@@ -629,7 +630,8 @@ export default function syncExtension(pi: ExtensionAPI) {
       const key = `${plan.target.wip ?? plan.target.base}:${plan.stash}`;
       if (!options.force && codeSettled.get(id) === key) return;
       if (!plan.automatic) {
-        if (!ctx.hasUI || ctx.mode === "json") {
+        // Never a dialog from the background poll: the user may be typing into it.
+        if (!ctx.hasUI || ctx.mode === "json" || options.ask === false) {
           codeSettled.set(id, key);
           notify(ctx, `This conversation's code is ${plan.summary}; this checkout is on ${plan.here}. Run /sync code to bring it here.`, "info");
           return;
@@ -927,7 +929,7 @@ let counted = binding;
     if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS) {
       lastCodeCheck = Date.now();
       await shareBetweenTurns(ctx, binding);
-      if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx);
+      if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx, { ask: false });
     }
   };
   let lastCodeCheck = 0;

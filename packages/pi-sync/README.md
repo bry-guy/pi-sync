@@ -87,8 +87,9 @@ the tip of the conversation's branch on the remote.
 - **Automatically** when nothing local can be lost and this checkout is on the
   default branch at its remote tip, or on the conversation's branch behind it.
   A working tree that only holds the snapshot this checkout last received
-  counts as nothing to lose.
-- **After asking** otherwise (another branch, or uncommitted work of your own).
+  counts as nothing to lose; it is still stashed on the way, just in case.
+- **After asking** otherwise (another branch, or uncommitted work of your own); the idle check only
+  says so, while catching up, startup, and `/sync code` ask.
   Your uncommitted work is stashed first (`git stash list`), never discarded.
   Declining is remembered until the code moves again; `/sync code` brings it
   later.

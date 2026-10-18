@@ -153,6 +153,29 @@ export async function deleteSnapshot(cwd: string, conversationId: string, gitRem
 }
 
 
+const SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Deletes this repository's snapshot refs whose conversation the server no longer has (retention deletes
+ * conversations idle for 14 days), at most once a day per checkout. `live` must be the server's full list.
+ */
+export async function sweepSnapshots(cwd: string, live: ReadonlySet<string>, now = Date.now()): Promise<number> {
+  const last = Number(await out(cwd, ["config", "--local", "pi-sync.lastSweep"]));
+  if (Number.isFinite(last) && now - last < SWEEP_EVERY_MS) return 0;
+  const remote = await remoteName(cwd);
+  if (!remote) return 0;
+  const listed = await git(cwd, ["ls-remote", remote, "refs/pi-sync/*"], { timeoutMs: 30_000 });
+  if (listed.code !== 0) return 0;
+  const stale = listed.stdout.split("\n").map((line) => line.split("\t")[1]?.trim()).filter((ref): ref is string => !!ref && !live.has(ref.slice("refs/pi-sync/".length)));
+  if (stale.length) {
+    const pushed = await git(cwd, ["push", "--no-verify", remote, ...stale.map((ref) => `:${ref}`)], { timeoutMs: 60_000 });
+    if (pushed.code !== 0) return 0;
+    for (const ref of stale) await git(cwd, ["update-ref", "-d", ref]);
+  }
+  await git(cwd, ["config", "--local", "pi-sync.lastSweep", String(now)]);
+  return stale.length;
+}
+
 /** The working tree as a tree object (non-ignored files, untracked included), without touching the user's index. */
 async function workingTree(cwd: string): Promise<string | undefined> {
   const dir = await mkdtemp(join(tmpdir(), "pi-sync-index-"));

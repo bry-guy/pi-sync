@@ -27,6 +27,7 @@ import {
   shareIdle,
   snapshotRef,
   deleteSnapshot,
+  sweepSnapshots,
   hasUnsharedCode,
   pushSnapshot,
   setShareSetting,
@@ -677,9 +678,22 @@ export default function syncExtension(pi: ExtensionAPI) {
     });
   };
 
+  /** Removes this conversation's snapshot ref here and on the remote; it is no longer kept current. */
+  const dropSnapshot = async (ctx: ExtensionContext, binding: SyncBinding) => {
+    const id = binding.canonicalSessionId;
+    pendingPushes.delete(id);
+    await inOrder(id, async () => {
+      if ((await gitOut(ctx.cwd, ["rev-parse", "--verify", "--quiet", snapshotRef(id)])) === undefined && !binding.workspace?.wip) return;
+      await deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote);
+      await gitOut(ctx.cwd, ["update-ref", "-d", snapshotRef(id)]);
+    }).catch(() => undefined);
+  };
+
   const syncCode = async (ctx: ExtensionCommandContext, arg: string) => {
     if (arg === "on" || arg === "off") {
       await setShareSetting(ctx.cwd, arg === "on");
+      const current = arg === "off" ? await bindingFor(ctx.sessionManager.getSessionId()) : undefined;
+      if (current) await dropSnapshot(ctx, current);
       notify(ctx, arg === "on" ? "Uncommitted code will be shared with your other devices after each turn." : "Uncommitted code will not be shared.", "info");
       return;
     }
@@ -938,6 +952,10 @@ let counted = binding;
     if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS) {
       lastCodeCheck = Date.now();
       await shareBetweenTurns(ctx, binding);
+      if (await shareEnabled(ctx.cwd)) {
+        const live = await clientFor(binding.serverUrl).list().then((listed) => new Set(listed.sessions.map((item) => item.sessionId)), () => undefined);
+        if (live?.has(binding.canonicalSessionId)) await sweepSnapshots(ctx.cwd, live);
+      }
       if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx, { ask: false });
     }
   };
@@ -1147,6 +1165,7 @@ let counted = binding;
     await ctx.waitForIdle();
     await finishTurn(ctx);
     stopPoll();
+    await dropSnapshot(ctx, binding);
     remembered.delete(sessionId);
     await store.remove(sessionId);
     pi.appendEntry(LINK_ENTRY, { detached: true });

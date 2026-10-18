@@ -79,6 +79,11 @@ Between turns, the device that wrote the latest turn keeps sharing: about once
 a minute (and when Pi exits) it pushes hand edits made since the last snapshot,
 and deletes the snapshot once everything is committed and pushed.
 
+Snapshot refs do not pile up: each conversation has at most one, `/sync detach`
+and `/sync code off` delete the current conversation's ref, and once a day a
+device that shares code deletes the repository's refs whose conversation the
+server no longer has (conversations are deleted after 14 days without activity).
+
 When another device worked on the conversation, pi-sync brings its code here:
 on catching up (before a replayed prompt runs), at startup, and about once a
 minute while idle. The newest code is the snapshot when there is one, otherwise

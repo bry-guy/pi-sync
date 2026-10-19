@@ -33,7 +33,7 @@ spec:
       containers:
         - name: pi-syncd
           # Pinned by scripts/deploy.sh on each push to main; roll back by reverting that deploy commit.
-          image: ghcr.io/bry-guy/pi-syncd@sha256:83ac69ce27bd7b61a12538ec1a40bbaed92753e7d09fca2ebe32d15b0c97e416
+          image: ghcr.io/bry-guy/pi-syncd@sha256:02d41834ce346ba3fdd46905e4bcb936d1f6f066db6707bd0a1c72d88f5a35bb
           imagePullPolicy: IfNotPresent
           env:
             - name: PI_SYNC_LISTEN

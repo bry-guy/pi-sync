@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 export type CodeSharing = "ask" | "auto" | "off";
 
-/** Client settings: `<agent dir>/pi-sync.json`, overridden by PI_SYNC_* environment variables. */
+/**
+ * Client settings: `~/.pi/agent/pi-sync.json` (dotfiles), then `<agent dir>/pi-sync.json` when Pi uses another
+ * agent dir (a hosted worker), then PI_SYNC_* environment variables; later sources win per key.
+ */
 export interface SyncConfig {
   serverUrl?: string;
   deviceLabel?: string;
@@ -21,15 +25,24 @@ export function configPath(agentDir: string): string {
   return join(agentDir, "pi-sync.json");
 }
 
-export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): SyncConfig {
+/** Settings files in increasing precedence: the home one from dotfiles, then the agent dir's own. */
+export function configPaths(agentDir: string, home = homedir()): string[] {
+  const own = resolve(configPath(agentDir));
+  const dotfiles = resolve(configPath(join(home, ".pi", "agent")));
+  return own === dotfiles ? [own] : [dotfiles, own];
+}
+
+export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = process.env): SyncConfig {
   const problems: string[] = [];
   let file: Record<string, unknown> = {};
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) file = parsed as Record<string, unknown>;
-    else problems.push(`${path} must hold a JSON object`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") problems.push(`${path} could not be read: ${(error as Error).message}`);
+  for (const path of typeof paths === "string" ? [paths] : paths) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) file = { ...file, ...(parsed as Record<string, unknown>) };
+      else problems.push(`${path} must hold a JSON object`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") problems.push(`${path} could not be read: ${(error as Error).message}`);
+    }
   }
   const pick = (key: string, envName: string): unknown => {
     const fromEnv = env[envName]?.trim();

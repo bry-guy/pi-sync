@@ -39,3 +39,21 @@ test("the test heartbeat stays inside the lease expiry", () => {
   assert.equal(loadConfig(configPath(dir()), { PI_SYNC_HEARTBEAT_MS: "500000" }).heartbeatMs, 30_000);
   assert.equal(loadConfig(configPath(dir()), { PI_SYNC_HEARTBEAT_MS: "1000" }).heartbeatMs, 1000);
 });
+
+test("the agent dir's file overrides the dotfiles one per key, and env overrides both", async () => {
+  const { configPaths } = await import("../dist/src/index.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const home = mkdtempSync(join(tmpdir(), "home-"));
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(join(home, ".pi", "agent", "pi-sync.json"), JSON.stringify({ code: "auto", allSessions: "on" }));
+  const agent = mkdtempSync(join(tmpdir(), "agent-"));
+  writeFileSync(join(agent, "pi-sync.json"), JSON.stringify({ allSessions: "off" }));
+  const paths = configPaths(agent, home);
+  const merged = loadConfig(paths, {});
+  assert.equal(merged.code, "auto");
+  assert.equal(merged.allSessions, false);
+  assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "on" }).allSessions, true);
+  assert.equal(configPaths(join(home, ".pi", "agent"), home).length, 1);
+});

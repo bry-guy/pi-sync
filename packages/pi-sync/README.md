@@ -9,7 +9,9 @@ The extension is intended to be installed as a trusted Pi package.
 
 ## Settings
 
-Settings live in `~/.pi/agent/pi-sync.json` (or `$PI_CODING_AGENT_DIR/pi-sync.json`).
+Settings live in `~/.pi/agent/pi-sync.json`. When Pi runs with another
+`$PI_CODING_AGENT_DIR` (a hosted worker), `$PI_CODING_AGENT_DIR/pi-sync.json`
+overrides it key by key, so dotfiles set the defaults everywhere.
 Each one can be overridden by an environment variable. Edits take effect after
 `/reload` or a restart. Invalid values are ignored with a warning at startup.
 

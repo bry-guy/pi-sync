@@ -40,7 +40,7 @@ import {
   normalizeSessionFile,
   repositoryIdentity,
   restoreHead,
-  configPath,
+  configPaths,
   loadConfig,
 } from "../src/index.js";
 
@@ -158,7 +158,7 @@ function relativeAge(value: string | undefined): string {
 export default function syncExtension(pi: ExtensionAPI) {
   const store = new BindingStore(getAgentDir());
   // Read once per load; /reload picks up edits.
-  const config = loadConfig(configPath(getAgentDir()));
+  const config = loadConfig(configPaths(getAgentDir()));
   const HEARTBEAT_MS = config.heartbeatMs;
   // Last binding seen per session in this process: an older pi-sync process sharing the file can
   // rewrite it without ours, so a missing binding we still know about is written back.

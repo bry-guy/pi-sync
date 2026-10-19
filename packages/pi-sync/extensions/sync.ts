@@ -562,11 +562,15 @@ export default function syncExtension(pi: ExtensionAPI) {
   /** The repository's own /sync code on|off wins; otherwise the configured default. */
   const shareEnabled = async (cwd: string): Promise<boolean> => config.code !== "off" && ((await shareSetting(cwd)) ?? config.code === "auto");
   const autoShareNoticed = new Set<string>();
+  // Idle shares that failed in a row, by conversation; the poll stops trying at MAX_POLL_FAILURES until the next turn.
+  const idleFailures = new Map<string, number>();
 
   // Snapshots whose push failed, by conversation. Only the latest matters: each push replaces the conversation's ref.
   // shortcut: kept in memory, so a restart drops it; the next turn's snapshot covers the same work.
-  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number; failed: boolean }>();
+  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number; failed: boolean; failures?: number }>();
   const PUSH_RETRY_MS = 60_000;
+  // A failed push may be a credential prompt (e.g. an SSH agent), so the poll backs off, then waits for the next turn.
+  const MAX_POLL_FAILURES = 3;
 
   // One push or delete at a time per conversation, so an older snapshot can never land after a newer one.
   const pushChains = new Map<string, Promise<void>>();
@@ -589,11 +593,13 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (pending.failed) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
       return;
     }
-    pendingPushes.set(id, { ...pending, failed: true, nextAttempt: Date.now() + PUSH_RETRY_MS });
+    const failures = (pending.failures ?? 0) + 1;
+    const nextAttempt = failures >= MAX_POLL_FAILURES ? Infinity : Date.now() + PUSH_RETRY_MS * 2 ** (failures - 1);
+    pendingPushes.set(id, { ...pending, failed: true, failures, nextAttempt });
     if (!pending.failed) notify(ctx, `Code for this turn was not shared yet: push to ${pending.remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
   });
 
-  /** Retries failed pushes from the poll, at most once a minute each, and after every turn. */
+  /** Retries failed pushes after every turn, and from the poll with backoff until MAX_POLL_FAILURES. */
   const retryPushes = async (ctx: ExtensionContext, force = false) => {
     for (const [id, pending] of pendingPushes) {
       if (pending.failed && (force || Date.now() >= pending.nextAttempt)) await tryPush(ctx, id, pending.commit);
@@ -603,6 +609,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   /** Pushes (or clears) the turn's code snapshot after the lease is released, so it never delays the other device. */
   const shareSnapshot = async (ctx: ExtensionContext, binding: SyncBinding, snapshot: Snapshot) => {
     const id = binding.canonicalSessionId;
+    idleFailures.delete(id); // a new turn re-enables idle sharing
     if (snapshot.kind === "skipped") {
       // A retryable failure is covered by the next turn's snapshot, which captures the whole working tree again.
       notify(ctx, snapshot.retryable ? `Code for this turn was not shared yet: ${snapshot.reason}. pi-sync will try again after your next turn.` : `Code for this turn was not shared: ${snapshot.reason}.`, "warning");
@@ -703,12 +710,14 @@ export default function syncExtension(pi: ExtensionAPI) {
   const IDLE_SHARE_MS = 3 * HEARTBEAT_MS;
   const shareBetweenTurns = async (ctx: ExtensionContext, binding: SyncBinding, force = false) => {
     if (!force && Date.now() - lastIdleShare < IDLE_SHARE_MS) return;
+    if (!force && (idleFailures.get(binding.canonicalSessionId) ?? 0) >= MAX_POLL_FAILURES) return;
     if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
     lastIdleShare = Date.now();
     const id = binding.canonicalSessionId;
     await inOrder(id, async () => {
       if (pendingPushes.has(id)) return; // a turn's push is still due; it covers this
-      await shareIdle(ctx.cwd, id);
+      if ((await shareIdle(ctx.cwd, id)) === "failed") idleFailures.set(id, (idleFailures.get(id) ?? 0) + 1);
+      else idleFailures.delete(id);
     });
   };
 

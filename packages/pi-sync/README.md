@@ -74,8 +74,10 @@ read the remote can read that ref. Snapshots over 20 MB, or with a file over
 5 MB, are skipped with a warning. The answer is stored per repository as
 `git config pi-sync.shareWorkingTree`; change it with `/sync code on|off`.
 If a push fails (offline, remote unreachable), pi-sync says so and retries
-after the next turn and about once a minute while idle; only the newest
-snapshot is pushed.
+after the next turn, and while idle after 1, 2, then 4 minutes; only the newest
+snapshot is pushed. After three failed background calls to the remote (push,
+fetch, or sweep) the idle poll leaves the remote alone until the next turn, so
+a locked SSH agent prompts at most three times.
 
 Between turns, the device that wrote the latest turn keeps sharing: about once
 a minute (and when Pi exits) it pushes hand edits made since the last snapshot,
@@ -87,8 +89,9 @@ device that shares code deletes the repository's refs whose conversation the
 server no longer has (conversations are deleted after 14 days without activity).
 
 When another device worked on the conversation, pi-sync brings its code here:
-on catching up (before a replayed prompt runs), at startup, and about once a
-minute while idle. The newest code is the snapshot when there is one, otherwise
+on catching up (before a replayed prompt runs), at startup, and while idle once
+each time a turn records new code. Hand edits another device shares between
+turns arrive with its next turn or `/sync code`. The newest code is the snapshot when there is one, otherwise
 the tip of the conversation's branch on the remote.
 
 - **Automatically** when nothing local can be lost and this checkout is on the

@@ -655,6 +655,8 @@ export default function syncExtension(pi: ExtensionAPI) {
   // Per conversation: the code target the user declined or that could not be applied, so it is not asked again.
   const codeSettled = new Map<string, string>();
   let arriving: Promise<void> | undefined;
+  // Per conversation: the workspace pointer last checked, so the poll does not fetch again until a turn changes it.
+  const arrivalChecked = new Map<string, string>();
 
   /**
    * Brings this checkout to the conversation's latest code after another device worked on it: automatically when
@@ -670,11 +672,13 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (!binding?.workspace) return;
       // This device wrote the latest turn: its checkout is the source, not a destination.
       if (!options.force && lastDevice(ctx) === deviceLabel) return;
+      // The poll fetches only when a turn recorded new code; each fetch may be an SSH credential prompt.
+      const pointer = JSON.stringify(binding.workspace);
+      if (options.ask === false && arrivalChecked.get(id) === pointer) return;
       const plan = await planCode(ctx.cwd, binding.workspace, binding.canonicalSessionId);
-      if (plan.kind === "none") {
-        if (plan.failed) idleFailed(binding.canonicalSessionId);
-        return;
-      }
+      if (plan.kind === "none" && plan.failed) return void idleFailed(binding.canonicalSessionId);
+      arrivalChecked.set(id, pointer);
+      if (plan.kind === "none") return;
       if (plan.kind === "matches") {
         if (options.force) notify(ctx, "This checkout already has the conversation's code.", "info");
         return;
@@ -1000,7 +1004,7 @@ let counted = binding;
       return;
     }
     setStatus(ctx, "sync: up to date");
-    // Code moves without turns too: hand edits here, or another device's between-turn snapshot.
+    // Code moves without turns too: hand edits here are shared; another device's arrive with its next turn or /sync code.
     if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS && !idleBackedOff(binding.canonicalSessionId)) {
       lastCodeCheck = Date.now();
       await shareBetweenTurns(ctx, binding);

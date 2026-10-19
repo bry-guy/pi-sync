@@ -25,6 +25,7 @@ export class Pi {
       if (r.method === "set_editor_text") { this.editorText = r.text; }
       else if (r.method === "notify") { this.notes.push(r.message); this.log("NOTIFY", r.notifyType || "", r.message); }
       else if (r.method === "setStatus") { this.status[r.statusKey] = r.statusText; }
+      else if (r.method === "setWidget") { (this.widgets ??= {})[r.widgetKey] = r.widgetLines; (this.widgetLog ??= []).push([r.widgetKey, r.widgetLines]); }
       else if (["select", "confirm", "input", "editor"].includes(r.method)) {
         const a = this.answers.shift();
         this.log("UI", r.method, r.title, JSON.stringify(r.options || r.message || ""), "->", JSON.stringify(a));

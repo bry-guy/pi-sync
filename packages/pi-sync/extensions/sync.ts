@@ -46,6 +46,9 @@ import {
 
 const REQUEST_TIMEOUT_MS = 8_000;
 const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
+// While another device runs a turn, poll faster so its reply arrives soon after it finishes.
+const REMOTE_POLL_MS = 3_000;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // Local-only entries of these types mean two devices really wrote the same conversation.
 // Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
 const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
@@ -181,7 +184,8 @@ export default function syncExtension(pi: ExtensionAPI) {
   const deviceLabel = config.deviceLabel || defaultDeviceLabel();
   let currentSessionId: string | undefined;
   let lease: HeldLease | undefined;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let remoteWork: { ctx: ExtensionContext; holder: string; timer: ReturnType<typeof setInterval> } | undefined;
   let pollGeneration = 0;
   let refreshDispatched = false;
   let busy: Promise<unknown> | undefined;
@@ -193,6 +197,34 @@ export default function syncExtension(pi: ExtensionAPI) {
     } catch {
       // A replaced session invalidates its context; the message is no longer relevant.
     }
+  };
+
+  /** Shows a spinner above the editor while another device holds the lease; no holder hides it. */
+  const showRemoteWork = (ctx: ExtensionContext, holder?: string) => {
+    if (remoteWork && remoteWork.holder === holder && remoteWork.ctx === ctx) return;
+    if (remoteWork) {
+      clearInterval(remoteWork.timer);
+      try {
+        remoteWork.ctx.ui.setWidget("pi-sync-remote", undefined);
+      } catch {
+        // A replaced session invalidates its context; its widgets went with it.
+      }
+      remoteWork = undefined;
+    }
+    if (!holder || !ctx.hasUI) return;
+    let frame = 0;
+    const render = () => {
+      try {
+        const theme = ctx.ui.theme;
+        ctx.ui.setWidget("pi-sync-remote", [`${theme.fg("accent", SPINNER_FRAMES[frame++ % SPINNER_FRAMES.length] ?? "")} ${theme.fg("muted", `Working on ${holder}…`)}`]);
+      } catch {
+        // A replaced session invalidates its context; the next poll owns the widget.
+      }
+    };
+    render();
+    const timer = setInterval(render, 100);
+    timer.unref?.();
+    remoteWork = { ctx, holder, timer };
   };
 
   const setStatus = (ctx: ExtensionContext | undefined, text?: string) => {
@@ -457,6 +489,8 @@ export default function syncExtension(pi: ExtensionAPI) {
     lease = held;
     // Persisted so a restart after a crash can release the lease instead of waiting for expiry.
     void store.set({ ...binding, leaseToken: token }).catch(() => undefined);
+    // This device runs the turn now (possibly after taking it over), so nothing else is.
+    showRemoteWork(ctx);
     setStatus(ctx, "sync: working");
   };
 
@@ -904,6 +938,7 @@ let counted = binding;
       }
       return { outcome: "busy", sessionId };
     }
+    showRemoteWork(ctx, metadata.leaseHolder ?? undefined);
     if (metadata.leaseHolder) {
       setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
       return { outcome: "busy", sessionId };
@@ -939,6 +974,7 @@ let counted = binding;
       notify(ctx, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.", "warning");
       return;
     }
+    showRemoteWork(ctx, metadata.leaseHolder ?? undefined);
     if (metadata.leaseHolder) {
       setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
       return;
@@ -963,8 +999,9 @@ let counted = binding;
 
   const stopPoll = () => {
     pollGeneration++;
-    if (pollTimer) clearInterval(pollTimer);
+    if (pollTimer) clearTimeout(pollTimer);
     pollTimer = undefined;
+    if (remoteWork) showRemoteWork(remoteWork.ctx);
   };
 
   const startPoll = (ctx: ExtensionContext) => {
@@ -972,19 +1009,22 @@ let counted = binding;
     // Print-mode runs and headless subagents end before a poll matters; hosts with a UI (TUI, RPC, pi-ez-web) follow.
     if (!ctx.hasUI) return;
     const generation = pollGeneration;
-    const tick = () => {
-      try {
-        ctx.sessionManager.getSessionId();
-      } catch {
-        // Stale ctx: the host disposed this session without a shutdown event (pi-ez-web does); stop polling it.
-        if (generation === pollGeneration) stopPoll();
-        return;
-      }
-      void poll(ctx, generation).catch(() => undefined);
+    // Chained rather than an interval so a slow poll never overlaps the next one.
+    const schedule = (delay: number) => {
+      pollTimer = setTimeout(async () => {
+        try {
+          ctx.sessionManager.getSessionId();
+        } catch {
+          // Stale ctx: the host disposed this session without a shutdown event (pi-ez-web does); stop polling it.
+          if (generation === pollGeneration) stopPoll();
+          return;
+        }
+        await poll(ctx, generation).catch(() => undefined);
+        if (generation === pollGeneration) schedule(remoteWork ? Math.min(REMOTE_POLL_MS, HEARTBEAT_MS) : HEARTBEAT_MS);
+      }, delay);
+      pollTimer.unref?.();
     };
-    setTimeout(tick, 250).unref?.();
-    pollTimer = setInterval(tick, HEARTBEAT_MS);
-    pollTimer.unref?.();
+    schedule(250);
   };
 
   /** Uploads a new conversation; one that does not fit in a request is sent as a first part plus appends. */

@@ -137,6 +137,15 @@ test("simultaneous use is blocked with the prompt restored, then works once the 
   assert.deepEqual(await userTexts(B), ["one", "sleep2500 long", "after"]);
 });
 
+test("an idle device shows when another device is working, and clears it once the reply arrives", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  const running = A.prompt("sleep4000 remote work");
+  assert.equal(await eventually(() => (B.widgetLog ?? []).some(([key, lines]) => key === "pi-sync-remote" && JSON.stringify(lines ?? "").includes("Working on A")), true), true);
+  await running;
+  assert.equal(await eventually(async () => (await userTexts(B)).includes("sleep4000 remote work"), true), true);
+  assert.equal(await eventually(() => B.widgets?.["pi-sync-remote"] ?? null, null), null);
+});
+
 test("a device can take over from one that is stuck mid-turn; the stuck reply is kept as a copy", { ...opts, timeout: 120_000 }, async () => {
   const { A, B } = await handoff();
   const running = A.prompt("sleep6000 stuck");

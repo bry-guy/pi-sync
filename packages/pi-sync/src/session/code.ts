@@ -158,6 +158,7 @@ const SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
 /**
  * Deletes this repository's snapshot refs whose conversation the server no longer has (retention deletes
  * conversations idle for 14 days), at most once a day per checkout. `live` must be the server's full list.
+ * Returns how many were deleted, or -1 when the remote could not be reached.
  */
 export async function sweepSnapshots(cwd: string, live: ReadonlySet<string>, now = Date.now()): Promise<number> {
   const last = Number(await out(cwd, ["config", "--local", "pi-sync.lastSweep"]));
@@ -165,11 +166,11 @@ export async function sweepSnapshots(cwd: string, live: ReadonlySet<string>, now
   const remote = await remoteName(cwd);
   if (!remote) return 0;
   const listed = await git(cwd, ["ls-remote", remote, "refs/pi-sync/*"], { timeoutMs: 30_000 });
-  if (listed.code !== 0) return 0;
+  if (listed.code !== 0) return -1;
   const stale = listed.stdout.split("\n").map((line) => line.split("\t")[1]?.trim()).filter((ref): ref is string => !!ref && !live.has(ref.slice("refs/pi-sync/".length)));
   if (stale.length) {
     const pushed = await git(cwd, ["push", "--no-verify", remote, ...stale.map((ref) => `:${ref}`)], { timeoutMs: 60_000 });
-    if (pushed.code !== 0) return 0;
+    if (pushed.code !== 0) return -1;
     for (const ref of stale) await git(cwd, ["update-ref", "-d", ref]);
   }
   await git(cwd, ["config", "--local", "pi-sync.lastSweep", String(now)]);
@@ -226,7 +227,7 @@ export async function rememberSnapshot(cwd: string, conversationId: string, comm
 export type CodeTarget = { branch: string; base: string; wip?: string; remote: string };
 
 export type CodePlan =
-  | { kind: "none" } // nothing recorded, another repository, or not reachable
+  | { kind: "none"; failed?: true } // nothing recorded, another repository, or (failed) not reachable
   | { kind: "matches" }
   | { kind: "apply"; automatic: boolean; stash: boolean; target: CodeTarget; summary: string; here: string }
   | { kind: "blocked"; message: string };
@@ -262,10 +263,10 @@ export async function planCode(cwd: string, workspace: WorkspacePointer | undefi
   } else if (/couldn't find remote ref|no such ref/i.test(fetchedRef.stderr)) {
     if (previous) await git(cwd, ["update-ref", "-d", ref]);
   } else {
-    return { kind: "none" }; // offline: try again later
+    return { kind: "none", failed: true }; // offline: try again later
   }
   const fetched = await git(cwd, ["fetch", "--no-tags", "--quiet", remote], { timeoutMs: 60_000 });
-  if (fetched.code !== 0) return { kind: "none" };
+  if (fetched.code !== 0) return { kind: "none", failed: true };
   let base: string | undefined;
   if (wip) base = await out(cwd, ["rev-parse", `${wip}^`]);
   else {

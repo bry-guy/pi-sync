@@ -562,8 +562,11 @@ export default function syncExtension(pi: ExtensionAPI) {
   /** The repository's own /sync code on|off wins; otherwise the configured default. */
   const shareEnabled = async (cwd: string): Promise<boolean> => config.code !== "off" && ((await shareSetting(cwd)) ?? config.code === "auto");
   const autoShareNoticed = new Set<string>();
-  // Idle shares that failed in a row, by conversation; the poll stops trying at MAX_POLL_FAILURES until the next turn.
+  // Background remote calls (idle share, arrival fetch, sweep) that failed in a row, by conversation; the poll stops
+  // reaching the remote at MAX_POLL_FAILURES until the next turn, since each may be a credential prompt.
   const idleFailures = new Map<string, number>();
+  const idleFailed = (id: string) => idleFailures.set(id, (idleFailures.get(id) ?? 0) + 1);
+  const idleBackedOff = (id: string) => (idleFailures.get(id) ?? 0) >= MAX_POLL_FAILURES;
 
   // Snapshots whose push failed, by conversation. Only the latest matters: each push replaces the conversation's ref.
   // shortcut: kept in memory, so a restart drops it; the next turn's snapshot covers the same work.
@@ -668,7 +671,10 @@ export default function syncExtension(pi: ExtensionAPI) {
       // This device wrote the latest turn: its checkout is the source, not a destination.
       if (!options.force && lastDevice(ctx) === deviceLabel) return;
       const plan = await planCode(ctx.cwd, binding.workspace, binding.canonicalSessionId);
-      if (plan.kind === "none") return;
+      if (plan.kind === "none") {
+        if (plan.failed) idleFailed(binding.canonicalSessionId);
+        return;
+      }
       if (plan.kind === "matches") {
         if (options.force) notify(ctx, "This checkout already has the conversation's code.", "info");
         return;
@@ -710,14 +716,15 @@ export default function syncExtension(pi: ExtensionAPI) {
   const IDLE_SHARE_MS = 3 * HEARTBEAT_MS;
   const shareBetweenTurns = async (ctx: ExtensionContext, binding: SyncBinding, force = false) => {
     if (!force && Date.now() - lastIdleShare < IDLE_SHARE_MS) return;
-    if (!force && (idleFailures.get(binding.canonicalSessionId) ?? 0) >= MAX_POLL_FAILURES) return;
+    if (!force && idleBackedOff(binding.canonicalSessionId)) return;
     if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
     lastIdleShare = Date.now();
     const id = binding.canonicalSessionId;
     await inOrder(id, async () => {
       if (pendingPushes.has(id)) return; // a turn's push is still due; it covers this
-      if ((await shareIdle(ctx.cwd, id)) === "failed") idleFailures.set(id, (idleFailures.get(id) ?? 0) + 1);
-      else idleFailures.delete(id);
+      const shared = await shareIdle(ctx.cwd, id);
+      if (shared === "failed") idleFailed(id);
+      else if (shared !== "unchanged") idleFailures.delete(id); // "unchanged" never reached the remote
     });
   };
 
@@ -994,12 +1001,12 @@ let counted = binding;
     }
     setStatus(ctx, "sync: up to date");
     // Code moves without turns too: hand edits here, or another device's between-turn snapshot.
-    if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS) {
+    if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS && !idleBackedOff(binding.canonicalSessionId)) {
       lastCodeCheck = Date.now();
       await shareBetweenTurns(ctx, binding);
       if (await shareEnabled(ctx.cwd)) {
         const live = await clientFor(binding.serverUrl).list().then((listed) => new Set(listed.sessions.map((item) => item.sessionId)), () => undefined);
-        if (live?.has(binding.canonicalSessionId)) await sweepSnapshots(ctx.cwd, live);
+        if (live?.has(binding.canonicalSessionId) && (await sweepSnapshots(ctx.cwd, live)) < 0) idleFailed(binding.canonicalSessionId);
       }
       if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx, { ask: false });
     }

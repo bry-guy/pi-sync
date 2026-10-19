@@ -21,3 +21,12 @@ test("sweep deletes snapshot refs of conversations the server no longer has, onc
   assert.equal(g(work, "for-each-ref", "--format=%(refname)", "refs/pi-sync"), "refs/pi-sync/live");
   assert.equal(await sweepSnapshots(work, new Set(), 2000), 0, "throttled within a day");
 });
+
+test("sweep reports an unreachable remote and tries again next time", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sweep-"));
+  g(root, "init", "-q", "work");
+  const work = join(root, "work");
+  g(work, "remote", "add", "origin", join(root, "missing.git"));
+  assert.equal(await sweepSnapshots(work, new Set(), 1000), -1);
+  assert.equal(await sweepSnapshots(work, new Set(), 2000), -1, "a failure is not throttled");
+});

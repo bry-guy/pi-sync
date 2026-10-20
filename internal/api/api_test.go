@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/bry-guy/pi-sync/internal/lease"
 	"github.com/bry-guy/pi-sync/internal/session"
@@ -460,5 +461,48 @@ func TestHTTPAppendAndPagedEntries(t *testing.T) {
 	status, full := call("GET", "/v1/sessions/session-1", nil, nil)
 	if status != http.StatusOK || len(full["session"].(map[string]any)["entries"].([]any)) != 2 {
 		t.Fatalf("full get: %d", status)
+	}
+}
+
+func TestHTTPWaitReturnsWhenTheLeaseHolderChanges(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases := lease.New(nil, lease.DefaultExpiry)
+	router := httptest.NewServer(New(filesystem, leases))
+	defer router.Close()
+	body, _ := json.Marshal(apiEnvelope())
+	created, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var made struct {
+		ETag string `json:"etag"`
+	}
+	_ = json.NewDecoder(created.Body).Decode(&made)
+	created.Body.Close()
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = leases.Acquire("session-1", "laptop")
+	}()
+	started := time.Now()
+	response, err := http.Get(router.URL + "/v1/sessions/session-1/wait?etag=" + url.QueryEscape(made.ETag))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var state struct {
+		ETag        string `json:"etag"`
+		LeaseHolder string `json:"leaseHolder"`
+		Changed     bool   `json:"changed"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if !state.Changed || state.LeaseHolder != "laptop" || state.ETag != made.ETag || elapsed < 250*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("wait returned %+v after %s", state, elapsed)
 	}
 }

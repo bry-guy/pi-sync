@@ -923,7 +923,9 @@ let counted = binding;
     }
     if (result.kind === "current") {
       if (mode === "manual") notify(ctx, "The synchronized conversation is already current.", "info");
-      if (replay) pi.sendUserMessage(replay.text);
+      // Another refresh may have caught up first; the replay still runs here.
+      if (replay?.compact) ctx.compact(replay.compact);
+      else if (replay) pi.sendUserMessage(replay.text);
       return { outcome: "unchanged", sessionId };
     }
     // Automatic catch-ups stay quiet: the new turns appearing is the signal.
@@ -970,7 +972,13 @@ let counted = binding;
     return refreshCurrent(ctx, "check");
   };
 
+  // What the last poll saw on the server; a long-poll waits for it to change. Unset when the poll skipped the check.
+  let lastSeen: { url: string; sessionId: string; etag: string; holder: string } | undefined;
+  // Servers without /wait (older pi-syncd), so their clients keep plain polling.
+  const noWait = new Set<string>();
+
   const poll = async (ctx: ExtensionContext, generation: number) => {
+    lastSeen = undefined;
     if (pendingPushes.size && !lease) void retryPushes(ctx).catch(() => undefined);
     if (generation !== pollGeneration || lease || busy || refreshDispatched || !currentSessionId) return;
     if (!ctx.isIdle() || hasPendingInput(ctx)) return;
@@ -984,6 +992,7 @@ let counted = binding;
       return;
     }
     if (generation !== pollGeneration || lease || busy || !ctx.isIdle() || hasPendingInput(ctx)) return;
+    if (metadata) lastSeen = { url: binding.serverUrl, sessionId: binding.canonicalSessionId, etag: metadata.etag, holder: metadata.leaseHolder ?? "" };
     if (!metadata) {
       if (await isDeleted(binding)) {
         await forgetDeleted(ctx, binding);
@@ -1017,7 +1026,32 @@ let counted = binding;
   };
   let lastCodeCheck = 0;
 
+  let waitAbort: AbortController | undefined;
+
+  /**
+   * Returns once the server reports a change since the last poll, so the next poll runs right away. Falls back to
+   * sleeping `delay` when the poll skipped its check, the server predates /wait, or the wait fails.
+   */
+  const waitForChange = async (delay: number) => {
+    const seen = lastSeen;
+    const sleep = () => new Promise<void>((resolve) => setTimeout(resolve, delay).unref?.());
+    if (!seen || noWait.has(seen.url)) return sleep();
+    const abort = (waitAbort = new AbortController());
+    // Never longer than the plain poll: local work (hand-edit snapshots, retries) still runs on that cadence.
+    const capped = setTimeout(() => abort.abort(), delay);
+    try {
+      await clientFor(seen.url).wait(seen.sessionId, seen.etag, seen.holder, { signal: abort.signal });
+    } catch (error) {
+      if (error instanceof SyncClientError && (error.code === "not_found" || error.code === "method_not_allowed")) noWait.add(seen.url);
+      if (!abort.signal.aborted) await sleep();
+    } finally {
+      clearTimeout(capped);
+      waitAbort = undefined;
+    }
+  };
+
   const stopPoll = () => {
+    waitAbort?.abort();
     pollGeneration++;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = undefined;
@@ -1040,7 +1074,10 @@ let counted = binding;
           return;
         }
         await poll(ctx, generation).catch(() => undefined);
-        if (generation === pollGeneration) schedule(remoteWork ? Math.min(REMOTE_POLL_MS, HEARTBEAT_MS) : HEARTBEAT_MS);
+        if (generation !== pollGeneration) return;
+        await waitForChange(remoteWork ? Math.min(REMOTE_POLL_MS, HEARTBEAT_MS) : HEARTBEAT_MS);
+        // A short floor keeps a flapping server from turning this into a busy loop.
+        if (generation === pollGeneration) schedule(100);
       }, delay);
       pollTimer.unref?.();
     };

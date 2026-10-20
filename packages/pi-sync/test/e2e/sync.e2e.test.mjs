@@ -11,8 +11,8 @@ import { Pi, sleep } from "./rpc.mjs";
 
 const enabled = process.env.PI_SYNC_E2E === "1";
 const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url));
-const SYNC_PORT = 18180;
-const LLM_PORT = 18181;
+const SYNC_PORT = Number(process.env.PI_SYNC_E2E_PORT ?? 18180);
+const LLM_PORT = SYNC_PORT + 1;
 process.env.SYNC_URL = `http://127.0.0.1:${SYNC_PORT}`;
 process.env.FAKE_LLM_PORT = String(LLM_PORT);
 
@@ -144,6 +144,25 @@ test("an idle device shows when another device is working, and clears it once th
   await running;
   assert.equal(await eventually(async () => (await userTexts(B)).includes("sleep4000 remote work"), true), true);
   assert.equal(await eventually(() => B.widgets?.["pi-sync-remote"] ?? null, null), null);
+});
+
+test("with a slow heartbeat, an idle device still sees remote work and its reply within seconds", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A"), B = peer("B", "b", { PI_SYNC_HEARTBEAT_MS: "30000" });
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await ready(B);
+  B.answers.push((options) => options[0]);
+  await B.prompt("/sync");
+  await sleep(1500);
+  const started = Date.now();
+  const running = A.prompt("sleep3000 quick");
+  assert.equal(await eventually(() => (B.widgetLog ?? []).some(([key, lines]) => key === "pi-sync-remote" && JSON.stringify(lines ?? "").includes("Working on A")), true), true);
+  assert.ok(Date.now() - started < 3000, `spinner took ${Date.now() - started} ms`);
+  await running;
+  const done = Date.now();
+  assert.equal(await eventually(async () => (await userTexts(B)).includes("sleep3000 quick"), true), true);
+  assert.ok(Date.now() - done < 5000, `reply took ${Date.now() - done} ms`);
 });
 
 test("a device can take over from one that is stuck mid-turn; the stuck reply is kept as a copy", { ...opts, timeout: 120_000 }, async () => {

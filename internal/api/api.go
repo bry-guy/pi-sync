@@ -179,6 +179,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", "GET, POST")
 			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
 		}
+	case "wait":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
+			return
+		}
+		s.wait(w, r, id)
 	case "lease/renew":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")
@@ -272,6 +279,45 @@ func (s *Server) noteReader(r *http.Request, id string) {
 		return
 	}
 	s.store.NoteDevice(id, label, time.Now())
+}
+
+// maxWait bounds a long-poll below the HTTP write timeout; waitStep is how often it re-reads state.
+const (
+	maxWait  = 25 * time.Second
+	waitStep = 200 * time.Millisecond
+)
+
+// wait holds the request until the conversation's etag or lease holder differs from ?etag= and ?holder=, or
+// maxWait passes, then returns the current pair. It only reports state; clients still read and write as usual.
+func (s *Server) wait(w http.ResponseWriter, r *http.Request, id string) {
+	etag, holder := r.URL.Query().Get("etag"), r.URL.Query().Get("holder")
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(waitStep)
+	defer tick.Stop()
+	for {
+		record, err := s.store.Meta(id)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		current := ""
+		if held, ok := s.leases.Current(id); ok {
+			current = held.Holder
+		}
+		if record.ETag != etag || current != holder {
+			s.writeJSON(w, http.StatusOK, map[string]any{"etag": record.ETag, "leaseHolder": current, "changed": true})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-deadline.C:
+			s.writeJSON(w, http.StatusOK, map[string]any{"etag": record.ETag, "leaseHolder": current, "changed": false})
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 func (s *Server) snapshot(w http.ResponseWriter, id string) {
@@ -595,6 +641,9 @@ func parseSessionPath(path string) (string, string, bool) {
 	}
 	if len(parts) == 1 {
 		return id, "session", true
+	}
+	if len(parts) == 2 && parts[1] == "wait" {
+		return id, "wait", true
 	}
 	if len(parts) == 2 && parts[1] == "entries" {
 		return id, "entries", true

@@ -116,6 +116,19 @@ export class SyncClient {
     }
   }
 
+  /**
+   * Long-polls until the conversation's etag or lease holder differs from the given pair, or the server's limit
+   * (about 25 s) passes. Older servers answer `not_found` or `method_not_allowed`.
+   */
+  async wait(sessionId: string, etag: string, holder: string, options: RequestOptions = {}): Promise<{ etag: string; leaseHolder: string; changed: boolean }> {
+    const query = `?etag=${encodeURIComponent(etag)}&holder=${encodeURIComponent(holder)}`;
+    const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/wait${query}`, { method: "GET" }, { timeoutMs: 35_000, ...options });
+    if (!isRecord(value) || typeof value.etag !== "string" || typeof value.leaseHolder !== "string" || typeof value.changed !== "boolean") {
+      throw new SyncClientError("invalid_response", "The sync server returned an invalid wait response.");
+    }
+    return { etag: value.etag, leaseHolder: value.leaseHolder, changed: value.changed };
+  }
+
   /** Reads the canonical snapshot without taking a lease. */
   async get(sessionId: string, options: RequestOptions = {}): Promise<SessionResponse> {
     const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "GET" }, options);

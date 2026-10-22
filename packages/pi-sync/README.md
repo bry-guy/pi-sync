@@ -75,9 +75,14 @@ read the remote can read that ref. Snapshots over 20 MB, or with a file over
 `git config pi-sync.shareWorkingTree`; change it with `/sync code on|off`.
 If a push fails (offline, remote unreachable), pi-sync says so and retries
 after the next turn, and while idle after 1, 2, then 4 minutes; only the newest
-snapshot is pushed. After three failed background calls to the remote (push,
+snapshot is pushed. When the remote is simply unreachable (offline, or just
+woken from sleep), retries continue every minute without limit. After three failed background calls to the remote (push,
 fetch, or sweep) the idle poll leaves the remote alone until the next turn, so
 a locked SSH agent prompts at most three times.
+
+During a turn, the working tree is pushed after a tool runs, at most every 30
+seconds, so work reaches the remote even if the laptop sleeps before the turn
+ends.
 
 Between turns, the device that wrote the latest turn keeps sharing: about once
 a minute (and when Pi exits) it pushes hand edits made since the last snapshot,

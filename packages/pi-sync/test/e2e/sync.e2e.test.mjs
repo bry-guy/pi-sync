@@ -463,6 +463,19 @@ test("code: auto shares without asking, and a failed push is retried on a later 
   assert.match(git(origin, "for-each-ref", "refs/pi-sync/"), /refs\/pi-sync\//, "the snapshot reached the remote");
 });
 
+test("code is shared during a turn, before it ends", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A", "a", { PI_SYNC_CODE: "auto" });
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  const origin = join(caseDir, "git", "origin.git");
+  const running = A.prompt("bashtool:echo mid > mid.txt; sleep8000 then the turn ends");
+  assert.ok(await waitFor(() => /refs\/pi-sync\//.test(git(origin, "for-each-ref", "refs/pi-sync/")), 6000), "snapshot pushed while the turn still runs");
+  const ref = git(origin, "for-each-ref", "--format=%(refname)", "refs/pi-sync/");
+  assert.equal(git(origin, "show", `${ref}:mid.txt`), "mid");
+  await running;
+});
+
 test("allSessions synchronizes a conversation after its first reply", { ...opts, timeout: 90_000 }, async () => {
   const A = peer("A", "a", { PI_SYNC_ALL_SESSIONS: "on" });
   await ready(A);

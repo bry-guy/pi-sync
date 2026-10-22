@@ -574,6 +574,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const PUSH_RETRY_MS = 60_000;
   // A failed push may be a credential prompt (e.g. an SSH agent), so the poll backs off, then waits for the next turn.
   const MAX_POLL_FAILURES = 3;
+  const OFFLINE_GIT = /could not resolve host|network is unreachable|connection (refused|timed out|reset)|operation timed out|no route to host|temporary failure in name resolution|could not read from remote|unable to access/i;
 
   // One push or delete at a time per conversation, so an older snapshot can never land after a newer one.
   const pushChains = new Map<string, Promise<void>>();
@@ -596,8 +597,10 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (pending.failed) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
       return;
     }
-    const failures = (pending.failures ?? 0) + 1;
-    const nextAttempt = failures >= MAX_POLL_FAILURES ? Infinity : Date.now() + PUSH_RETRY_MS * 2 ** (failures - 1);
+    // An unreachable remote (offline, or just woken from sleep) is not a credential prompt: keep retrying each minute.
+    const offline = OFFLINE_GIT.test(pushed.stderr);
+    const failures = offline ? (pending.failures ?? 0) : (pending.failures ?? 0) + 1;
+    const nextAttempt = offline ? Date.now() + PUSH_RETRY_MS : failures >= MAX_POLL_FAILURES ? Infinity : Date.now() + PUSH_RETRY_MS * 2 ** (failures - 1);
     pendingPushes.set(id, { ...pending, failed: true, failures, nextAttempt });
     if (!pending.failed) notify(ctx, `Code for this turn was not shared yet: push to ${pending.remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
   });
@@ -729,6 +732,23 @@ export default function syncExtension(pi: ExtensionAPI) {
       const shared = await shareIdle(ctx.cwd, id);
       if (shared === "failed") idleFailed(id);
       else if (shared !== "unchanged") idleFailures.delete(id); // "unchanged" never reached the remote
+    });
+  };
+
+  // During a turn, files change before the turn ends; a laptop that sleeps mid-turn would otherwise share nothing.
+  const TURN_SHARE_MS = Math.min(30_000, 3 * HEARTBEAT_MS);
+  const lastTurnShare = new Map<string, number>();
+  /** Pushes the working tree after a tool runs mid-turn, at most every TURN_SHARE_MS; the turn-end push stays final. */
+  const shareDuringTurn = async (ctx: ExtensionContext) => {
+    if (!lease || !currentSessionId) return;
+    const binding = await bindingFor(currentSessionId);
+    if (!binding) return;
+    const id = binding.canonicalSessionId;
+    if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS || !(await shareEnabled(ctx.cwd))) return;
+    lastTurnShare.set(id, Date.now());
+    await inOrder(id, async () => {
+      if (pendingPushes.has(id)) return; // a failed turn push is retried on its own
+      await shareIdle(ctx.cwd, id);
     });
   };
 
@@ -1524,6 +1544,11 @@ let counted = binding;
     setStatus(ctx, "sync: up to date");
     startPoll(ctx);
   };
+
+  pi.on("tool_execution_end", async (_event, ctx) => {
+    // Not awaited: sharing must never slow the agent down.
+    void shareDuringTurn(ctx).catch(() => undefined);
+  });
 
   pi.on("agent_settled", async (_event, ctx) => {
     await finishTurn(ctx);

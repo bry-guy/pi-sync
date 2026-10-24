@@ -104,3 +104,15 @@ test("appending to a session file matches a full rewrite and refuses a file that
   assert.equal(await readFile(fast, "utf8"), before, "refusals leave the file untouched");
   assert.deepEqual((await readdir(dir)).filter((name) => name.includes(".tmp-")), [], "no temporary files left");
 });
+
+test("model and thinking switches are shared only as placeholders", async () => {
+  const native = [
+    JSON.stringify({ type: "session", version: 3, id: "s", timestamp: "2026-01-01T00:00:00Z" }),
+    JSON.stringify({ type: "message", id: "a", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "hi" } }),
+    JSON.stringify({ type: "thinking_level_change", id: "b", parentId: "a", timestamp: "2026-01-01T00:00:01Z", thinkingLevel: "high" }),
+    JSON.stringify({ type: "model_change", id: "c", parentId: "b", timestamp: "2026-01-01T00:00:01Z", provider: "x", modelId: "y" }),
+  ].join("\n");
+  const { entries } = await normalizeNativeJsonl(native);
+  assert.deepEqual(entries.map((entry) => [entry.id, entry.parentId, entry.type]), [["a", null, "message"], ["b", "a", "custom"], ["c", "b", "custom"]]);
+  assert.equal(entries[1].thinkingLevel, undefined);
+});

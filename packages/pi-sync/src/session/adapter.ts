@@ -23,6 +23,18 @@ export interface NormalizeOptions {
   workspace?: WorkspacePointer;
 }
 
+/**
+ * Model and thinking choices belong to each device, so they are never shared. The entries stay as placeholders with
+ * the same id and parent: the server copy keeps the local file's shape, which counts and appends rely on.
+ */
+export function withoutLocalSettings(entries: PiEntry[]): PiEntry[] {
+  return entries.map((entry) =>
+    entry.type === "model_change" || entry.type === "thinking_level_change"
+      ? ({ type: "custom", customType: "pi-sync-local-setting", id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp } as PiEntry)
+      : entry,
+  );
+}
+
 export async function normalizeSessionFile(path: string, options: NormalizeOptions = {}): Promise<SessionEnvelope> {
   return normalizeNativeJsonl(await readFile(path, "utf8"), options);
 }
@@ -52,6 +64,7 @@ export async function normalizeNativeJsonl(text: string, options: NormalizeOptio
     if (!isRecord(value) || typeof value.type !== "string") throw new Error(`session entry ${index} is invalid`);
     entries.push(value as PiEntry);
   }
+  const shared = withoutLocalSettings(entries);
 
   let parentSessionId = options.parentSessionId;
   if (parentSessionId === undefined && header.parentSession) {
@@ -73,7 +86,7 @@ export async function normalizeNativeJsonl(text: string, options: NormalizeOptio
     parentSessionId,
     headEntryId,
     title: options.title ?? (inferredTitle && typeof inferredTitle.name === "string" ? inferredTitle.name : ""),
-    entries,
+    entries: shared,
     ...(options.workspace ? { workspace: options.workspace } : {}),
   } satisfies SessionEnvelope;
   return validateEnvelope(envelope);

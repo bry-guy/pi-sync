@@ -38,6 +38,7 @@ import {
   materializeSessionFile,
   nativeHeaderLine,
   normalizeSessionFile,
+  withoutLocalSettings,
   repositoryIdentity,
   restoreHead,
   configPaths,
@@ -465,7 +466,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         workspace: workspace ?? (await idleWorkspace(ctx, binding)),
       };
       try {
-        const response = await client.append(binding.canonicalSessionId, token, binding.lastEtag, { baseCount: base, entries: entries.slice(base), ...header });
+        const response = await client.append(binding.canonicalSessionId, token, binding.lastEtag, { baseCount: base, entries: withoutLocalSettings(entries.slice(base)), ...header });
         const envelope = { formatVersion: 1 as const, sessionId: binding.canonicalSessionId, piSessionVersion: 3, createdAt: "", parentSessionId: binding.parentSessionId ?? null, ...header, entries };
         const next = syncedBinding(binding, envelope, response.etag, file);
         await store.set(next);

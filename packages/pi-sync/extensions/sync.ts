@@ -1386,6 +1386,7 @@ let counted = binding;
     const reopened = ctx.sessionManager.getSessionFile();
     const kept = reopened ? keptSettings.get(resolvePath(reopened)) : undefined;
     if (reopened) keptSettings.delete(resolvePath(reopened));
+    const beforeRestore = localFingerprint(ctx);
     if (kept) {
       if (kept.model && (ctx.model?.provider !== kept.model.provider || ctx.model?.id !== kept.model.id)) await pi.setModel(kept.model);
       if (pi.getThinkingLevel() !== kept.thinking) pi.setThinkingLevel(kept.thinking);
@@ -1414,6 +1415,12 @@ let counted = binding;
     if (file && resolvePath(file) !== resolvePath(binding.materializedFile)) {
       // Opened through /resume or a copy from an older pi-sync; adopt it as this device's file.
       binding = { ...binding, materializedFile: file };
+      await store.set(binding);
+    }
+    // Restoring this device's model/thinking appends entries; uploading them makes devices with different settings
+    // ping-pong refreshes forever. They ride along with the next real turn instead.
+    if (kept && binding.lastFingerprint === beforeRestore && localFingerprint(ctx) !== beforeRestore) {
+      binding = { ...binding, lastFingerprint: localFingerprint(ctx) };
       await store.set(binding);
     }
     setStatus(ctx, binding.state === "setup_required" ? "sync: server copy missing (/sync attach)" : "sync: on");

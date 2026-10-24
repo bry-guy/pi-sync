@@ -287,6 +287,19 @@ export default function syncExtension(pi: ExtensionAPI) {
   const localFingerprint = (ctx: ExtensionContext) =>
     entriesFingerprint(ctx.sessionManager.getEntries() as { id?: unknown }[], ctx.sessionManager.getLeafId());
 
+  /**
+   * Whether this copy has changes worth an idle upload. Model and thinking switches don't count, nor does a moved
+   * head: each device restores its own settings after a catch-up, and uploading that made two devices with different
+   * settings refresh each other forever. Those changes go up with the next turn.
+   */
+  const localChanged = (ctx: ExtensionContext, binding: SyncBinding) => {
+    if (localFingerprint(ctx) === binding.lastFingerprint) return false;
+    const entries = ctx.sessionManager.getEntries() as { id?: unknown; type?: unknown }[];
+    const synced = binding.syncedCount;
+    if (!synced || synced > entries.length || entries[synced - 1]?.id !== binding.syncedLastId) return true;
+    return entries.slice(synced).some((entry) => entry.type !== "model_change" && entry.type !== "thinking_level_change");
+  };
+
   const remoteFingerprint = (envelope: SessionEnvelope) => entriesFingerprint(envelope.entries, envelope.headEntryId);
 
   const normalizeCurrent = async (ctx: ExtensionContext, binding?: SyncBinding, workspace?: WorkspacePointer): Promise<SessionEnvelope> => {
@@ -910,7 +923,7 @@ let counted = binding;
           await store.set(counted);
         }
         // Already current; push idle local changes (renames, model switches) under a brief lease.
-        if (localFingerprint(ctx) !== binding.lastFingerprint) {
+        if (localChanged(ctx, binding)) {
           const reserved = await acquire(ctx, counted);
           if (!reserved.ok) return { kind: "refused" as const, message: reserved.message };
           try {
@@ -985,7 +998,7 @@ let counted = binding;
       setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
       return { outcome: "busy", sessionId };
     }
-    if (metadata.etag === binding.lastEtag && localFingerprint(ctx) === binding.lastFingerprint) {
+    if (metadata.etag === binding.lastEtag && !localChanged(ctx, binding)) {
       setStatus(ctx, "sync: up to date");
       return { outcome: "unchanged", sessionId };
     }
@@ -1028,7 +1041,7 @@ let counted = binding;
       setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
       return;
     }
-    if (metadata.etag !== binding.lastEtag || localFingerprint(ctx) !== binding.lastFingerprint) {
+    if (metadata.etag !== binding.lastEtag || localChanged(ctx, binding)) {
       dispatchRefresh();
       return;
     }
@@ -1386,7 +1399,6 @@ let counted = binding;
     const reopened = ctx.sessionManager.getSessionFile();
     const kept = reopened ? keptSettings.get(resolvePath(reopened)) : undefined;
     if (reopened) keptSettings.delete(resolvePath(reopened));
-    const beforeRestore = localFingerprint(ctx);
     if (kept) {
       if (kept.model && (ctx.model?.provider !== kept.model.provider || ctx.model?.id !== kept.model.id)) await pi.setModel(kept.model);
       if (pi.getThinkingLevel() !== kept.thinking) pi.setThinkingLevel(kept.thinking);
@@ -1415,12 +1427,6 @@ let counted = binding;
     if (file && resolvePath(file) !== resolvePath(binding.materializedFile)) {
       // Opened through /resume or a copy from an older pi-sync; adopt it as this device's file.
       binding = { ...binding, materializedFile: file };
-      await store.set(binding);
-    }
-    // Restoring this device's model/thinking appends entries; uploading them makes devices with different settings
-    // ping-pong refreshes forever. They ride along with the next real turn instead.
-    if (kept && binding.lastFingerprint === beforeRestore && localFingerprint(ctx) !== beforeRestore) {
-      binding = { ...binding, lastFingerprint: localFingerprint(ctx) };
       await store.set(binding);
     }
     setStatus(ctx, binding.state === "setup_required" ? "sync: server copy missing (/sync attach)" : "sync: on");

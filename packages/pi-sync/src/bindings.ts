@@ -13,6 +13,8 @@ export interface SyncBinding {
   lastEtag: string;
   materializedFile: string;
   leaseToken?: string;
+  /** Process holding leaseToken; other local processes must not release it while it runs. */
+  leasePid?: number;
   leaseExpiresAt?: string;
   lastFingerprint?: string;
   /** Entries this device last synchronized, and the id of the last one: the local file's first syncedCount entries. */
@@ -142,6 +144,7 @@ function isBinding(value: unknown): value is SyncBinding {
     typeof value.lastEtag === "string" &&
     typeof value.materializedFile === "string" &&
     (value.leaseToken === undefined || typeof value.leaseToken === "string") &&
+    (value.leasePid === undefined || Number.isInteger(value.leasePid)) &&
     (value.leaseExpiresAt === undefined || typeof value.leaseExpiresAt === "string") &&
     (value.lastFingerprint === undefined || typeof value.lastFingerprint === "string") &&
     (value.syncedCount === undefined || Number.isInteger(value.syncedCount)) &&

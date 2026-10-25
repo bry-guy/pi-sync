@@ -159,6 +159,15 @@ function relativeAge(value: string | undefined): string {
   return `${Math.round(seconds / 86400)}d ago`;
 }
 
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
 export default function syncExtension(pi: ExtensionAPI) {
   const store = new BindingStore(getAgentDir());
   // Read once per load; /reload picks up edits.
@@ -336,6 +345,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       title: envelope.title,
     };
     delete next.leaseToken;
+    delete next.leasePid;
     delete next.leaseExpiresAt;
     return next;
   };
@@ -343,6 +353,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   const markSetupRequired = async (ctx: ExtensionContext, binding: SyncBinding) => {
     const next: SyncBinding = { ...binding, state: "setup_required" };
     delete next.leaseToken;
+    delete next.leasePid;
     delete next.leaseExpiresAt;
     await store.set(next);
     setStatus(ctx, "sync: server copy missing (/sync attach)");
@@ -502,7 +513,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     held.timer.unref?.();
     lease = held;
     // Persisted so a restart after a crash can release the lease instead of waiting for expiry.
-    void store.set({ ...binding, leaseToken: token }).catch(() => undefined);
+    void store.set({ ...binding, leaseToken: token, leasePid: process.pid }).catch(() => undefined);
     // This device runs the turn now (possibly after taking it over), so nothing else is.
     showRemoteWork(ctx);
     setStatus(ctx, "sync: working");
@@ -565,6 +576,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         const stored = await bindingFor(held.binding.nativeSessionId);
         if (stored?.leaseToken === held.token) {
           delete stored.leaseToken;
+          delete stored.leasePid;
           await store.set(stored);
         }
       }
@@ -1420,11 +1432,13 @@ let counted = binding;
       else void reconnect(ctx).catch(() => undefined);
       return;
     }
-    if (binding.leaseToken) {
+    // A token held by another live local process (e.g. a background run) is in use, not left behind.
+    if (binding.leaseToken && !(binding.leasePid && binding.leasePid !== process.pid && pidAlive(binding.leasePid))) {
       // Left behind by a crash mid-turn; the server lease expires anyway, so drop it.
       await release(binding, binding.leaseToken);
       binding = { ...binding };
       delete binding.leaseToken;
+      delete binding.leasePid;
       delete binding.leaseExpiresAt;
       await store.set(binding);
     }
@@ -1543,8 +1557,9 @@ let counted = binding;
     const url = config.serverUrl;
     const path = ctx.sessionManager.getSessionFile();
     // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
+    // pi-background runs (PI_BACKGROUND=1) are the user's own sessions moved off-screen, so they enroll.
     const sessionId = ctx.sessionManager.getSessionId();
-    if (!(config.allSessions || freshEnroll.has(sessionId)) || !url || !ctx.hasUI || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    if (!(config.allSessions || freshEnroll.has(sessionId)) || !url || !(ctx.hasUI || process.env.PI_BACKGROUND) || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     if (await bindingFor(sessionId)) return;
     const envelope = await normalizeCurrent(ctx);
     try {

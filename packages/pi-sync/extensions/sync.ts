@@ -1267,6 +1267,7 @@ let counted = binding;
   /**
    * On a fresh start in a repository, warns about the shared conversation this client hasn't caught up with, naming
    * the clients it is on. Opening it stays a deliberate /sync.
+   * Only conversations on this checkout's branch count: their code would land here, so this checkout is out of date.
    * shortcut: only conversations updated in the last day are mentioned.
    */
   const warnArrival = async (ctx: ExtensionContext) => {
@@ -1276,9 +1277,12 @@ let counted = binding;
     if (!repository) return;
     const { sessions } = await clientFor(url).list({ timeoutMs: REQUEST_TIMEOUT_MS });
     const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
+    const branch = (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim();
+    if (!branch) return;
     const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const candidate = sessions
       .filter((item) => repositoryIdentity(item.workspace) === repository && (item.updatedAt ?? item.createdAt) > dayAgo)
+      .filter((item) => (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch)
       .filter((item) => bindings.get(item.sessionId)?.lastEtag !== item.etag)
       .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
     if (!candidate) return;

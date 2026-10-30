@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkspacePointer } from "../protocol.js";
-import { deriveWorkspacePointer, repositoryIdentity } from "./workspace.js";
+import { deriveWorkspacePointer, isProjectsStateRepo, repositoryIdentity } from "./workspace.js";
 
 /**
  * Code-state sharing for synchronized conversations.
@@ -62,6 +62,7 @@ export async function setShareSetting(cwd: string, enabled: boolean): Promise<vo
 
 /** True when the working tree has changes (including untracked, non-ignored files) or HEAD is not pushed. */
 export async function hasUnsharedCode(cwd: string): Promise<boolean> {
+  if (await isProjectsStateRepo(cwd)) return false;
   const status = await out(cwd, ["status", "--porcelain"]);
   if (status === undefined) return false; // not a Git repository
   if (status) return true;

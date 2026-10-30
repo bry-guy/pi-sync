@@ -404,6 +404,7 @@ func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string
 		HeadEntryID string             `json:"headEntryId"`
 		Title       string             `json:"title"`
 		Workspace   *session.Workspace `json:"workspace,omitempty"`
+		Project     string             `json:"project,omitempty"`
 	}
 	body := http.MaxBytesReader(w, r.Body, session.MaxRequestBytes)
 	decoder := json.NewDecoder(body)
@@ -419,7 +420,7 @@ func (s *Server) appendEntries(w http.ResponseWriter, r *http.Request, id string
 		s.writeError(w, http.StatusBadRequest, "invalid_request", "baseCount is required", nil)
 		return
 	}
-	header := session.Envelope{HeadEntryID: request.HeadEntryID, Title: request.Title, Workspace: request.Workspace}
+	header := session.Envelope{HeadEntryID: request.HeadEntryID, Title: request.Title, Workspace: request.Workspace, Project: request.Project}
 	record, err := s.store.Append(id, ifMatch, *request.BaseCount, request.Entries, header)
 	if err != nil {
 		var stale *store.StaleETagError
@@ -584,6 +585,7 @@ func (s *Server) metadata(record store.Record) metadata {
 		HeadEntryID: record.Envelope.HeadEntryID,
 		ETag:        record.ETag,
 		Workspace:   record.Envelope.Workspace,
+		Project:     record.Envelope.Project,
 		Devices:     record.Devices,
 	}
 	if !record.UpdatedAt.IsZero() {
@@ -607,6 +609,7 @@ type metadata struct {
 	LeaseExpiresAt *time.Time         `json:"leaseExpiresAt"`
 	UpdatedAt      *time.Time         `json:"updatedAt,omitempty"`
 	Workspace      *session.Workspace `json:"workspace,omitempty"`
+	Project        string             `json:"project,omitempty"`
 	Devices        []store.Device     `json:"devices,omitempty"`
 }
 

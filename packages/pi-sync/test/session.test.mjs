@@ -116,3 +116,43 @@ test("model and thinking switches are shared only as placeholders", async () => 
   assert.deepEqual(entries.map((entry) => [entry.id, entry.parentId, entry.type]), [["a", null, "message"], ["b", "a", "custom"], ["c", "b", "custom"]]);
   assert.equal(entries[1].thinkingLevel, undefined);
 });
+
+test("project link: envelope carries the project, arrival uses the project folder", async () => {
+  const { projectCwd, projectLink } = await import("../dist/src/session/index.js");
+  const link = { type: "custom", customType: "pi-project", id: "p", parentId: "a", timestamp: "2026-01-01T00:00:02Z", data: { projectId: "x", name: "eco", rel: "repos/web" } };
+  const native = [
+    JSON.stringify({ type: "session", version: 3, id: "s-2", timestamp: "2026-01-01T00:00:00Z", cwd: "/laptop/eco" }),
+    JSON.stringify({ type: "message", id: "a", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "hi" } }),
+    JSON.stringify(link),
+  ].join("\n") + "\n";
+  const envelope = await normalizeNativeJsonl(native);
+  assert.equal(envelope.project, "eco");
+  assert.deepEqual(projectLink(envelope.entries), { name: "eco", rel: "repos/web" });
+  process.env.PI_PROJECTS_DIR = "/w/projects";
+  const has = (paths) => (path) => paths.includes(path);
+  assert.equal(projectCwd(envelope.entries, "/agent", "/here", has([])), "/here", "no project here: stay put");
+  assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json"])), "/w/projects/eco", "repo not cloned: project root");
+  assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json", "/w/projects/eco/repos/web"])), "/w/projects/eco/repos/web");
+  const escaping = [{ ...link, data: { name: "eco", rel: "../other" } }];
+  assert.equal(projectCwd(escaping, "/agent", "/here", () => true), "/w/projects/eco");
+  delete process.env.PI_PROJECTS_DIR;
+});
+
+test("the pi-projects state repo never shares code", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { hasUnsharedCode } = await import("../dist/src/session/index.js");
+  const dir = mkdtempSync(join(tmpdir(), "state-"));
+  execFileSync("git", ["init", "-q", dir]);
+  writeFileSync(join(dir, "x"), "dirty");
+  assert.equal(await hasUnsharedCode(dir), true);
+  process.env.PI_PROJECTS_DIR = dir;
+  try {
+    assert.equal(await hasUnsharedCode(dir), false);
+    assert.equal(await deriveWorkspacePointer(dir), undefined);
+  } finally {
+    delete process.env.PI_PROJECTS_DIR;
+  }
+});

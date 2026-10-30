@@ -35,8 +35,11 @@ import {
   type Snapshot,
   type WorkspacePointer,
   appendSessionFile,
+  defaultSessionDir,
   materializeSessionFile,
   nativeHeaderLine,
+  projectCwd,
+  projectLink,
   normalizeSessionFile,
   withoutLocalSettings,
   repositoryIdentity,
@@ -475,6 +478,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         headEntryId: ctx.sessionManager.getLeafId() ?? entries.at(-1)?.id ?? "",
         title: conversationTitle(ctx, binding),
         workspace: workspace ?? (await idleWorkspace(ctx, binding)),
+        ...(projectLink(entries) ? { project: projectLink(entries)!.name } : {}),
       };
       try {
         const response = await client.append(binding.canonicalSessionId, token, binding.lastEtag, { baseCount: base, entries: withoutLocalSettings(entries.slice(base)), ...header });
@@ -851,13 +855,19 @@ export default function syncExtension(pi: ExtensionAPI) {
     });
     const entries = snapshot.session.entries;
     const synced = binding.syncedCount ?? 0;
+    // A project conversation reopens in its project folder; others stay where this pi runs.
+    const cwd = projectCwd(entries, getAgentDir(), ctx.cwd, existsSync);
+    const parent = snapshot.session.parentSessionId
+      ? (await store.all()).find((item) => item.canonicalSessionId === snapshot.session.parentSessionId)?.materializedFile
+      : undefined;
+    const where = { cwd, ...(parent && existsSync(parent) ? { parentSessionPath: parent } : {}) };
     // A pure append onto the file this device last synchronized: add the new lines instead of rewriting it all.
     const appended = !copyTitle && carried.length === 0 && binding.syncedLastId !== undefined && synced > 0
       && synced <= entries.length && entries[synced - 1]?.id === binding.syncedLastId
       && headEntryId === entries.at(-1)?.id
       && resolvePath(target) === resolvePath(binding.materializedFile)
-      && await appendSessionFile(target, { headerLine: nativeHeaderLine(snapshot.session, { cwd: ctx.cwd }), count: synced, lastId: binding.syncedLastId }, entries.slice(synced));
-    if (!appended) await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...entries, ...carried] }, { cwd: ctx.cwd });
+      && await appendSessionFile(target, { headerLine: nativeHeaderLine(snapshot.session, where), count: synced, lastId: binding.syncedLastId }, entries.slice(synced));
+    if (!appended) await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...entries, ...carried] }, where);
     // Recorded as the canonical copy, so carried entries count as local changes and upload on the next check.
     const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
     await store.set(next);
@@ -1151,11 +1161,11 @@ let counted = binding;
     try {
       let count = first.length;
       for (const batch of batches.slice(1)) {
-        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: batch, headEntryId: batch.at(-1)!.id, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}) }));
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: batch, headEntryId: batch.at(-1)!.id, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}), ...(envelope.project ? { project: envelope.project } : {}) }));
         count += batch.length;
       }
       if (envelope.headEntryId !== batches.at(-1)!.at(-1)!.id) {
-        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: [], headEntryId: envelope.headEntryId, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}) }));
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: [], headEntryId: envelope.headEntryId, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}), ...(envelope.project ? { project: envelope.project } : {}) }));
       }
     } finally {
       await client.release(envelope.sessionId, held.token).catch(() => undefined);
@@ -1255,7 +1265,7 @@ let counted = binding;
   const openSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
     const existing = await bindingFor(sessionId);
     const reusable = existing && existsSync(existing.materializedFile) ? existing : undefined;
-    const target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
+    let target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
     const binding: SyncBinding = reusable ?? {
       nativeSessionId: sessionId,
       serverUrl: url,
@@ -1269,6 +1279,12 @@ let counted = binding;
       if (reusable) local = await normalizeSessionFile(target).catch(() => undefined);
       const fetched = await fetchCanonical(ctx, binding, local?.entries);
       if (!fetched.ok) return { kind: "failed" as const, message: fetched.message };
+      const cwd = projectCwd(fetched.snapshot.session.entries, getAgentDir(), ctx.cwd, existsSync);
+      // A new copy of a project conversation goes where pi lists that folder's sessions (/resume, pi-web), unless sessions live in a custom folder.
+      if (!reusable && resolvePath(cwd) !== resolvePath(ctx.cwd) && resolvePath(ctx.sessionManager.getSessionDir()) === defaultSessionDir(ctx.cwd, getAgentDir())) {
+        target = join(defaultSessionDir(cwd, getAgentDir()), `${Date.now()}_${sessionId}.jsonl`);
+        binding.materializedFile = target;
+      }
       return { kind: "written" as const, written: await materializeCanonical(ctx, target, local, binding, fetched.snapshot), snapshot: fetched.snapshot };
     }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
     if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);

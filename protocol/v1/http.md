@@ -15,6 +15,11 @@ present, it contains only the remote URL, upstream branch, and full upstream
 commit. Local paths, dirty state, local-only commits, credentials, and stashes
 are not synchronized.
 
+`project` (optional) names the pi project the conversation belongs to (a
+portable identifier, the pi-projects folder name). Clients take it from the
+last `pi-project` custom entry. The server stores it and reports it in
+`GET /v1/sessions`; an append without `project` keeps the stored value.
+
 ## Endpoints
 
 | Method | Path | Response |
@@ -37,7 +42,7 @@ are not synchronized.
 Conversations grow without a size limit, so current clients never send or fetch the
 whole conversation once it is on both sides:
 
-- **`POST /v1/sessions/:id/entries`** sends `{ "baseCount": N, "entries": [...], "headEntryId": "...", "title": "...", "workspace": {...} }`
+- **`POST /v1/sessions/:id/entries`** sends `{ "baseCount": N, "entries": [...], "headEntryId": "...", "title": "...", "workspace": {...}, "project": "..." }`
   with the lease and `If-Match`. `baseCount` must equal the server's entry count, so a
   device can only append to the copy it last saw; a mismatch is `412 stale_etag` like a
   stale ETag. An empty `entries` list just moves the head or changes the title.

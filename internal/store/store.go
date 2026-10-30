@@ -69,6 +69,7 @@ type meta struct {
 	HeadEntryID      string             `json:"headEntryId"`
 	Title            string             `json:"title"`
 	Workspace        *session.Workspace `json:"workspace,omitempty"`
+	Project          string             `json:"project,omitempty"`
 	Count            int                `json:"count"`
 	Bytes            int64              `json:"bytes"`
 	// Chain hashes the entries in order: chain_n = sha256(chain_{n-1} || entry_n).
@@ -81,7 +82,7 @@ type meta struct {
 }
 
 func (m meta) envelope() session.Envelope {
-	return session.Envelope{FormatVersion: m.FormatVersion, SessionID: m.SessionID, PiSessionVersion: m.PiSessionVersion, CreatedAt: m.CreatedAt, ParentSessionID: m.ParentSessionID, HeadEntryID: m.HeadEntryID, Title: m.Title, Workspace: m.Workspace, Entries: []json.RawMessage{}}
+	return session.Envelope{FormatVersion: m.FormatVersion, SessionID: m.SessionID, PiSessionVersion: m.PiSessionVersion, CreatedAt: m.CreatedAt, ParentSessionID: m.ParentSessionID, HeadEntryID: m.HeadEntryID, Title: m.Title, Workspace: m.Workspace, Project: m.Project, Entries: []json.RawMessage{}}
 }
 
 // currentETag is what clients see: the legacy ETag until the first write after conversion.
@@ -318,6 +319,9 @@ func (s *Store) Append(id, expectedETag string, baseCount int, entries []json.Ra
 	}
 	next := m
 	next.HeadEntryID, next.Title, next.Workspace = head, header.Title, header.Workspace
+	if header.Project != "" {
+		next.Project = header.Project
+	}
 	if err := session.ValidateHeader(next.envelope()); err != nil {
 		return Record{}, err
 	}
@@ -456,7 +460,7 @@ func (s *Store) convert(base string) (meta, error) {
 
 // rewrite replaces all three files with the given conversation.
 func (s *Store) rewrite(base string, envelope session.Envelope, legacyETag string) (meta, error) {
-	m := meta{FormatVersion: session.FormatVersion, SessionID: envelope.SessionID, PiSessionVersion: envelope.PiSessionVersion, CreatedAt: envelope.CreatedAt, ParentSessionID: envelope.ParentSessionID, HeadEntryID: envelope.HeadEntryID, Title: envelope.Title, Workspace: envelope.Workspace, LegacyETag: legacyETag}
+	m := meta{FormatVersion: session.FormatVersion, SessionID: envelope.SessionID, PiSessionVersion: envelope.PiSessionVersion, CreatedAt: envelope.CreatedAt, ParentSessionID: envelope.ParentSessionID, HeadEntryID: envelope.HeadEntryID, Title: envelope.Title, Workspace: envelope.Workspace, Project: envelope.Project, LegacyETag: legacyETag}
 	var log, idx bytes.Buffer
 	chain := sha256.Sum256(nil)
 	for _, raw := range envelope.Entries {

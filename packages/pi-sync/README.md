@@ -147,6 +147,20 @@ Hosts such as pi-ez-web run the extension in JSON mode, which disables the
 background poll. They call `/sync auto-check` (or `/sync reconcile`) instead;
 it returns `{ outcome: "unchanged" | "busy" | "conflict" | "refreshed" }`.
 
+### pi projects
+
+A conversation started in a [pi-projects](https://github.com/bry-guy/pi-projects)
+project carries a `pi-project` entry naming the project and the subfolder it
+ran in. When it arrives on a machine that has that project (under
+`PI_PROJECTS_DIR`), it opens in the same project folder, and its file goes in
+that folder's session list, instead of wherever pi happens to be running. The
+project name is also sent to the server, so hosts can list a project's
+conversations. pi-projects keeps `project.json` and `memory.md` in their own
+git repo; pi-sync never shares code from that repo.
+
+Background runs from pi-background enroll and hold the lease like turns typed
+in the terminal.
+
 ## Tests
 
 `npm test` runs the unit tests. `npm run test:e2e` drives two real Pi

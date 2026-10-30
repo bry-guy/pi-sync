@@ -172,7 +172,7 @@ export class SyncClient {
   }
 
   /** Appends entries under the lease; `baseCount` is the entry count this device last synchronized. */
-  async append(sessionId: string, token: string, etag: string, body: { baseCount: number; entries: SessionEnvelope["entries"]; headEntryId: string; title: string; workspace?: SessionEnvelope["workspace"] }, options: RequestOptions = {}): Promise<{ etag: string; count: number }> {
+  async append(sessionId: string, token: string, etag: string, body: { baseCount: number; entries: SessionEnvelope["entries"]; headEntryId: string; title: string; workspace?: SessionEnvelope["workspace"]; project?: string }, options: RequestOptions = {}): Promise<{ etag: string; count: number }> {
     const value = await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/entries`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...this.leaseHeaders(token), "If-Match": etag },

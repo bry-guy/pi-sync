@@ -506,3 +506,47 @@ func TestHTTPWaitReturnsWhenTheLeaseHolderChanges(t *testing.T) {
 		t.Fatalf("wait returned %+v after %s", state, elapsed)
 	}
 }
+
+func TestHTTPListReportsProject(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := httptest.NewServer(New(filesystem, lease.New(nil, lease.DefaultExpiry)))
+	defer router.Close()
+	envelope := apiEnvelope()
+	envelope.Project = "pi-web-ecosystem"
+	body, _ := json.Marshal(envelope)
+	created, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+	listed, err := http.Get(router.URL + "/v1/sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listed.Body.Close()
+	var list struct {
+		Sessions []struct {
+			Project string `json:"project"`
+		} `json:"sessions"`
+	}
+	if err := json.NewDecoder(listed.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].Project != "pi-web-ecosystem" {
+		t.Fatalf("list must report the project: %+v", list.Sessions)
+	}
+	envelope.Project = "bad name/with slash"
+	envelope.SessionID = "session-2"
+	body, _ = json.Marshal(envelope)
+	rejected, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected.Body.Close()
+	if rejected.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid project must be rejected, got %d", rejected.StatusCode)
+	}
+}

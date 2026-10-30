@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import { type PiEntry, type SessionEnvelope, type WorkspacePointer, validateEnvelope } from "../protocol.js";
 
@@ -33,6 +34,43 @@ export function withoutLocalSettings(entries: PiEntry[]): PiEntry[] {
       ? ({ type: "custom", customType: "pi-sync-local-setting", id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp } as PiEntry)
       : entry,
   );
+}
+
+/** The pi-projects link (`pi-project` custom entry): project folder name and cwd relative to it. */
+export function projectLink(entries: readonly PiEntry[]): { name: string; rel: string } | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as PiEntry & { customType?: unknown; data?: { name?: unknown; rel?: unknown } };
+    if (entry.type !== "custom" || entry.customType !== "pi-project") continue;
+    const { name, rel } = entry.data ?? {};
+    if (typeof name !== "string" || !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(name)) return undefined;
+    return { name, rel: typeof rel === "string" ? rel : "" };
+  }
+  return undefined;
+}
+
+/** pi-projects' folder: PI_PROJECTS_DIR, else <agentDir>/pi-projects. */
+export function projectsDir(agentDir: string): string {
+  const env = process.env.PI_PROJECTS_DIR;
+  return resolve(env ? env.replace(/^~(?=$|\/)/, homedir()) : join(agentDir, "pi-projects"));
+}
+
+/**
+ * Where a conversation belongs on this machine: its project folder (plus the same subfolder) when the project
+ * exists here, else `fallback`. A subfolder that is not there yet (an uncloned repo) falls back to the project root.
+ */
+export function projectCwd(entries: readonly PiEntry[], agentDir: string, fallback: string, exists: (path: string) => boolean): string {
+  const link = projectLink(entries);
+  if (!link) return fallback;
+  const root = join(projectsDir(agentDir), link.name);
+  if (!exists(join(root, "project.json"))) return fallback;
+  const full = resolve(root, link.rel);
+  if (full !== root && !full.startsWith(root + sep)) return root;
+  return exists(full) ? full : root;
+}
+
+/** pi's default per-cwd sessions folder (session-manager getDefaultSessionDir). */
+export function defaultSessionDir(cwd: string, agentDir: string): string {
+  return join(resolve(agentDir), "sessions", `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
 }
 
 export async function normalizeSessionFile(path: string, options: NormalizeOptions = {}): Promise<SessionEnvelope> {
@@ -88,6 +126,7 @@ export async function normalizeNativeJsonl(text: string, options: NormalizeOptio
     title: options.title ?? (inferredTitle && typeof inferredTitle.name === "string" ? inferredTitle.name : ""),
     entries: shared,
     ...(options.workspace ? { workspace: options.workspace } : {}),
+    ...(projectLink(entries) ? { project: projectLink(entries)!.name } : {}),
   } satisfies SessionEnvelope;
   return validateEnvelope(envelope);
 }

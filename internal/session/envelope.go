@@ -95,6 +95,8 @@ type Envelope struct {
 	Title            string            `json:"title"`
 	Entries          []json.RawMessage `json:"entries"`
 	Workspace        *Workspace        `json:"workspace,omitempty"`
+	// Project names the pi project the conversation belongs to, so clients can list a project's conversations.
+	Project string `json:"project,omitempty"`
 }
 
 type ValidationError struct {
@@ -197,6 +199,9 @@ func Validate(envelope Envelope) error {
 	}
 	if strings.IndexByte(envelope.Title, 0) >= 0 {
 		return invalid("title", "contains a NUL byte")
+	}
+	if envelope.Project != "" && !validID(envelope.Project, MaxSessionIDLength) {
+		return invalid("project", "must be omitted or a portable identifier")
 	}
 
 	ids := make(map[string]string, len(envelope.Entries))

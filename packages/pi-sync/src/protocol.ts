@@ -32,6 +32,8 @@ export interface SessionEnvelope {
   title: string;
   entries: PiEntry[];
   workspace?: WorkspacePointer;
+  /** pi project the conversation belongs to (pi-projects folder name). */
+  project?: string;
 }
 
 export interface SessionMetadata {
@@ -44,6 +46,7 @@ export interface SessionMetadata {
   leaseExpiresAt: string | null;
   updatedAt?: string;
   workspace?: WorkspacePointer;
+  project?: string;
   /** Clients that have used the conversation, most recent first (servers before 0.1.8 omit it). */
   devices?: { label: string; lastSeen: string }[];
 }
@@ -225,6 +228,7 @@ export function validateEnvelope(value: unknown, options: { partial?: boolean } 
   }
 
   const workspace = validateWorkspace(value.workspace);
+  const project = optionalProject(value.project);
   return {
     formatVersion: PROTOCOL_VERSION,
     sessionId,
@@ -235,7 +239,15 @@ export function validateEnvelope(value: unknown, options: { partial?: boolean } 
     title,
     entries,
     ...(workspace ? { workspace } : {}),
+    ...(project ? { project } : {}),
   };
+}
+
+function optionalProject(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const project = stringField(value, "project", 128);
+  if (!safeId.test(project)) fail("must be a portable identifier", "project");
+  return project;
 }
 
 export function assertProtocolVersion(value: unknown): void {
@@ -259,7 +271,9 @@ export function validateMetadata(value: unknown): SessionMetadata {
   const devices = Array.isArray(value.devices)
     ? value.devices.flatMap((item: unknown) => isObject(item) && typeof item.label === "string" && item.label.length <= 128 && typeof item.lastSeen === "string" ? [{ label: item.label, lastSeen: item.lastSeen }] : [])
     : undefined;
-  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), ...(devices ? { devices } : {}), workspace: validateWorkspace(value.workspace) };
+  // An unreadable project only loses grouping, so it is dropped rather than failing the list.
+  const project = typeof value.project === "string" && safeId.test(value.project) ? value.project : undefined;
+  return { sessionId, title, createdAt, headEntryId, etag, leaseHolder, leaseExpiresAt, ...(updatedAt ? { updatedAt } : {}), ...(devices ? { devices } : {}), ...(project ? { project } : {}), workspace: validateWorkspace(value.workspace) };
 }
 
 export function validateSessionResponse(value: unknown, options: { partial?: boolean } = {}): SessionResponse {

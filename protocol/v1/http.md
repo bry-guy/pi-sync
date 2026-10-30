@@ -27,7 +27,8 @@ last `pi-project` custom entry. The server stores it and reports it in
 | GET | `/v1/health` | status, `buildId` (source commit), protocol and lease timing |
 | GET | `/v1/sessions/{id}/wait?etag=E&holder=H` | long-poll, no lease: returns `{etag, leaseHolder, changed}` as soon as the etag or lease holder (empty when none) differs from the query, or with `changed:false` after about 25 s; older servers answer 404 and clients keep plain polling |
 | GET | `/v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&groupBy=model,device` | token usage rows; `groupBy` (any of date, provider, model, device, repository) sums the other dimensions away; `{date, provider, model, device, repository, input, output, cacheRead, cacheWrite, cost, turns}`, kept forever |
-| GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by repository) |
+| GET | `/v1/sessions` | metadata, ETags, `updatedAt`, lease display, workspace pointers, `devices` (optionally filtered by `repository` and/or `project`) |
+| GET | `/v1/projects` | `{projects: [{name, sessions, lastActive}]}`, one per distinct session `project`, sorted by name |
 | POST | `/v1/sessions` | create an enrolled canonical snapshot (`201`) |
 | GET | `/v1/sessions/:id` | complete snapshot and ETag without taking a lease (older clients) |
 | POST | `/v1/sessions/:id/lease` | acquire lease and return complete snapshot |

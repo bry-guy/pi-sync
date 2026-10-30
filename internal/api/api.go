@@ -60,6 +60,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSessions(w, r)
 		return
 	}
+	if r.URL.Path == "/v1/projects" {
+		s.listProjects(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/sessions/") {
 		s.handleSession(w, r)
 		return
@@ -80,9 +84,13 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session store is unavailable", nil)
 			return
 		}
+		project := r.URL.Query().Get("project")
 		sessions := make([]metadata, 0, len(records))
 		for _, record := range records {
 			if scoped && session.RepositoryIdentity(record.Envelope.Workspace) != repository {
+				continue
+			}
+			if project != "" && record.Envelope.Project != project {
 				continue
 			}
 			sessions = append(sessions, s.metadata(record))
@@ -545,6 +553,46 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, id string) {
 		"etag":          record.ETag,
 		"count":         record.Count,
 	})
+}
+
+// listProjects names every project that has a synced conversation, derived from session metadata.
+func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method is not supported", nil)
+		return
+	}
+	records, err := s.store.List()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "store_unavailable", "session store is unavailable", nil)
+		return
+	}
+	type project struct {
+		Name       string     `json:"name"`
+		Sessions   int        `json:"sessions"`
+		LastActive *time.Time `json:"lastActive,omitempty"`
+	}
+	byName := map[string]*project{}
+	for _, record := range records {
+		name := record.Envelope.Project
+		if name == "" {
+			continue
+		}
+		entry := byName[name]
+		if entry == nil {
+			entry = &project{Name: name}
+			byName[name] = entry
+		}
+		entry.Sessions++
+		if updated := record.UpdatedAt; !updated.IsZero() && (entry.LastActive == nil || updated.After(*entry.LastActive)) {
+			entry.LastActive = &updated
+		}
+	}
+	projects := make([]project, 0, len(byName))
+	for _, entry := range byName {
+		projects = append(projects, *entry)
+	}
+	sort.Slice(projects, func(i, j int) bool { return projects[i].Name < projects[j].Name })
+	s.writeJSON(w, http.StatusOK, map[string]any{"formatVersion": session.FormatVersion, "projects": projects})
 }
 
 func requestedRepository(r *http.Request) (string, bool, error) {

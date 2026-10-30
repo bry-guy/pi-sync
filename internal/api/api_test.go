@@ -538,6 +538,43 @@ func TestHTTPListReportsProject(t *testing.T) {
 	if len(list.Sessions) != 1 || list.Sessions[0].Project != "pi-web-ecosystem" {
 		t.Fatalf("list must report the project: %+v", list.Sessions)
 	}
+	other := apiEnvelope()
+	other.SessionID = "session-unrelated"
+	body, _ = json.Marshal(other)
+	unrelated, err := http.Post(router.URL+"/v1/sessions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated.Body.Close()
+	filtered, err := http.Get(router.URL + "/v1/sessions?project=pi-web-ecosystem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list.Sessions = nil
+	if err := json.NewDecoder(filtered.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	filtered.Body.Close()
+	if len(list.Sessions) != 1 {
+		t.Fatalf("project filter must drop other sessions: %+v", list.Sessions)
+	}
+	projects, err := http.Get(router.URL + "/v1/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projectList struct {
+		Projects []struct {
+			Name     string `json:"name"`
+			Sessions int    `json:"sessions"`
+		} `json:"projects"`
+	}
+	if err := json.NewDecoder(projects.Body).Decode(&projectList); err != nil {
+		t.Fatal(err)
+	}
+	projects.Body.Close()
+	if len(projectList.Projects) != 1 || projectList.Projects[0].Name != "pi-web-ecosystem" || projectList.Projects[0].Sessions != 1 {
+		t.Fatalf("projects must list each named project once: %+v", projectList.Projects)
+	}
 	envelope.Project = "bad name/with slash"
 	envelope.SessionID = "session-2"
 	body, _ = json.Marshal(envelope)

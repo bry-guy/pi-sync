@@ -77,45 +77,65 @@ const out = async (cwd: string, args: string[]) => {
 };
 
 // behind: another device shared newer work on this branch that this checkout has not taken; nothing is overwritten.
-export type ShareResult = { checkout: string; branch?: string; result: "unchanged" | "pushed" | "cleared" | "behind" | "failed"; reason?: string };
+export type ShareResult = { repo: string; checkout: string; branch?: string; result: "unchanged" | "pushed" | "cleared" | "behind" | "skipped" | "failed"; reason?: string };
 
 /**
  * Pushes one checkout's work to its project ref when it changed since the snapshot this repository last pushed or
  * received, or deletes the ref once everything is committed and pushed. Both only if no other device replaced the
  * ref since (compare-and-swap through --force-with-lease), so unseen work from another device is never overwritten.
  */
-export async function shareCheckout(cwd: string, project: Project, device: string): Promise<ShareResult> {
+export async function shareCheckout(cwd: string, project: Project, device: string, repo = cwd, skip?: (branch: string) => boolean): Promise<ShareResult> {
+  const name = repo.slice(repo.lastIndexOf(sep) + 1);
+  const r = (result: Omit<ShareResult, "repo" | "checkout">): ShareResult => ({ repo: name, checkout: cwd, ...result });
   const branch = await out(cwd, ["symbolic-ref", "--short", "HEAD"]);
-  if (!branch) return { checkout: cwd, result: "unchanged" }; // detached: nothing to name it by
+  if (!branch) return r({ result: "unchanged" }); // detached: nothing to name it by
+  if (skip?.(branch)) return r({ branch, result: "skipped" });
   const ref = projectRef(project.id, branch);
   const known = await out(cwd, ["rev-parse", "--verify", "--quiet", ref]);
   if (known) {
     const [tree, knownTree, head, knownBase] = await Promise.all([workingTree(cwd), treeOf(cwd, known), out(cwd, ["rev-parse", "HEAD"]), out(cwd, ["rev-parse", `${known}^`])]);
-    if (tree && tree === knownTree && head === knownBase) return { checkout: cwd, branch, result: "unchanged" };
+    if (tree && tree === knownTree && head === knownBase) return r({ branch, result: "unchanged" });
   }
   const snapshot = await captureWorkspace(cwd, `Device: ${device}`);
-  if (snapshot.kind === "skipped") return { checkout: cwd, branch, result: "failed", reason: snapshot.reason };
+  if (snapshot.kind === "skipped") return r({ branch, result: "failed", reason: snapshot.reason });
   if (snapshot.kind === "clean") {
-    if (!known) return { checkout: cwd, branch, result: "unchanged" };
+    if (!known) return r({ branch, result: "unchanged" });
     const remote = await remoteName(cwd);
     if (remote) await git(cwd, ["push", "--no-verify", `--force-with-lease=${ref}:${known}`, remote, `:${ref}`], { timeoutMs: 30_000 });
     await git(cwd, ["update-ref", "-d", ref]);
-    return { checkout: cwd, branch, result: "cleared" };
+    return r({ branch, result: "cleared" });
   }
   const commit = snapshot.workspace.wip!.commit;
   const pushed = await git(cwd, ["push", "--no-verify", `--force-with-lease=${ref}:${known ?? ""}`, snapshot.remote, `${commit}:${ref}`], { timeoutMs: 60_000 });
-  if (pushed.code !== 0 && /stale info|rejected/.test(pushed.stderr)) return { checkout: cwd, branch, result: "behind", reason: "another device shared newer changes on this branch; /sync code brings them" };
-  if (pushed.code !== 0) return { checkout: cwd, branch, result: "failed", reason: pushed.stderr.trim().split("\n").at(-1) };
+  if (pushed.code !== 0 && /stale info|rejected/.test(pushed.stderr)) return r({ branch, result: "behind", reason: "another device shared newer changes on this branch; /sync code brings them" });
+  if (pushed.code !== 0) return r({ branch, result: "failed", reason: pushed.stderr.trim().split("\n").at(-1) });
   await git(cwd, ["update-ref", ref, commit]);
-  return { checkout: cwd, branch, result: "pushed" };
+  return r({ branch, result: "pushed" });
 }
 
-/** Shares every checkout of every repository in the project that `allowed` permits. */
-export async function shareProject(project: Project, device: string, allowed: (repo: string) => Promise<boolean>): Promise<ShareResult[]> {
+/**
+ * Shares every checkout of every repository in the project that `allowed` permits, then withdraws snapshots of
+ * branches this machine shared or received that no longer have a checkout here (a removed worktree, a deleted
+ * branch), so other machines do not recreate them. Withdrawing is compare-and-swap like sharing.
+ */
+export async function shareProject(project: Project, device: string, allowed: (repo: string) => Promise<boolean>, skip?: (repo: string, branch: string) => boolean): Promise<ShareResult[]> {
   const results: ShareResult[] = [];
+  const prefix = `refs/pi-projects/${project.id}/`;
   for (const repo of projectRepos(project)) {
     if (!(await allowed(repo))) continue;
-    for (const checkout of await checkouts(repo, project)) results.push(await shareCheckout(checkout.path, project, device));
+    const here = await checkouts(repo, project);
+    for (const checkout of here) results.push(await shareCheckout(checkout.path, project, device, repo, skip && ((branch) => skip(repo, branch))));
+    const known = ((await out(repo, ["for-each-ref", "--format=%(refname) %(objectname)", prefix])) ?? "").split("\n").filter(Boolean);
+    for (const line of known) {
+      const [ref, sha] = line.split(" ") as [string, string];
+      const branch = ref.slice(prefix.length);
+      if (here.some((item) => item.branch === branch)) continue;
+      const remote = await remoteName(repo);
+      const removed = remote ? await git(repo, ["push", "--no-verify", `--force-with-lease=${ref}:${sha}`, remote, `:${ref}`], { timeoutMs: 30_000 }) : undefined;
+      // Already gone or replaced by another device: either way it is no longer this machine's to withdraw.
+      if (!removed || removed.code === 0 || /stale info|rejected|unable to delete/.test(removed.stderr)) await git(repo, ["update-ref", "-d", ref]);
+      results.push({ repo: repo.slice(repo.lastIndexOf(sep) + 1), checkout: repo, branch, result: removed && removed.code !== 0 && !/stale info|rejected|unable to delete/.test(removed.stderr) ? "failed" : "cleared" });
+    }
   }
   return results;
 }
@@ -159,23 +179,22 @@ export async function arriveProject(project: Project, options: { force?: boolean
       return fetchedMain;
     };
     const here = await checkouts(repo, project);
-    // Deleted on the remote: the other device committed and pushed. A checkout still holding exactly that snapshot catches up.
+    // Deleted on the remote: the other device committed and pushed (or withdrew it). When this checkout's files are
+    // exactly the pushed branch tip, move HEAD there (nothing changes on disk); otherwise its work is its own now.
     for (const [branch, known] of localRefs) {
       if (remoteRefs.has(branch)) continue;
-      const checkout = here.find((item) => item.branch === branch);
       const ref = projectRef(project.id, branch);
-      if (!checkout) { await git(repo, ["update-ref", "-d", ref]); continue; }
-      const tree = await workingTree(checkout.path);
-      if (tree !== (await treeOf(checkout.path, known))) { await git(repo, ["update-ref", "-d", ref]); continue; } // edited here since: this device's own work now
-      if (!(await fetchMain())) continue;
-      const head = await out(checkout.path, ["rev-parse", "HEAD"]);
-      if (tree !== (head ? await treeOf(checkout.path, head) : undefined)) {
-        const stashed = await git(checkout.path, ["stash", "push", "--include-untracked", "-m", `pi-sync: ${branch} changes the other device has committed`], { timeoutMs: 60_000 });
-        if (stashed.code !== 0) continue;
+      const checkout = here.find((item) => item.branch === branch);
+      if (checkout && (await workingTree(checkout.path)) === (await treeOf(checkout.path, known)) && (await fetchMain())) {
+        const tip = await out(checkout.path, ["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${branch}`]);
+        const head = await out(checkout.path, ["rev-parse", "HEAD"]);
+        if (tip && head && tip !== head && (await git(checkout.path, ["merge-base", "--is-ancestor", head, tip])).code === 0
+          && (await treeOf(checkout.path, tip)) === (await workingTree(checkout.path))
+          && (await git(checkout.path, ["reset", "--quiet", "--mixed", tip])).code === 0) {
+          results.push({ repo: name, branch, checkout: checkout.path, result: "settled", message: `${name}/${branch}: the other device committed and pushed its changes; this checkout now matches it.` });
+        }
       }
-      await git(checkout.path, ["merge", "--ff-only", "--quiet", `refs/remotes/${remote}/${branch}`]);
       await git(repo, ["update-ref", "-d", ref]);
-      results.push({ repo: name, branch, checkout: checkout.path, result: "settled", message: `${name}/${branch}: the other device committed its changes; updated here (the uncommitted copy is in git stash).` });
     }
     for (const [branch, sha] of remoteRefs) {
       if (localRefs.get(branch) === sha) continue;

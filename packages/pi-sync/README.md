@@ -167,8 +167,9 @@ worktrees under `worktrees/<repo>/<branch>`, and lays the changes onto
 checkouts that are clean (or hold only the previous snapshot) and at or behind
 the snapshot's base. Anything else is reported; `/sync code` brings it after
 asking, stashing local changes first. When the other device commits and
-pushes, its snapshot is deleted and an unchanged copy here is stashed and
-fast-forwarded. `/sync code on|off` applies to every repository in the
+pushes, its snapshot is deleted, and a copy here whose files already match the
+pushed tip moves to it (nothing changes on disk). Removing a worktree or branch
+withdraws its snapshot, so other machines do not recreate it. `/sync code on|off` applies to every repository in the
 project. Commits and pushes stay yours. Edit a branch on one machine at a time.
 
 Background runs from pi-background enroll and hold the lease like turns typed

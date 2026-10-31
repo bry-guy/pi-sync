@@ -78,8 +78,43 @@ test("project code: a worktree's work arrives in a new worktree; a dirty checkou
   const settled = await arriveProject(web.project);
   assert.equal(settled.find((item) => item.branch === "feat").result, "settled");
   assert.equal(git(webFeat, "rev-parse", "HEAD"), git(feat, "rev-parse", "HEAD"));
-  assert.equal(git(webFeat, "status", "--porcelain"), "");
+  assert.equal(git(webFeat, "status", "--porcelain"), "", "files already matched the pushed tip: nothing changed on disk, nothing stashed");
   assert.equal(existsSync(join(webFeat, "new.txt")), true);
+  assert.doesNotMatch(git(web.app, "stash", "list"), /feat/);
+});
+
+test("project code: a removed worktree's snapshot is withdrawn, so other machines do not recreate it", async () => {
+  const { laptop, web } = setup();
+  const wt = join(laptop.root, "worktrees", "app", "feature", "x");
+  git(laptop.app, "worktree", "add", "-q", "-b", "feature/x", wt);
+  writeFileSync(join(wt, "x.txt"), "x\n");
+  const shared = await shareProject(laptop.project, "macbook", allowed);
+  assert.equal(shared.find((item) => item.branch === "feature/x").result, "pushed", "a branch with a slash shares");
+  assert.match(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/*"), /refs\/pi-projects\/p1\/feature\/x/);
+
+  // Laptop drops the worktree (and branch) with the work still uncommitted.
+  git(laptop.app, "worktree", "remove", "--force", wt);
+  git(laptop.app, "branch", "-D", "feature/x");
+  const withdrawn = await shareProject(laptop.project, "macbook", allowed);
+  assert.equal(withdrawn.find((item) => item.branch === "feature/x").result, "cleared");
+  assert.equal(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/*"), "");
+  await arriveProject(web.project);
+  assert.equal(existsSync(join(web.root, "worktrees", "app", "feature", "x")), false);
+});
+
+test("project code: a branch with a slash arrives in a nested worktree", async () => {
+  const { laptop, web } = setup();
+  const wt = join(laptop.root, "worktrees", "app", "feature", "y");
+  git(laptop.app, "worktree", "add", "-q", "-b", "feature/y", wt);
+  writeFileSync(join(wt, "y.txt"), "y\n");
+  await shareProject(laptop.project, "macbook", allowed);
+  const arrived = await arriveProject(web.project);
+  assert.equal(arrived.find((item) => item.branch === "feature/y").result, "created");
+  const webWt = join(web.root, "worktrees", "app", "feature", "y");
+  assert.equal(readFileSync(join(webWt, "y.txt"), "utf8"), "y\n");
+  // Web holds only what it received: sharing pushes nothing, withdraws nothing.
+  const again = await shareProject(web.project, "web", allowed);
+  assert.equal(again.find((item) => item.branch === "feature/y").result, "unchanged");
 });
 
 test("project code: only folders inside a project with an id count", () => {

@@ -7,7 +7,7 @@ import { git, oversized, remoteName, treeOf, workingTree } from "./code.js";
  *
  * A pi project folder holds several repositories (`repos/<name>`) and their worktrees (`worktrees/<name>/...`). A
  * conversation there may touch any of them, so the checkouts themselves are mirrored across machines, not per
- * conversation: each has a ref `refs/pi-projects/<project id>/<key>` on its repository's own remote holding its
+ * conversation: each has a ref `refs/pi-checkouts/<project id>/<key>` on its repository's own remote holding its
  * branch, commit and uncommitted work (a commit on top of HEAD). After each turn changed checkouts are pushed and
  * removed worktrees deleted; arrival creates, removes and updates checkouts to match, but only where nothing here
  * can be lost (otherwise it reports, and /sync code brings it after asking). Every push and delete is
@@ -20,7 +20,7 @@ export interface Project { root: string; id: string; name: string }
 
 /** A checkout's ref: `key` is `repo` (the main checkout) or `wt/<path under worktrees/<repo>/>`. */
 export function projectRef(projectId: string, key: string): string {
-  return `refs/pi-projects/${projectId}/${key}`;
+  return `refs/pi-checkouts/${projectId}/${key}`;
 }
 
 /** The pi project containing `cwd`: the first folder under `projectsDir` that has a project.json with an id. */
@@ -56,7 +56,9 @@ export function projectRepos(project: Project): string[] {
     .sort();
 }
 
-interface Checkout { path: string; key: string }
+// missing: listed by git but its folder is gone or unreadable (prunable); it still counts as present, so its ref
+// is neither withdrawn (other machines keep it) nor shared.
+interface Checkout { path: string; key: string; missing?: boolean }
 
 /**
  * Where a checkout sits in the project, as its ref key: `repo` for `repos/<name>`, `wt/<path>` for
@@ -76,18 +78,23 @@ const pathOf = (project: Project, repo: string, key: string) => key === "repo" ?
 /** How a checkout is named in messages: its branch, or where it is. */
 const labelOf = (key: string, branch?: string) => branch ?? (key === "repo" ? "main checkout (detached)" : key.slice(3));
 
-/** A repository's checkouts inside the project (its main checkout and worktrees under worktrees/<name>/). */
-export async function checkouts(repo: string, project: Project): Promise<Checkout[]> {
+/**
+ * A repository's checkouts inside the project (its main checkout and worktrees under worktrees/<name>/), or
+ * undefined when git cannot list them: callers then leave the repository alone, since a short list would read as
+ * worktrees removed here and remove them everywhere.
+ */
+export async function checkouts(repo: string, project: Project): Promise<Checkout[] | undefined> {
   const listed = await git(repo, ["worktree", "list", "--porcelain"]);
-  if (listed.code !== 0) return [{ path: repo, key: "repo" }];
+  if (listed.code !== 0 || !listed.stdout.trim()) return undefined;
   const found: Checkout[] = [];
   for (const block of listed.stdout.split("\n\n")) {
     const path = /^worktree (.+)$/m.exec(block)?.[1];
-    if (!path || /^prunable/m.test(block)) continue;
+    if (!path) continue;
     const key = keyOf(project, repo, path);
-    if (key) found.push({ path, key });
+    if (!key) continue;
+    found.push(/^prunable/m.test(block) || !existsSync(path) ? { path, key, missing: true } : { path, key });
   }
-  return found;
+  return found.some((item) => item.key === "repo") ? found : undefined;
 }
 
 const out = async (cwd: string, args: string[]) => {
@@ -96,9 +103,9 @@ const out = async (cwd: string, args: string[]) => {
 };
 
 const refsOf = async (repo: string, project: Project) => new Map(
-  ((await out(repo, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/pi-projects/${project.id}/`])) ?? "").split("\n").filter(Boolean).map((line) => {
+  ((await out(repo, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/pi-checkouts/${project.id}/`])) ?? "").split("\n").filter(Boolean).map((line) => {
     const [ref, sha] = line.split(" ") as [string, string];
-    return [ref.slice(`refs/pi-projects/${project.id}/`.length), sha] as const;
+    return [ref.slice(`refs/pi-checkouts/${project.id}/`.length), sha] as const;
   }),
 );
 
@@ -160,14 +167,19 @@ export async function shareProject(project: Project, device: string, allowed: (r
     if (!remote) continue;
     const name = repo.slice(repo.lastIndexOf(sep) + 1);
     const here = await checkouts(repo, project);
+    if (!here) {
+      results.push({ repo: name, key: "", checkout: repo, result: "failed", reason: "git could not list its worktrees" });
+      continue;
+    }
     const known = await refsOf(repo, project);
     for (const checkout of here) {
+      if (checkout.missing) continue;
       if (skip?.(repo, checkout.key)) results.push({ repo: name, key: checkout.key, checkout: checkout.path, result: "skipped" });
       else results.push(await shareCheckout(repo, checkout, project, device, known.get(checkout.key), remote));
     }
     for (const [key, sha] of known) {
       if (here.some((item) => item.key === key)) continue;
-      const ref = `refs/pi-projects/${project.id}/${key}`;
+      const ref = `refs/pi-checkouts/${project.id}/${key}`;
       const removed = await git(repo, ["push", "--no-verify", `--force-with-lease=${ref}:${sha}`, remote, `:${ref}`], { timeoutMs: 30_000 });
       // Refused: another device changed it since, so it is theirs now and arrives back here; either way not ours to track.
       const refused = removed.code !== 0 && /stale info|rejected/.test(removed.stderr);
@@ -201,7 +213,7 @@ export async function arriveProject(project: Project, options: { force?: boolean
     const name = repo.slice(repo.lastIndexOf(sep) + 1);
     const remote = await remoteName(repo);
     if (!remote) continue;
-    const prefix = `refs/pi-projects/${project.id}/`;
+    const prefix = `refs/pi-checkouts/${project.id}/`;
     const listed = await git(repo, ["ls-remote", remote, `${prefix}*`], { timeoutMs: 30_000 });
     if (listed.code !== 0) {
       results.push({ repo: name, key: "", result: "failed", message: listed.stderr.trim().split("\n").at(-1) });
@@ -209,7 +221,12 @@ export async function arriveProject(project: Project, options: { force?: boolean
     }
     const remoteRefs = new Map(listed.stdout.split("\n").map((line) => line.split("\t")).filter(([sha, ref]) => sha && ref?.startsWith(prefix)).map(([sha, ref]) => [ref!.slice(prefix.length).trim(), sha!.trim()] as const).filter(([key]) => validKey(key)));
     const localRefs = await refsOf(repo, project);
-    const here = await checkouts(repo, project);
+    const listedHere = await checkouts(repo, project);
+    if (!listedHere) {
+      results.push({ repo: name, key: "", result: "failed", message: `${name}: git could not list its worktrees; left alone.` });
+      continue;
+    }
+    const here = listedHere.filter((item) => !item.missing);
 
     for (const [key, known] of localRefs) {
       if (remoteRefs.has(key) || !validKey(key)) continue;
@@ -221,7 +238,7 @@ export async function arriveProject(project: Project, options: { force?: boolean
         const state = await stateOf(checkout.path);
         const clean = !!state.tree && !!state.head && state.tree === (await treeOf(checkout.path, state.head));
         // Nothing here to lose: as the other device last saw it, or clean on a branch (its commits stay on the branch).
-        if (holds(state, snap) || (clean && !!state.branch)) {
+        if ((holds(state, snap) || (clean && !!state.branch)) && (await onBranch(checkout.path, state))) {
           const removed = await git(repo, ["worktree", "remove", "--force", checkout.path]);
           if (removed.code === 0) {
             removeEmptyParents(checkout.path, join(project.root, "worktrees", name));
@@ -237,7 +254,7 @@ export async function arriveProject(project: Project, options: { force?: boolean
     for (const [key, sha] of remoteRefs) {
       if (localRefs.get(key) === sha) continue;
       const ref = projectRef(project.id, key);
-      const incoming = `refs/pi-projects-incoming/${project.id}/${key}`;
+      const incoming = `refs/pi-checkouts-incoming/${project.id}/${key}`;
       const fetched = await git(repo, ["fetch", "--no-tags", "--quiet", remote, `+${ref}:${incoming}`], { timeoutMs: 60_000 });
       if (fetched.code !== 0) {
         results.push({ repo: name, key, result: "failed", message: fetched.stderr.trim().split("\n").at(-1) });
@@ -290,6 +307,7 @@ async function arriveCheckout(project: Project, repo: string, key: string, sha: 
   }
 
   const state = await stateOf(checkout);
+  if (!(await onBranch(checkout, state))) return r("pending", checkout, `${label}: ${checkout} has a detached commit on no branch; put it on a branch, then run /sync code.`);
   if (holds(state, snap)) {
     await git(repo, ["update-ref", projectRef(project.id, key), sha]);
     return created ? r("created", checkout, `${label}: new worktree from ${from}.`) : r("matches", checkout);
@@ -299,6 +317,9 @@ async function arriveCheckout(project: Project, repo: string, key: string, sha: 
   if (!fitsBranch) return r("pending", checkout, diverged);
   if (!clean && !asLeft && !force) return r("pending", checkout, `${label} has newer changes from ${from}; run /sync code to bring them here.`);
 
+  // Re-read right before changing anything: an agent may be writing here.
+  const now = await stateOf(checkout);
+  if (now.tree !== state.tree || now.head !== state.head || now.branch !== state.branch) return r("pending", checkout, `${label} changed while syncing; it is tried again later.`);
   let note = "";
   if (!clean && !asLeft) {
     const stashed = await git(checkout, ["stash", "push", "--include-untracked", "-m", `pi-sync: local changes before bringing ${label} from ${from}`], { timeoutMs: 60_000 });
@@ -317,6 +338,12 @@ async function arriveCheckout(project: Project, repo: string, key: string, sha: 
   }
   await git(repo, ["update-ref", projectRef(project.id, key), sha]);
   return r(created ? "created" : "applied", checkout, `${label}: now matches ${from}${created ? " (new worktree)" : ""}.${note}`);
+}
+
+/** HEAD is on a branch, or a detached commit some branch contains: moving away from it loses no commit. */
+async function onBranch(cwd: string, state: State): Promise<boolean> {
+  if (state.branch || !state.head) return true;
+  return !!(await out(cwd, ["for-each-ref", "--count=1", "--contains", state.head, "--format=%(refname)", "refs/heads/"]));
 }
 
 function removeEmptyParents(path: string, stop: string) {

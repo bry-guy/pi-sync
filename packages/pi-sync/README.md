@@ -159,7 +159,7 @@ hosts can list a project's conversations. pi-projects keeps `project.json` and
 
 A project's checkouts are mirrored across machines, not per conversation.
 Each checkout (`repos/<repo>` and every worktree under `worktrees/<repo>/`)
-has a ref on its repository's remote, `refs/pi-projects/<project id>/repo` or
+has a ref on its repository's remote, `refs/pi-checkouts/<project id>/repo` or
 `.../wt/<path>`, holding its branch, commits (pushed or not) and uncommitted
 changes. After each turn (and between turns) changed checkouts are pushed, and
 worktrees removed here have their ref deleted. Arrival makes this machine
@@ -173,7 +173,8 @@ changes a checkout only when it is clean or exactly as last synced, and its
 branch has no commits the incoming one lacks; anything else is reported, and
 `/sync code` brings it after asking, stashing local changes first. A worktree
 removed elsewhere that has changes here is kept and shared again. Removing a
-worktree keeps its branch. `/sync code on|off` applies to every repository in
+worktree keeps its branch. A worktree whose folder is missing is left alone everywhere, and arrival waits while a
+turn runs in the project. `/sync code on|off` applies to every repository in
 the project. Pushing branches to their upstream stays yours. Edit a checkout
 on one machine at a time.
 

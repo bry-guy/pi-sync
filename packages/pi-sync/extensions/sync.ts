@@ -181,6 +181,9 @@ const pidAlive = (pid: number): boolean => {
 // branches whose push was refused because another device shared newer work; they are not pushed again until arrival.
 const projectRuns = new Map<string, Promise<unknown>>();
 const projectBehind = new Map<string, Set<string>>();
+// Turns running in each project folder in this process: arrival changes checkouts only when none is (an agent may
+// be editing any repository there).
+const projectTurns = new Map<string, number>();
 const inProjectOrder = <T>(root: string, run: () => Promise<T>): Promise<T> => {
   const next = (projectRuns.get(root) ?? Promise.resolve()).catch(() => undefined).then(run);
   projectRuns.set(root, next.catch(() => undefined));
@@ -631,7 +634,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       const firstPushes = [...new Set(results.filter((item) => item.result === "pushed" && !autoShareNoticed.has(`project:${item.repo}`)).map((item) => item.repo))];
       if (firstPushes.length && config.code === "auto") {
         for (const repo of firstPushes) autoShareNoticed.add(`project:${repo}`);
-        notify(ctx, `Sharing checkouts (branches, unpushed commits, uncommitted changes) of ${firstPushes.join(", ")} to ${firstPushes.length > 1 ? "their remotes" : "its remote"} (refs/pi-projects/…); anyone who can read a remote can read it. /sync code off stops it for this project.`, "info");
+        notify(ctx, `Sharing checkouts (branches, unpushed commits, uncommitted changes) of ${firstPushes.join(", ")} to ${firstPushes.length > 1 ? "their remotes" : "its remote"} (refs/pi-checkouts/…); anyone who can read a remote can read it. /sync code off stops it for this project.`, "info");
       }
       const refused = results.filter((item) => item.result === "behind");
       if (refused.length) {
@@ -820,6 +823,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   let lastProjectArrival = 0;
   const arriveProjectCode = async (ctx: ExtensionContext, project: Project, options: { force?: boolean; ask?: boolean; now?: boolean }) => {
     const failId = (await bindingFor(ctx.sessionManager.getSessionId()))?.canonicalSessionId;
+    if (!options.force && (projectTurns.get(project.root) ?? 0) > 0) return;
     if (options.ask === false) {
       // The idle poll checks every repository's remote (one fetch each, maybe an SSH prompt): every 5 minutes at most.
       if (failId && idleBackedOff(failId)) return;
@@ -1688,6 +1692,22 @@ let counted = binding;
     return typeof marker?.data?.device === "string" ? marker.data.device : undefined;
   };
 
+  // This session's turn in a project folder, counted in projectTurns while it runs.
+  let turnRoot: string | undefined;
+  const endProjectTurn = () => {
+    if (!turnRoot) return;
+    const left = (projectTurns.get(turnRoot) ?? 1) - 1;
+    if (left > 0) projectTurns.set(turnRoot, left);
+    else projectTurns.delete(turnRoot);
+    turnRoot = undefined;
+  };
+  pi.on("agent_start", async (_event, ctx) => {
+    endProjectTurn();
+    turnRoot = projectOf(ctx.cwd)?.root;
+    if (turnRoot) projectTurns.set(turnRoot, (projectTurns.get(turnRoot) ?? 0) + 1);
+  });
+  pi.on("agent_end", async () => endProjectTurn());
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (!lease) return;
     const previous = lastDevice(ctx);
@@ -1727,6 +1747,7 @@ let counted = binding;
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    endProjectTurn();
     await finishTurn(ctx);
     await autoEnroll(ctx).catch(() => undefined);
   });
@@ -1758,6 +1779,7 @@ let counted = binding;
   pi.on("session_compact_failed", async (_event, ctx) => finishTurn(ctx));
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    endProjectTurn();
     stopPoll();
     await finishTurn(ctx);
     // Leaving: share hand edits made since the last turn, without holding up exit for long.

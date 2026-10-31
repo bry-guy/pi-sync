@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -130,7 +130,7 @@ test("project code: removing a worktree removes it everywhere, unless it has cha
   assert.equal(back["wt/feature/y"].result, "created");
   assert.equal(readFileSync(join(y, "y.txt"), "utf8"), "web edit\n");
   assert.equal(existsSync(x), false, "x stays removed");
-  assert.equal(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/wt/feature/x"), "");
+  assert.equal(git(laptop.app, "ls-remote", "origin", "refs/pi-checkouts/p1/wt/feature/x"), "");
 });
 
 test("project code: switching the main checkout's branch follows when the checkout is clean", async () => {
@@ -159,4 +159,33 @@ test("project code: machines that pulled at different times do not flag each oth
   assert.equal(byKey(await shareProject(web.project, "web", allowed)).repo.result, "pushed");
   assert.equal(byKey(await arriveProject(laptop.project)).repo.result, "applied", "and the laptop catches up");
   assert.equal(git(laptop.app, "rev-parse", "HEAD"), git(web.app, "rev-parse", "HEAD"));
+});
+
+test("project code: a worktree whose folder is missing is not removed everywhere", async () => {
+  const { laptop, web } = setup();
+  const x = join(laptop.root, "worktrees", "app", "x");
+  git(laptop.app, "worktree", "add", "-q", "-b", "x", x);
+  await shareProject(laptop.project, "macbook", allowed);
+  await arriveProject(web.project);
+  rmSync(x, { recursive: true, force: true }); // unmounted, half-moved: git lists it as prunable
+  const shared = byKey(await shareProject(laptop.project, "macbook", allowed));
+  assert.equal(shared["wt/x"], undefined, "neither shared nor withdrawn");
+  assert.notEqual(git(laptop.app, "ls-remote", "origin", "refs/pi-checkouts/p1/wt/x"), "");
+  await arriveProject(web.project);
+  assert.equal(existsSync(join(web.root, "worktrees", "app", "x")), true);
+});
+
+test("project code: a detached commit on no branch is never moved away from", async () => {
+  const { laptop, web } = setup();
+  await shareProject(laptop.project, "macbook", allowed);
+  await arriveProject(web.project);
+  git(web.app, "switch", "-q", "--detach");
+  writeFileSync(join(web.app, "d.txt"), "d\n");
+  git(web.app, "add", ".");
+  git(web.app, "commit", "-qm", "detached work");
+  const orphan = git(web.app, "rev-parse", "HEAD");
+  writeFileSync(join(laptop.app, "a.txt"), "laptop\n");
+  await shareProject(laptop.project, "macbook", allowed);
+  for (const force of [false, true]) assert.equal(byKey(await arriveProject(web.project, { force })).repo.result, "pending");
+  assert.equal(git(web.app, "rev-parse", "HEAD"), orphan);
 });

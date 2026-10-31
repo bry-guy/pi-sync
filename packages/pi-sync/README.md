@@ -157,26 +157,36 @@ in that folder's session list. The project name is also sent to the server, so
 hosts can list a project's conversations. pi-projects keeps `project.json` and
 `memory.md` in their own git repo; pi-sync never shares code from that repo.
 
-A project's checkouts are mirrored across machines, not per conversation.
-Each checkout (`repos/<repo>` and every worktree under `worktrees/<repo>/`)
-has a ref on its repository's remote, `refs/pi-checkouts/<project id>/repo` or
-`.../wt/<path>`, holding its branch, commits (pushed or not) and uncommitted
-changes. After each turn (and between turns) changed checkouts are pushed, and
-worktrees removed here have their ref deleted. Arrival makes this machine
-match: it creates worktrees added elsewhere, removes worktrees removed
-elsewhere, and moves checkouts to the other machine's branch, commits and
-changes.
+A project's checkouts sync across machines, not per conversation. Each
+checkout (`repos/<repo>` and every worktree under `worktrees/<repo>/`) has a
+ref on its repository's remote, `refs/pi-checkouts/<project id>/repo` or
+`.../wt/<path>`. The ref holds its branch, commits (pushed or not) and
+uncommitted changes as a commit on top of HEAD whose second parent is the
+previous state, so it is a history that only moves forward; a removed worktree
+is a commit marked `Removed: yes`. Every push is a compare-and-swap against
+what this machine last saw.
 
-Nothing is lost on the way. Every push and delete is a compare-and-swap, so it
-never replaces state from another device this machine has not taken. Arrival
-changes a checkout only when it is clean or exactly as last synced, and its
-branch has no commits the incoming one lacks; anything else is reported, and
-`/sync code` brings it after asking, stashing local changes first. A worktree
-removed elsewhere that has changes here is kept and shared again. Removing a
-worktree keeps its branch. A worktree whose folder is missing is left alone everywhere, and arrival waits while a
-turn runs in the project. `/sync code on|off` applies to every repository in
-the project. Pushing branches to their upstream stays yours. Edit a checkout
-on one machine at a time.
+Per checkout, a machine compares the state it last agreed with, its checkout
+now, and the remote's latest (fetched to `refs/pi-checkouts-theirs/...`):
+
+| here | other machines | what happens |
+|---|---|---|
+| unchanged | unchanged | nothing |
+| changed | unchanged | shared |
+| unchanged | changed | followed: created, removed, or moved to their branch, commits and changes |
+| changed | changed | **desynced**, unless one side is clean and the other contains it (pulled at different times) |
+
+Only the machine that runs into the conflict desyncs, and nothing on disk
+changes. It is recomputed on every check, so it clears as soon as either
+machine settles it. `/sync code` lists desynced checkouts: take the other
+machine's version (your changes go to `git stash`, commits it lacks to a
+`<branch>.mine-<time>` branch), keep mine (replaces the version you were shown,
+and only that one), or stop syncing that checkout here (`git config
+pi-checkouts.<id>/<key>.stopped`). The status line counts desynced checkouts.
+Checkouts never change while a turn runs in the project, and a worktree whose
+folder is missing is left alone everywhere. Removing a worktree keeps its
+branch; deleting a branch does not sync. `/sync code on|off` applies to every
+repository in the project. Pushing branches upstream stays yours.
 
 Background runs from pi-background enroll and hold the lease like turns typed
 in the terminal.

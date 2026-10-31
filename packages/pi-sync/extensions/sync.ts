@@ -43,8 +43,9 @@ import {
   projectsDir,
   projectFor,
   projectRepos,
-  shareProject,
-  arriveProject,
+  syncProject,
+  resolveCheckout,
+  projectDesyncs,
   type Project,
   normalizeSessionFile,
   withoutLocalSettings,
@@ -177,10 +178,8 @@ const pidAlive = (pid: number): boolean => {
   }
 };
 
-// Per project folder, shared by every session in this process (pi-web runs many): one share run at a time, and the
-// branches whose push was refused because another device shared newer work; they are not pushed again until arrival.
+// Per project folder, shared by every session in this process (pi-web runs many): one checkout sync at a time.
 const projectRuns = new Map<string, Promise<unknown>>();
-const projectBehind = new Map<string, Set<string>>();
 // Turns running in each project folder in this process: arrival changes checkouts only when none is (an agent may
 // be editing any repository there).
 const projectTurns = new Map<string, number>();
@@ -259,9 +258,13 @@ export default function syncExtension(pi: ExtensionAPI) {
     remoteWork = { ctx, holder, timer };
   };
 
+  // Desynced checkouts of this session's project, shown after the sync status.
+  let desyncedCount = 0;
+  let statusText: string | undefined;
   const setStatus = (ctx: ExtensionContext | undefined, text?: string) => {
+    statusText = text;
     try {
-      if (ctx?.hasUI) ctx.ui.setStatus("pi-sync", text);
+      if (ctx?.hasUI) ctx.ui.setStatus("pi-sync", text && desyncedCount ? `${text} · ${desyncedCount} desynced` : text);
     } catch {
       // A replaced session invalidates its context; the new session sets its own status.
     }
@@ -606,7 +609,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
       }
     });
-    if (project) void shareProjectCode(ctx, project, held.binding.canonicalSessionId);
+    if (project) void syncProjectCode(ctx, project, { fetch: false, failId: held.binding.canonicalSessionId });
     else if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot).then(() => retryPushes(ctx, true)).catch(() => undefined);
     else void retryPushes(ctx, true).catch(() => undefined);
   };
@@ -614,47 +617,53 @@ export default function syncExtension(pi: ExtensionAPI) {
   const projectOf = (cwd: string): Project | undefined => projectFor(cwd, projectsDir(getAgentDir()));
   const projectNoticed = new Set<string>();
   /**
-   * Shares every repository and worktree of the project that may share code. `failId` is the conversation whose
+   * Syncs the project's checkouts (see syncProject): `fetch` asks the remotes for other machines' states, otherwise
+   * this only shares; checkouts change only when no turn runs in the project. `failId` is the conversation whose
    * background backoff counts failures (each may be a credential prompt).
    */
-  const shareProjectCode = (ctx: ExtensionContext, project: Project, failId?: string): Promise<unknown> =>
+  const syncProjectCode = (ctx: ExtensionContext, project: Project, options: { fetch: boolean; failId?: string; notifyAll?: boolean }): Promise<void> =>
     inProjectOrder(project.root, async () => {
       if (config.code === "off") return;
       const asked: string[] = [];
-      const behind = projectBehind.get(project.root) ?? new Set<string>();
-      const results = await shareProject(project, deviceLabel, async (repo) => {
-        const setting = await shareSetting(repo);
-        if (setting === undefined && config.code === "ask") asked.push(repo.slice(repo.lastIndexOf("/") + 1));
-        return setting ?? config.code === "auto";
-      }, (repo, key) => behind.has(`${repo}\0${key}`));
-      if (failId) {
-        if (results.some((item) => item.result === "failed")) idleFailed(failId);
-        else if (results.some((item) => item.result === "pushed" || item.result === "removed")) idleFailures.delete(failId);
+      const results = await syncProject(project, {
+        device: deviceLabel,
+        fetch: options.fetch,
+        apply: (projectTurns.get(project.root) ?? 0) === 0,
+        allowed: async (repo) => {
+          const setting = await shareSetting(repo);
+          if (setting === undefined && config.code === "ask") asked.push(repo.slice(repo.lastIndexOf("/") + 1));
+          return setting ?? config.code === "auto";
+        },
+      });
+      if (options.failId) {
+        if (results.some((item) => item.result === "failed")) idleFailed(options.failId);
+        else if (results.some((item) => item.result !== "unchanged")) idleFailures.delete(options.failId);
       }
-      const firstPushes = [...new Set(results.filter((item) => item.result === "pushed" && !autoShareNoticed.has(`project:${item.repo}`)).map((item) => item.repo))];
-      if (firstPushes.length && config.code === "auto") {
-        for (const repo of firstPushes) autoShareNoticed.add(`project:${repo}`);
-        notify(ctx, `Sharing checkouts (branches, unpushed commits, uncommitted changes) of ${firstPushes.join(", ")} to ${firstPushes.length > 1 ? "their remotes" : "its remote"} (refs/pi-checkouts/…); anyone who can read a remote can read it. /sync code off stops it for this project.`, "info");
-      }
-      const refused = results.filter((item) => item.result === "behind");
-      if (refused.length) {
-        const set = projectBehind.get(project.root) ?? new Set<string>();
-        for (const item of refused) set.add(`${join(project.root, "repos", item.repo)}\0${item.key}`);
-        projectBehind.set(project.root, set);
-        // Take the other device's work where that loses nothing; otherwise this reports it once.
-        setTimeout(() => void arriveCode(ctx, { ask: false, now: true }).catch(() => undefined), 0);
+      const firstShares = [...new Set(results.filter((item) => item.result === "shared" && !autoShareNoticed.has(`project:${item.repo}`)).map((item) => item.repo))];
+      if (firstShares.length && config.code === "auto") {
+        for (const repo of firstShares) autoShareNoticed.add(`project:${repo}`);
+        notify(ctx, `Syncing checkouts (branches, unpushed commits, uncommitted changes) of ${firstShares.join(", ")} through ${firstShares.length > 1 ? "their remotes" : "its remote"} (refs/pi-checkouts/…); anyone who can read a remote can read them. /sync code off stops it for this project.`, "info");
       }
       if (asked.length && !projectNoticed.has(`ask:${project.id}`)) {
         projectNoticed.add(`ask:${project.id}`);
-        notify(ctx, `Uncommitted code in ${asked.join(", ")} is not shared with your other devices. /sync code on shares it for every repository in this project.`, "info");
+        notify(ctx, `Checkouts of ${asked.join(", ")} are not synced with your other devices. /sync code on syncs every repository in this project.`, "info");
       }
-      for (const failed of results.filter((item) => item.result === "failed" || item.result === "behind")) {
-        const key = `fail:${failed.checkout}:${failed.reason}`;
-        if (projectNoticed.has(key)) continue;
+      for (const item of results) {
+        if (!item.message) continue;
+        const key = `${item.repo}:${item.key}:${item.result}:${item.message}`;
+        if (!options.notifyAll && projectNoticed.has(key)) continue;
         projectNoticed.add(key);
-        notify(ctx, `Could not share ${failed.checkout}${failed.branch ? ` (${failed.branch})` : ""}: ${failed.reason ?? "git failed"}.`, "warning");
+        notify(ctx, item.message, item.result === "failed" || item.result === "desynced" ? "warning" : "info");
       }
+      await refreshDesyncs(ctx, project);
     }).catch(() => undefined);
+
+  const refreshDesyncs = async (ctx: ExtensionContext, project: Project) => {
+    const count = (await projectDesyncs(project).catch(() => [])).filter((item) => item.message).length;
+    if (count === desyncedCount) return;
+    desyncedCount = count;
+    setStatus(ctx, statusText);
+  };
 
   /** The repository's own /sync code on|off wins; otherwise the configured default. */
   const shareEnabled = async (cwd: string): Promise<boolean> => config.code !== "off" && ((await shareSetting(cwd)) ?? config.code === "auto");
@@ -817,41 +826,44 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   /**
-   * Brings the project's shared code here: new worktrees and changes onto checkouts where nothing can be lost
-   * happen silently; the rest is reported once, and /sync code (force) brings it after asking, stashing local changes.
+   * Brings other machines' checkout states here (and shares this one's): at most every 5 minutes from the idle
+   * poll, unless `now`; never changes checkouts while a turn runs in the project.
    */
   let lastProjectArrival = 0;
   const arriveProjectCode = async (ctx: ExtensionContext, project: Project, options: { force?: boolean; ask?: boolean; now?: boolean }) => {
     const failId = (await bindingFor(ctx.sessionManager.getSessionId()))?.canonicalSessionId;
-    if (!options.force && (projectTurns.get(project.root) ?? 0) > 0) return;
     if (options.ask === false) {
-      // The idle poll checks every repository's remote (one fetch each, maybe an SSH prompt): every 5 minutes at most.
       if (failId && idleBackedOff(failId)) return;
       if (!options.now && Date.now() - lastProjectArrival < 5 * 60_000) return;
     }
     lastProjectArrival = Date.now();
-    let results = await inProjectOrder(project.root, () => arriveProject(project));
-    // Refused pushes wait for this: whatever it found, the next share may try again.
-    projectBehind.delete(project.root);
-    if (failId && results.some((item) => item.result === "failed")) idleFailed(failId);
-    const pending = results.filter((item) => item.result === "pending");
-    if (options.force && pending.length && ctx.hasUI) {
-      const ok = await ctx.ui.confirm(
-        "Bring the other device's code here?",
-        `${pending.map((item) => item.message).join("\n")}\n\nLocal uncommitted changes in those checkouts are stashed first (git stash list).`,
-      );
-      if (ok) results = [...results.filter((item) => item.result !== "pending"), ...(await inProjectOrder(project.root, () => arriveProject(project, { force: true })))];
+    await syncProjectCode(ctx, project, { fetch: true, failId, notifyAll: options.force });
+  };
+
+  /** /sync code in a project: sync now, then settle each desynced or stopped checkout as the user chooses. */
+  const resolveProjectCode = async (ctx: ExtensionCommandContext, project: Project) => {
+    if ((projectTurns.get(project.root) ?? 0) > 0) notify(ctx, "A turn is running in this project; checkouts change after it ends.", "info");
+    await arriveProjectCode(ctx, project, { force: true });
+    const open = await projectDesyncs(project);
+    if (!open.length) {
+      notify(ctx, "Every checkout in this project is in sync.", "info");
+      return;
     }
-    let reported = false;
-    for (const item of results) {
-      if (!item.message) continue;
-      const key = `arrive:${item.repo}:${item.key}:${item.result}:${item.message}`;
-      if (!options.force && projectNoticed.has(key)) continue;
-      projectNoticed.add(key);
-      reported = true;
-      notify(ctx, item.message, item.result === "failed" || item.result === "pending" ? "warning" : "info");
+    for (const item of open) {
+      if (!ctx.hasUI) {
+        notify(ctx, item.message ?? `${item.repo} ${item.key}: not synced on this machine.`, "warning");
+        continue;
+      }
+      const choices = item.stopped
+        ? ["Resume syncing", "Leave it"]
+        : ["Take the other machine's version", "Keep mine", "Stop syncing this checkout", "Leave it desynced"];
+      const picked = await ctx.ui.select(item.stopped ? `${item.repo} · ${item.key.replace(/^wt\//, "")}: not synced on this machine` : item.message!.replace(/ Nothing was changed\..*$/, ""), choices);
+      const choice = picked === choices[0] ? (item.stopped ? "resume" : "theirs") : !item.stopped && picked === choices[1] ? "mine" : !item.stopped && picked === choices[2] ? "stop" : undefined;
+      if (!choice) continue;
+      const result = await inProjectOrder(project.root, () => resolveCheckout(project, item.repo, item.key, choice, deviceLabel));
+      if (result.message) notify(ctx, result.message, result.result === "failed" || result.result === "desynced" ? "warning" : "info");
     }
-    if (options.force && !reported) notify(ctx, "This project's checkouts already have the latest shared code.", "info");
+    await refreshDesyncs(ctx, project);
   };
 
   /** Between turns, the device that wrote the latest turn keeps sharing hand edits (and clears the snapshot once pushed). */
@@ -865,7 +877,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (project) {
       // Any device's hand edits count: a checkout holding only what it received has nothing new to push.
       lastIdleShare = Date.now();
-      await shareProjectCode(ctx, project, binding.canonicalSessionId);
+      await syncProjectCode(ctx, project, { fetch: false, failId: binding.canonicalSessionId });
       return;
     }
     if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
@@ -892,7 +904,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (project) {
       if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS) return;
       lastTurnShare.set(id, Date.now());
-      await shareProjectCode(ctx, project, id);
+      await syncProjectCode(ctx, project, { fetch: false, failId: id });
       return;
     }
     if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS || !(await shareEnabled(ctx.cwd))) return;
@@ -918,10 +930,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     const project = projectOf(ctx.cwd);
     if (project && (arg === "on" || arg === "off")) {
       for (const repo of projectRepos(project)) await setShareSetting(repo, arg === "on");
-      notify(ctx, arg === "on" ? `Uncommitted code in every repository of ${project.name} will be shared with your other devices.` : `Uncommitted code in ${project.name} will not be shared.`, "info");
+      notify(ctx, arg === "on" ? `Every repository's checkouts in ${project.name} will sync with your other devices.` : `Checkouts in ${project.name} will not sync.`, "info");
       return;
     }
-    if (project) return void (await arriveCode(ctx, { force: true }));
+    if (project) return void (await resolveProjectCode(ctx, project));
     if (arg === "on" || arg === "off") {
       await setShareSetting(ctx.cwd, arg === "on");
       const current = arg === "off" ? await bindingFor(ctx.sessionManager.getSessionId()) : undefined;
@@ -1703,8 +1715,12 @@ let counted = binding;
   };
   pi.on("agent_start", async (_event, ctx) => {
     endProjectTurn();
-    turnRoot = projectOf(ctx.cwd)?.root;
-    if (turnRoot) projectTurns.set(turnRoot, (projectTurns.get(turnRoot) ?? 0) + 1);
+    const project = projectOf(ctx.cwd);
+    turnRoot = project?.root;
+    if (!project) return;
+    projectTurns.set(project.root, (projectTurns.get(project.root) ?? 0) + 1);
+    const open = (await projectDesyncs(project).catch(() => [])).filter((item) => item.message);
+    if (open.length) notify(ctx, `${open.length === 1 ? open[0]!.message!.replace(/ Nothing was changed\..*$/, "") : `${open.length} checkouts are desynced`}. Edits there stay on this machine until you choose: /sync code`, "warning");
   });
   pi.on("agent_end", async () => endProjectTurn());
 

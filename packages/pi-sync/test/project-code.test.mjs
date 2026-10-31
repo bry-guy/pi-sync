@@ -32,97 +32,131 @@ function setup() {
 
 const allowed = async () => true;
 
-test("project code: a worktree's work arrives in a new worktree; a dirty checkout is left alone until /sync code", async () => {
+const byKey = (results) => Object.fromEntries(results.map((item) => [item.key, item]));
+
+test("project code: worktrees and their work arrive; a dirty checkout is left alone until /sync code", async () => {
   const { laptop, web } = setup();
   assert.deepEqual(laptop.project && { id: laptop.project.id, name: laptop.project.name }, { id: "p1", name: "eco" });
 
-  // Laptop: uncommitted work in a feature worktree, and in the main checkout.
+  // Laptop: a feature worktree with an unpushed commit and uncommitted work, an edit in the main checkout,
+  // and a clean worktree of a new branch.
   const feat = join(laptop.root, "worktrees", "app", "feat");
   git(laptop.app, "worktree", "add", "-q", "-b", "feat", feat);
+  writeFileSync(join(feat, "c.txt"), "committed\n");
+  git(feat, "add", ".");
+  git(feat, "commit", "-qm", "unpushed");
   writeFileSync(join(feat, "a.txt"), "feature\n");
   writeFileSync(join(feat, "new.txt"), "new\n");
   writeFileSync(join(laptop.app, "a.txt"), "main edit\n");
+  git(laptop.app, "worktree", "add", "-q", "-b", "idea", join(laptop.root, "worktrees", "app", "idea"));
   const shared = await shareProject(laptop.project, "macbook", allowed);
-  assert.deepEqual(shared.map((item) => item.result).sort(), ["pushed", "pushed"]);
-  assert.deepEqual((await shareProject(laptop.project, "macbook", allowed)).map((item) => item.result), ["unchanged", "unchanged"], "nothing new: no push");
+  assert.deepEqual(shared.map((item) => item.result), ["pushed", "pushed", "pushed"]);
+  assert.deepEqual((await shareProject(laptop.project, "macbook", allowed)).map((item) => item.result), ["unchanged", "unchanged", "unchanged"], "nothing new: no push");
 
   // Web: its main checkout has its own uncommitted edit.
   writeFileSync(join(web.app, "b.txt"), "web's own\n");
-  const arrived = await arriveProject(web.project);
-  const byBranch = Object.fromEntries(arrived.map((item) => [item.branch, item]));
-  assert.equal(byBranch.feat.result, "created");
-  assert.equal(byBranch.feat.device, "macbook");
+  const arrived = byKey(await arriveProject(web.project));
+  assert.equal(arrived["wt/feat"].result, "created");
+  assert.equal(arrived["wt/feat"].device, "macbook");
+  assert.equal(arrived["wt/idea"].result, "created", "a clean worktree arrives too");
   const webFeat = join(web.root, "worktrees", "app", "feat");
+  assert.equal(git(webFeat, "rev-parse", "HEAD"), git(feat, "rev-parse", "HEAD"), "with its unpushed commit");
+  assert.equal(git(webFeat, "symbolic-ref", "--short", "HEAD"), "feat");
   assert.equal(readFileSync(join(webFeat, "a.txt"), "utf8"), "feature\n");
   assert.equal(readFileSync(join(webFeat, "new.txt"), "utf8"), "new\n");
-  assert.equal(byBranch.main.result, "pending", "a dirty checkout is not touched");
+  assert.equal(arrived.repo.result, "pending", "a dirty checkout is not touched");
   assert.equal(readFileSync(join(web.app, "a.txt"), "utf8"), "one\n");
   assert.equal((await arriveProject(web.project)).filter((item) => item.result !== "pending").length, 0, "applied snapshots are not applied again");
 
-  // Web received the feat snapshot unchanged: sharing pushes nothing back.
-  const webShared = await shareProject(web.project, "web", async (repo) => repo === web.app);
-  assert.equal(webShared.find((item) => item.branch === "feat").result, "unchanged");
-  assert.equal(webShared.find((item) => item.branch === "main").result, "behind", "web's own edit does not overwrite the laptop's unseen work");
+  // Web holds what it received: sharing pushes nothing back, and its own edit does not overwrite the laptop's.
+  const webShared = byKey(await shareProject(web.project, "web", allowed));
+  assert.equal(webShared["wt/feat"].result, "unchanged");
+  assert.equal(webShared["wt/idea"].result, "unchanged");
+  assert.equal(webShared.repo.result, "behind");
 
   // /sync code: stash the local edit, then bring the laptop's.
-  const forced = await arriveProject(web.project, { force: true });
-  assert.equal(forced.find((item) => item.branch === "main").result, "applied");
+  const forced = byKey(await arriveProject(web.project, { force: true }));
+  assert.equal(forced.repo.result, "applied");
   assert.equal(readFileSync(join(web.app, "a.txt"), "utf8"), "main edit\n");
-  assert.match(git(web.app, "stash", "list"), /local changes before bringing main/);
+  assert.match(git(web.app, "stash", "list"), /local changes before bringing/);
 
-  // Laptop commits and pushes feat: its snapshot is deleted, and web's copy (unchanged there) catches up.
+  // Laptop commits feat: web's copy (as received) follows, with nothing stashed.
   git(feat, "add", ".");
   git(feat, "commit", "-qm", "feature");
-  git(feat, "push", "-q", "-u", "origin", "feat");
-  assert.equal((await shareProject(laptop.project, "macbook", allowed)).find((item) => item.branch === "feat").result, "cleared");
-  const settled = await arriveProject(web.project);
-  assert.equal(settled.find((item) => item.branch === "feat").result, "settled");
+  assert.equal(byKey(await shareProject(laptop.project, "macbook", allowed))["wt/feat"].result, "pushed");
+  assert.equal(byKey(await arriveProject(web.project))["wt/feat"].result, "applied");
   assert.equal(git(webFeat, "rev-parse", "HEAD"), git(feat, "rev-parse", "HEAD"));
-  assert.equal(git(webFeat, "status", "--porcelain"), "", "files already matched the pushed tip: nothing changed on disk, nothing stashed");
-  assert.equal(existsSync(join(webFeat, "new.txt")), true);
-  assert.doesNotMatch(git(web.app, "stash", "list"), /feat/);
+  assert.equal(git(webFeat, "status", "--porcelain"), "");
+  assert.doesNotMatch(git(webFeat, "stash", "list"), /feat/);
+
+  // Web carries on in feat; the laptop (as it left it) follows back.
+  writeFileSync(join(webFeat, "w.txt"), "from web\n");
+  assert.equal(byKey(await shareProject(web.project, "web", allowed))["wt/feat"].result, "pushed");
+  assert.equal(byKey(await arriveProject(laptop.project))["wt/feat"].result, "applied");
+  assert.equal(readFileSync(join(feat, "w.txt"), "utf8"), "from web\n");
 });
 
-test("project code: a removed worktree's snapshot is withdrawn, so other machines do not recreate it", async () => {
+test("project code: removing a worktree removes it everywhere, unless it has changes there", async () => {
   const { laptop, web } = setup();
-  const wt = join(laptop.root, "worktrees", "app", "feature", "x");
-  git(laptop.app, "worktree", "add", "-q", "-b", "feature/x", wt);
-  writeFileSync(join(wt, "x.txt"), "x\n");
-  const shared = await shareProject(laptop.project, "macbook", allowed);
-  assert.equal(shared.find((item) => item.branch === "feature/x").result, "pushed", "a branch with a slash shares");
-  assert.match(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/*"), /refs\/pi-projects\/p1\/feature\/x/);
-
-  // Laptop drops the worktree (and branch) with the work still uncommitted.
-  git(laptop.app, "worktree", "remove", "--force", wt);
-  git(laptop.app, "branch", "-D", "feature/x");
-  const withdrawn = await shareProject(laptop.project, "macbook", allowed);
-  assert.equal(withdrawn.find((item) => item.branch === "feature/x").result, "cleared");
-  assert.equal(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/*"), "");
+  const x = join(laptop.root, "worktrees", "app", "feature", "x");
+  const y = join(laptop.root, "worktrees", "app", "feature", "y");
+  git(laptop.app, "worktree", "add", "-q", "-b", "feature/x", x);
+  git(laptop.app, "worktree", "add", "-q", "-b", "feature/y", y);
+  writeFileSync(join(x, "x.txt"), "x\n");
+  const shared = byKey(await shareProject(laptop.project, "macbook", allowed));
+  assert.equal(shared["wt/feature/x"].result, "pushed", "a nested path (branch with a slash) shares");
   await arriveProject(web.project);
-  assert.equal(existsSync(join(web.root, "worktrees", "app", "feature", "x")), false);
+  const webX = join(web.root, "worktrees", "app", "feature", "x");
+  const webY = join(web.root, "worktrees", "app", "feature", "y");
+  assert.equal(readFileSync(join(webX, "x.txt"), "utf8"), "x\n");
+  assert.equal(existsSync(webY), true);
+
+  // Web edits y; the laptop then removes both worktrees.
+  writeFileSync(join(webY, "y.txt"), "web edit\n");
+  git(laptop.app, "worktree", "remove", "--force", x);
+  git(laptop.app, "worktree", "remove", "--force", y);
+  const removed = byKey(await shareProject(laptop.project, "macbook", allowed));
+  assert.equal(removed["wt/feature/x"].result, "removed");
+  assert.equal(removed["wt/feature/y"].result, "removed");
+
+  const arrived = byKey(await arriveProject(web.project));
+  assert.equal(arrived["wt/feature/x"].result, "removed");
+  assert.equal(existsSync(webX), false);
+  assert.equal(arrived["wt/feature/y"].result, "kept", "web's unshared edit is never thrown away");
+  assert.equal(readFileSync(join(webY, "y.txt"), "utf8"), "web edit\n");
+  // ...and it is shared again, so it comes back on the laptop with web's edit.
+  assert.equal(byKey(await shareProject(web.project, "web", allowed))["wt/feature/y"].result, "pushed");
+  const back = byKey(await arriveProject(laptop.project));
+  assert.equal(back["wt/feature/y"].result, "created");
+  assert.equal(readFileSync(join(y, "y.txt"), "utf8"), "web edit\n");
+  assert.equal(existsSync(x), false, "x stays removed");
+  assert.equal(git(laptop.app, "ls-remote", "origin", "refs/pi-projects/p1/wt/feature/x"), "");
 });
 
-test("project code: a branch with a slash arrives in a nested worktree", async () => {
+test("project code: switching the main checkout's branch follows when the checkout is clean", async () => {
   const { laptop, web } = setup();
-  const wt = join(laptop.root, "worktrees", "app", "feature", "y");
-  git(laptop.app, "worktree", "add", "-q", "-b", "feature/y", wt);
-  writeFileSync(join(wt, "y.txt"), "y\n");
   await shareProject(laptop.project, "macbook", allowed);
-  const arrived = await arriveProject(web.project);
-  assert.equal(arrived.find((item) => item.branch === "feature/y").result, "created");
-  const webWt = join(web.root, "worktrees", "app", "feature", "y");
-  assert.equal(readFileSync(join(webWt, "y.txt"), "utf8"), "y\n");
-  // Web holds only what it received: sharing pushes nothing, withdraws nothing.
-  const again = await shareProject(web.project, "web", allowed);
-  assert.equal(again.find((item) => item.branch === "feature/y").result, "unchanged");
+  git(laptop.app, "switch", "-q", "-c", "topic");
+  writeFileSync(join(laptop.app, "t.txt"), "t\n");
+  git(laptop.app, "add", ".");
+  git(laptop.app, "commit", "-qm", "topic");
+  await shareProject(laptop.project, "macbook", allowed);
+  assert.equal(byKey(await arriveProject(web.project)).repo.result, "applied");
+  assert.equal(git(web.app, "symbolic-ref", "--short", "HEAD"), "topic");
+  assert.equal(git(web.app, "rev-parse", "HEAD"), git(laptop.app, "rev-parse", "HEAD"));
 });
 
-test("project code: only folders inside a project with an id count", () => {
-  const base = mkdtempSync(join(tmpdir(), "pi-sync-project-for-"));
-  mkdirSync(join(base, "eco", "repos"), { recursive: true });
-  assert.equal(projectFor(join(base, "eco"), base), undefined, "no project.json");
-  writeFileSync(join(base, "eco", "project.json"), JSON.stringify({ id: "p1", name: "eco" }));
-  assert.equal(projectFor(join(base, "eco", "repos"), base)?.root.endsWith("/eco"), true);
-  assert.equal(projectFor(base, base), undefined, "the projects folder itself");
-  assert.equal(projectFor(tmpdir(), base), undefined);
+test("project code: machines that pulled at different times do not flag each other", async () => {
+  const { laptop, web } = setup();
+  await shareProject(laptop.project, "macbook", allowed);
+  // main moves on the remote; web pulls, the laptop does not.
+  const seed = join(laptop.root, "..", "..", "seed");
+  writeFileSync(join(seed, "a.txt"), "two\n");
+  git(seed, "commit", "-qam", "two");
+  git(seed, "push", "-q", "origin", "HEAD:main");
+  git(web.app, "pull", "-q");
+  assert.equal(byKey(await arriveProject(web.project)).repo.result, "matches", "older and clean: nothing to bring");
+  assert.equal(byKey(await shareProject(web.project, "web", allowed)).repo.result, "pushed");
+  assert.equal(byKey(await arriveProject(laptop.project)).repo.result, "applied", "and the laptop catches up");
+  assert.equal(git(laptop.app, "rev-parse", "HEAD"), git(web.app, "rev-parse", "HEAD"));
 });

@@ -128,7 +128,7 @@ export async function captureWorkspace(cwd: string, trailer = ""): Promise<Snaps
   }
 }
 
-async function oversized(cwd: string, head: string, tree: string): Promise<string | undefined> {
+export async function oversized(cwd: string, head: string, tree: string): Promise<string | undefined> {
   const changed = await out(cwd, ["diff-tree", "-r", "--no-renames", "--diff-filter=AM", head, tree]);
   if (!changed) return undefined;
   let total = 0;

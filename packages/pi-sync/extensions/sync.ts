@@ -623,20 +623,20 @@ export default function syncExtension(pi: ExtensionAPI) {
         const setting = await shareSetting(repo);
         if (setting === undefined && config.code === "ask") asked.push(repo.slice(repo.lastIndexOf("/") + 1));
         return setting ?? config.code === "auto";
-      }, (repo, branch) => behind.has(`${repo}\0${branch}`));
+      }, (repo, key) => behind.has(`${repo}\0${key}`));
       if (failId) {
         if (results.some((item) => item.result === "failed")) idleFailed(failId);
-        else if (results.some((item) => item.result === "pushed" || item.result === "cleared")) idleFailures.delete(failId);
+        else if (results.some((item) => item.result === "pushed" || item.result === "removed")) idleFailures.delete(failId);
       }
       const firstPushes = [...new Set(results.filter((item) => item.result === "pushed" && !autoShareNoticed.has(`project:${item.repo}`)).map((item) => item.repo))];
       if (firstPushes.length && config.code === "auto") {
         for (const repo of firstPushes) autoShareNoticed.add(`project:${repo}`);
-        notify(ctx, `Sharing uncommitted code from ${firstPushes.join(", ")} to ${firstPushes.length > 1 ? "their remotes" : "its remote"} (refs/pi-projects/…); anyone who can read a remote can read it. /sync code off stops it for this project.`, "info");
+        notify(ctx, `Sharing checkouts (branches, unpushed commits, uncommitted changes) of ${firstPushes.join(", ")} to ${firstPushes.length > 1 ? "their remotes" : "its remote"} (refs/pi-projects/…); anyone who can read a remote can read it. /sync code off stops it for this project.`, "info");
       }
       const refused = results.filter((item) => item.result === "behind");
       if (refused.length) {
         const set = projectBehind.get(project.root) ?? new Set<string>();
-        for (const item of refused) set.add(`${join(project.root, "repos", item.repo)}\0${item.branch}`);
+        for (const item of refused) set.add(`${join(project.root, "repos", item.repo)}\0${item.key}`);
         projectBehind.set(project.root, set);
         // Take the other device's work where that loses nothing; otherwise this reports it once.
         setTimeout(() => void arriveCode(ctx, { ask: false, now: true }).catch(() => undefined), 0);
@@ -649,7 +649,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         const key = `fail:${failed.checkout}:${failed.reason}`;
         if (projectNoticed.has(key)) continue;
         projectNoticed.add(key);
-        notify(ctx, `Could not share ${failed.checkout} (${failed.branch ?? "detached"}): ${failed.reason ?? "git failed"}.`, "warning");
+        notify(ctx, `Could not share ${failed.checkout}${failed.branch ? ` (${failed.branch})` : ""}: ${failed.reason ?? "git failed"}.`, "warning");
       }
     }).catch(() => undefined);
 
@@ -826,7 +826,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (!options.now && Date.now() - lastProjectArrival < 5 * 60_000) return;
     }
     lastProjectArrival = Date.now();
-    let results = await arriveProject(project);
+    let results = await inProjectOrder(project.root, () => arriveProject(project));
     // Refused pushes wait for this: whatever it found, the next share may try again.
     projectBehind.delete(project.root);
     if (failId && results.some((item) => item.result === "failed")) idleFailed(failId);
@@ -836,12 +836,12 @@ export default function syncExtension(pi: ExtensionAPI) {
         "Bring the other device's code here?",
         `${pending.map((item) => item.message).join("\n")}\n\nLocal uncommitted changes in those checkouts are stashed first (git stash list).`,
       );
-      if (ok) results = [...results.filter((item) => item.result !== "pending"), ...(await arriveProject(project, { force: true }))];
+      if (ok) results = [...results.filter((item) => item.result !== "pending"), ...(await inProjectOrder(project.root, () => arriveProject(project, { force: true })))];
     }
     let reported = false;
     for (const item of results) {
       if (!item.message) continue;
-      const key = `arrive:${item.repo}:${item.branch}:${item.result}:${item.message}`;
+      const key = `arrive:${item.repo}:${item.key}:${item.result}:${item.message}`;
       if (!options.force && projectNoticed.has(key)) continue;
       projectNoticed.add(key);
       reported = true;

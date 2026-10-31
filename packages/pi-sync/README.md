@@ -157,20 +157,25 @@ in that folder's session list. The project name is also sent to the server, so
 hosts can list a project's conversations. pi-projects keeps `project.json` and
 `memory.md` in their own git repo; pi-sync never shares code from that repo.
 
-Code in a project is shared per project, not per conversation. After each
-turn (and between turns), every checkout under `repos/` and its worktrees with
-uncommitted or unpushed work is pushed to
-`refs/pi-projects/<project id>/<branch>` on that repository's remote. The push
-is a compare-and-swap: it never replaces a snapshot from another device that
-this machine has not taken. Arrival fetches those refs, creates missing
-worktrees under `worktrees/<repo>/<branch>`, and lays the changes onto
-checkouts that are clean (or hold only the previous snapshot) and at or behind
-the snapshot's base. Anything else is reported; `/sync code` brings it after
-asking, stashing local changes first. When the other device commits and
-pushes, its snapshot is deleted, and a copy here whose files already match the
-pushed tip moves to it (nothing changes on disk). Removing a worktree or branch
-withdraws its snapshot, so other machines do not recreate it. `/sync code on|off` applies to every repository in the
-project. Commits and pushes stay yours. Edit a branch on one machine at a time.
+A project's checkouts are mirrored across machines, not per conversation.
+Each checkout (`repos/<repo>` and every worktree under `worktrees/<repo>/`)
+has a ref on its repository's remote, `refs/pi-projects/<project id>/repo` or
+`.../wt/<path>`, holding its branch, commits (pushed or not) and uncommitted
+changes. After each turn (and between turns) changed checkouts are pushed, and
+worktrees removed here have their ref deleted. Arrival makes this machine
+match: it creates worktrees added elsewhere, removes worktrees removed
+elsewhere, and moves checkouts to the other machine's branch, commits and
+changes.
+
+Nothing is lost on the way. Every push and delete is a compare-and-swap, so it
+never replaces state from another device this machine has not taken. Arrival
+changes a checkout only when it is clean or exactly as last synced, and its
+branch has no commits the incoming one lacks; anything else is reported, and
+`/sync code` brings it after asking, stashing local changes first. A worktree
+removed elsewhere that has changes here is kept and shared again. Removing a
+worktree keeps its branch. `/sync code on|off` applies to every repository in
+the project. Pushing branches to their upstream stays yours. Edit a checkout
+on one machine at a time.
 
 Background runs from pi-background enroll and hold the lease like turns typed
 in the terminal.

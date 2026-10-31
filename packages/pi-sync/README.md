@@ -150,13 +150,26 @@ it returns `{ outcome: "unchanged" | "busy" | "conflict" | "refreshed" }`.
 ### pi projects
 
 A conversation started in a [pi-projects](https://github.com/bry-guy/pi-projects)
-project carries a `pi-project` entry naming the project and the subfolder it
-ran in. When it arrives on a machine that has that project (under
-`PI_PROJECTS_DIR`), it opens in the same project folder, and its file goes in
-that folder's session list, instead of wherever pi happens to be running. The
-project name is also sent to the server, so hosts can list a project's
-conversations. pi-projects keeps `project.json` and `memory.md` in their own
-git repo; pi-sync never shares code from that repo.
+project carries a `pi-project` entry naming the project. When it arrives on a
+machine that has that project (under `PI_PROJECTS_DIR`), it opens at the
+project folder's root (whichever repository it last ran in), and its file goes
+in that folder's session list. The project name is also sent to the server, so
+hosts can list a project's conversations. pi-projects keeps `project.json` and
+`memory.md` in their own git repo; pi-sync never shares code from that repo.
+
+Code in a project is shared per project, not per conversation. After each
+turn (and between turns), every checkout under `repos/` and its worktrees with
+uncommitted or unpushed work is pushed to
+`refs/pi-projects/<project id>/<branch>` on that repository's remote. The push
+is a compare-and-swap: it never replaces a snapshot from another device that
+this machine has not taken. Arrival fetches those refs, creates missing
+worktrees under `worktrees/<repo>/<branch>`, and lays the changes onto
+checkouts that are clean (or hold only the previous snapshot) and at or behind
+the snapshot's base. Anything else is reported; `/sync code` brings it after
+asking, stashing local changes first. When the other device commits and
+pushes, its snapshot is deleted and an unchanged copy here is stashed and
+fast-forwarded. `/sync code on|off` applies to every repository in the
+project. Commits and pushes stay yours. Edit a branch on one machine at a time.
 
 Background runs from pi-background enroll and hold the lease like turns typed
 in the terminal.

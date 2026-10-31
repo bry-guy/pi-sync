@@ -70,7 +70,7 @@ export async function hasUnsharedCode(cwd: string): Promise<boolean> {
   return ahead === undefined || ahead !== "0";
 }
 
-async function remoteName(cwd: string, gitRemote?: string): Promise<string | undefined> {
+export async function remoteName(cwd: string, gitRemote?: string): Promise<string | undefined> {
   const names = (await out(cwd, ["remote"]))?.split("\n").map((name) => name.trim()).filter(Boolean) ?? [];
   if (gitRemote) {
     const wanted = repositoryIdentity(gitRemote);
@@ -89,7 +89,7 @@ export type Snapshot =
   | { kind: "skipped"; reason: string; retryable: boolean; workspace?: WorkspacePointer };
 
 /** Captures the working tree as a commit without touching the user's index, worktree, or stash. */
-export async function captureWorkspace(cwd: string): Promise<Snapshot> {
+export async function captureWorkspace(cwd: string, trailer = ""): Promise<Snapshot> {
   const pushed = await deriveWorkspacePointer(cwd);
   if (!(await hasUnsharedCode(cwd))) return { kind: "clean", workspace: pushed };
   const head = await out(cwd, ["rev-parse", "HEAD"]);
@@ -113,7 +113,7 @@ export async function captureWorkspace(cwd: string): Promise<Snapshot> {
     if (!tree) return failed("could not write the working tree", written);
     const tooLarge = await oversized(cwd, head, tree);
     if (tooLarge) return { kind: "skipped", reason: tooLarge, retryable: false, workspace: pushed };
-    const recorded = await git(cwd, ["commit-tree", tree, "-p", head, "-m", `pi-sync working tree snapshot\n\nBranch: ${branch}`], {
+    const recorded = await git(cwd, ["commit-tree", tree, "-p", head, "-m", `pi-sync working tree snapshot\n\nBranch: ${branch}${trailer ? `\n${trailer}` : ""}`], {
       env: { GIT_AUTHOR_NAME: "pi-sync", GIT_AUTHOR_EMAIL: "pi-sync@localhost", GIT_COMMITTER_NAME: "pi-sync", GIT_COMMITTER_EMAIL: "pi-sync@localhost" },
     });
     const commit = recorded.stdout.trim();
@@ -179,7 +179,7 @@ export async function sweepSnapshots(cwd: string, live: ReadonlySet<string>, now
 }
 
 /** The working tree as a tree object (non-ignored files, untracked included), without touching the user's index. */
-async function workingTree(cwd: string): Promise<string | undefined> {
+export async function workingTree(cwd: string): Promise<string | undefined> {
   const dir = await mkdtemp(join(tmpdir(), "pi-sync-index-"));
   try {
     const env = { GIT_INDEX_FILE: join(dir, "index") };
@@ -191,7 +191,7 @@ async function workingTree(cwd: string): Promise<string | undefined> {
   }
 }
 
-const treeOf = (cwd: string, commit: string) => out(cwd, ["rev-parse", `${commit}^{tree}`]);
+export const treeOf = (cwd: string, commit: string) => out(cwd, ["rev-parse", `${commit}^{tree}`]);
 
 /**
  * Shares the working tree between turns: pushes a fresh snapshot when it changed since the last one this checkout

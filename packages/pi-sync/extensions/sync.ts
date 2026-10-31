@@ -40,6 +40,12 @@ import {
   nativeHeaderLine,
   projectCwd,
   projectLink,
+  projectsDir,
+  projectFor,
+  projectRepos,
+  shareProject,
+  arriveProject,
+  type Project,
   normalizeSessionFile,
   withoutLocalSettings,
   repositoryIdentity,
@@ -545,7 +551,9 @@ export default function syncExtension(pi: ExtensionAPI) {
     stopHeartbeat();
     lease = undefined;
     let snapshot: Snapshot | undefined;
-    if (await shareEnabled(ctx.cwd)) snapshot = await captureWithRetry(ctx.cwd);
+    // Project conversations share every repository of the project instead (after the upload, below).
+    const project = projectOf(ctx.cwd);
+    if (!project && await shareEnabled(ctx.cwd)) snapshot = await captureWithRetry(ctx.cwd);
     let uploaded = false;
     await exclusive(async () => {
       try {
@@ -585,8 +593,36 @@ export default function syncExtension(pi: ExtensionAPI) {
         }
       }
     });
-    if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot).then(() => retryPushes(ctx, true)).catch(() => undefined);
+    if (project) void shareProjectCode(ctx, project);
+    else if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot).then(() => retryPushes(ctx, true)).catch(() => undefined);
     else void retryPushes(ctx, true).catch(() => undefined);
+  };
+
+  const projectOf = (cwd: string): Project | undefined => projectFor(cwd, projectsDir(getAgentDir()));
+  let projectSharing: Promise<unknown> = Promise.resolve();
+  const projectNoticed = new Set<string>();
+  /** Shares every repository and worktree of the project that may share code; one run at a time. */
+  const shareProjectCode = (ctx: ExtensionContext, project: Project): Promise<unknown> => {
+    projectSharing = projectSharing.then(async () => {
+      if (config.code === "off") return;
+      const asked: string[] = [];
+      const results = await shareProject(project, deviceLabel, async (repo) => {
+        const setting = await shareSetting(repo);
+        if (setting === undefined && config.code === "ask") asked.push(repo.slice(repo.lastIndexOf("/") + 1));
+        return setting ?? config.code === "auto";
+      });
+      if (asked.length && !projectNoticed.has(`ask:${project.id}`)) {
+        projectNoticed.add(`ask:${project.id}`);
+        notify(ctx, `Uncommitted code in ${asked.join(", ")} is not shared with your other devices. /sync code on shares it for every repository in this project.`, "info");
+      }
+      for (const failed of results.filter((item) => item.result === "failed" || item.result === "behind")) {
+        const key = `fail:${failed.checkout}:${failed.reason}`;
+        if (projectNoticed.has(key)) continue;
+        projectNoticed.add(key);
+        notify(ctx, `Could not share ${failed.checkout} (${failed.branch ?? "detached"}): ${failed.reason ?? "git failed"}.`, "warning");
+      }
+    }).catch(() => undefined);
+    return projectSharing;
   };
 
   /** The repository's own /sync code on|off wins; otherwise the configured default. */
@@ -674,7 +710,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
   const askToShareCode = async (ctx: ExtensionContext) => {
-    if (config.code !== "ask" || !ctx.hasUI || (await shareSetting(ctx.cwd)) !== undefined) return;
+    if (config.code !== "ask" || !ctx.hasUI || projectOf(ctx.cwd) || (await shareSetting(ctx.cwd)) !== undefined) return;
     if (!(await hasUnsharedCode(ctx.cwd))) return;
     const enabled = await ctx.ui.confirm(
       "Share uncommitted code with your other devices?",
@@ -700,6 +736,8 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (options.force) await arriving; // /sync code must run, not join a background check
     arriving ??= (async () => {
       if (config.code === "off" || !ctx.isIdle()) return;
+      const project = projectOf(ctx.cwd);
+      if (project) return arriveProjectCode(ctx, project, options);
       const id = ctx.sessionManager.getSessionId();
       const binding = await bindingFor(id);
       if (!binding?.workspace) return;
@@ -747,6 +785,36 @@ export default function syncExtension(pi: ExtensionAPI) {
     return arriving;
   };
 
+  /**
+   * Brings the project's shared code here: new worktrees and changes onto checkouts where nothing can be lost
+   * happen silently; the rest is reported once, and /sync code (force) brings it after asking, stashing local changes.
+   */
+  let lastProjectArrival = 0;
+  const arriveProjectCode = async (ctx: ExtensionContext, project: Project, options: { force?: boolean; ask?: boolean }) => {
+    // The idle poll checks every repository's remote (one fetch each, maybe an SSH prompt): every 5 minutes at most.
+    if (options.ask === false && Date.now() - lastProjectArrival < 5 * 60_000) return;
+    lastProjectArrival = Date.now();
+    let results = await arriveProject(project);
+    const pending = results.filter((item) => item.result === "pending");
+    if (options.force && pending.length && ctx.hasUI) {
+      const ok = await ctx.ui.confirm(
+        "Bring the other device's code here?",
+        `${pending.map((item) => item.message).join("\n")}\n\nLocal uncommitted changes in those checkouts are stashed first (git stash list).`,
+      );
+      if (ok) results = [...results.filter((item) => item.result !== "pending"), ...(await arriveProject(project, { force: true }))];
+    }
+    let reported = false;
+    for (const item of results) {
+      if (!item.message) continue;
+      const key = `arrive:${item.repo}:${item.branch}:${item.result}:${item.message}`;
+      if (!options.force && projectNoticed.has(key)) continue;
+      projectNoticed.add(key);
+      reported = true;
+      notify(ctx, item.message, item.result === "failed" || item.result === "pending" ? "warning" : "info");
+    }
+    if (options.force && !reported) notify(ctx, "This project's checkouts already have the latest shared code.", "info");
+  };
+
   /** Between turns, the device that wrote the latest turn keeps sharing hand edits (and clears the snapshot once pushed). */
   let lastIdleShare = 0;
   // Three polls apart: 60 s by default.
@@ -754,6 +822,13 @@ export default function syncExtension(pi: ExtensionAPI) {
   const shareBetweenTurns = async (ctx: ExtensionContext, binding: SyncBinding, force = false) => {
     if (!force && Date.now() - lastIdleShare < IDLE_SHARE_MS) return;
     if (!force && idleBackedOff(binding.canonicalSessionId)) return;
+    const project = projectOf(ctx.cwd);
+    if (project) {
+      // Any device's hand edits count: a checkout holding only what it received has nothing new to push.
+      lastIdleShare = Date.now();
+      await shareProjectCode(ctx, project);
+      return;
+    }
     if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
     lastIdleShare = Date.now();
     const id = binding.canonicalSessionId;
@@ -774,6 +849,13 @@ export default function syncExtension(pi: ExtensionAPI) {
     const binding = await bindingFor(currentSessionId);
     if (!binding) return;
     const id = binding.canonicalSessionId;
+    const project = projectOf(ctx.cwd);
+    if (project) {
+      if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS) return;
+      lastTurnShare.set(id, Date.now());
+      await shareProjectCode(ctx, project);
+      return;
+    }
     if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS || !(await shareEnabled(ctx.cwd))) return;
     lastTurnShare.set(id, Date.now());
     await inOrder(id, async () => {
@@ -794,6 +876,13 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   const syncCode = async (ctx: ExtensionCommandContext, arg: string) => {
+    const project = projectOf(ctx.cwd);
+    if (project && (arg === "on" || arg === "off")) {
+      for (const repo of projectRepos(project)) await setShareSetting(repo, arg === "on");
+      notify(ctx, arg === "on" ? `Uncommitted code in every repository of ${project.name} will be shared with your other devices.` : `Uncommitted code in ${project.name} will not be shared.`, "info");
+      return;
+    }
+    if (project) return void (await arriveCode(ctx, { force: true }));
     if (arg === "on" || arg === "off") {
       await setShareSetting(ctx.cwd, arg === "on");
       const current = arg === "off" ? await bindingFor(ctx.sessionManager.getSessionId()) : undefined;
@@ -1073,7 +1162,7 @@ let counted = binding;
     if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS && !idleBackedOff(binding.canonicalSessionId)) {
       lastCodeCheck = Date.now();
       await shareBetweenTurns(ctx, binding);
-      if (await shareEnabled(ctx.cwd)) {
+      if (!projectOf(ctx.cwd) && await shareEnabled(ctx.cwd)) {
         const live = await clientFor(binding.serverUrl).list().then((listed) => new Set(listed.sessions.map((item) => item.sessionId)), () => undefined);
         if (live?.has(binding.canonicalSessionId) && (await sweepSnapshots(ctx.cwd, live)) < 0) idleFailed(binding.canonicalSessionId);
       }

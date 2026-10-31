@@ -127,12 +127,12 @@ test("project link: envelope carries the project, arrival uses the project folde
   ].join("\n") + "\n";
   const envelope = await normalizeNativeJsonl(native);
   assert.equal(envelope.project, "eco");
-  assert.deepEqual(projectLink(envelope.entries), { name: "eco", rel: "repos/web" });
+  assert.deepEqual(projectLink(envelope.entries), { name: "eco", rel: "repos/web", projectId: "x" });
   process.env.PI_PROJECTS_DIR = "/w/projects";
   const has = (paths) => (path) => paths.includes(path);
   assert.equal(projectCwd(envelope.entries, "/agent", "/here", has([])), "/here", "no project here: stay put");
   assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json"])), "/w/projects/eco", "repo not cloned: project root");
-  assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json", "/w/projects/eco/repos/web"])), "/w/projects/eco/repos/web");
+  assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json", "/w/projects/eco/repos/web"])), "/w/projects/eco", "a repository session opens at the project root");
   const escaping = [{ ...link, data: { name: "eco", rel: "../other" } }];
   assert.equal(projectCwd(escaping, "/agent", "/here", () => true), "/w/projects/eco");
   delete process.env.PI_PROJECTS_DIR;

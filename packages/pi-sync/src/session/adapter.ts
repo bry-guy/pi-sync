@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { type PiEntry, type SessionEnvelope, type WorkspacePointer, validateEnvelope } from "../protocol.js";
 
@@ -36,14 +36,14 @@ export function withoutLocalSettings(entries: PiEntry[]): PiEntry[] {
   );
 }
 
-/** The pi-projects link (`pi-project` custom entry): project folder name and cwd relative to it. */
-export function projectLink(entries: readonly PiEntry[]): { name: string; rel: string } | undefined {
+/** The pi-projects link (`pi-project` custom entry): project id, folder name, and cwd relative to it. */
+export function projectLink(entries: readonly PiEntry[]): { name: string; rel: string; projectId?: string } | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i] as PiEntry & { customType?: unknown; data?: { name?: unknown; rel?: unknown } };
+    const entry = entries[i] as PiEntry & { customType?: unknown; data?: { name?: unknown; rel?: unknown; projectId?: unknown } };
     if (entry.type !== "custom" || entry.customType !== "pi-project") continue;
-    const { name, rel } = entry.data ?? {};
+    const { name, rel, projectId } = entry.data ?? {};
     if (typeof name !== "string" || !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(name)) return undefined;
-    return { name, rel: typeof rel === "string" ? rel : "" };
+    return { name, rel: typeof rel === "string" ? rel : "", ...(typeof projectId === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(projectId) ? { projectId } : {}) };
   }
   return undefined;
 }
@@ -55,17 +55,14 @@ export function projectsDir(agentDir: string): string {
 }
 
 /**
- * Where a conversation belongs on this machine: its project folder (plus the same subfolder) when the project
- * exists here, else `fallback`. A subfolder that is not there yet (an uncloned repo) falls back to the project root.
+ * Where a conversation belongs on this machine: its project folder when the project exists here, else `fallback`.
+ * Always the project root, whichever repository or worktree it last ran in: project sessions live in the project.
  */
 export function projectCwd(entries: readonly PiEntry[], agentDir: string, fallback: string, exists: (path: string) => boolean): string {
   const link = projectLink(entries);
   if (!link) return fallback;
   const root = join(projectsDir(agentDir), link.name);
-  if (!exists(join(root, "project.json"))) return fallback;
-  const full = resolve(root, link.rel);
-  if (full !== root && !full.startsWith(root + sep)) return root;
-  return exists(full) ? full : root;
+  return exists(join(root, "project.json")) ? root : fallback;
 }
 
 /** pi's default per-cwd sessions folder (session-manager getDefaultSessionDir). */

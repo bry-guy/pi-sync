@@ -233,3 +233,25 @@ test("checkouts: three machines: one winner, losers desync alone, racing resolut
     assert.deepEqual(await projectDesyncs(m.project), []);
   }
 });
+
+test("checkouts: a branch deleted on one machine is not brought back by another", async () => {
+  const { laptop, web } = setup();
+  git(laptop.app, "worktree", "add", "-q", "-b", "old", wt(laptop, "old"));
+  edit(join(wt(laptop, "old"), "o.txt"), "o\n");
+  git(wt(laptop, "old"), "add", ".");
+  git(wt(laptop, "old"), "commit", "-qm", "old work");
+  await sync(laptop, "macbook");
+  await sync(web, "web");
+  git(laptop.app, "worktree", "remove", "--force", wt(laptop, "old"));
+  await sync(laptop, "macbook");
+  await sync(web, "web");
+  assert.equal(existsSync(wt(web, "old")), false);
+  git(laptop.app, "branch", "-D", "old");
+  for (let round = 0; round < 2; round++) {
+    await sync(web, "web");
+    await sync(laptop, "macbook");
+  }
+  assert.equal(git(laptop.app, "branch", "--list", "old"), "", "not recreated on the machine that deleted it");
+  assert.equal(existsSync(wt(laptop, "old")), false);
+  assert.equal(git(web.app, "branch", "--list", "old").trim(), "old", "the other machine keeps its own branch");
+});

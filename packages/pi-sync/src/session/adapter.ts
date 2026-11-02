@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { type PiEntry, type SessionEnvelope, type WorkspacePointer, validateEnvelope } from "../protocol.js";
 
@@ -56,13 +56,16 @@ export function projectsDir(agentDir: string): string {
 
 /**
  * Where a conversation belongs on this machine: its project folder when the project exists here, else `fallback`.
- * Always the project root, whichever repository or worktree it last ran in: project sessions live in the project.
+ * The project root, whichever repository or worktree it last ran in, unless `fallback` (where it is being opened) is
+ * already inside the project: opening from a repository (pi-web's repository sessions) keeps it there.
  */
 export function projectCwd(entries: readonly PiEntry[], agentDir: string, fallback: string, exists: (path: string) => boolean): string {
   const link = projectLink(entries);
   if (!link) return fallback;
   const root = join(projectsDir(agentDir), link.name);
-  return exists(join(root, "project.json")) ? root : fallback;
+  if (!exists(join(root, "project.json"))) return fallback;
+  const inside = relative(root, resolve(fallback));
+  return inside && !inside.startsWith("..") && !isAbsolute(inside) ? resolve(fallback) : root;
 }
 
 /** pi's default per-cwd sessions folder (session-manager getDefaultSessionDir). */

@@ -133,6 +133,8 @@ test("project link: envelope carries the project, arrival uses the project folde
   assert.equal(projectCwd(envelope.entries, "/agent", "/here", has([])), "/here", "no project here: stay put");
   assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json"])), "/w/projects/eco", "repo not cloned: project root");
   assert.equal(projectCwd(envelope.entries, "/agent", "/here", has(["/w/projects/eco/project.json", "/w/projects/eco/repos/web"])), "/w/projects/eco", "a repository session opens at the project root");
+  assert.equal(projectCwd(envelope.entries, "/agent", "/w/projects/eco/repos/web", has(["/w/projects/eco/project.json"])), "/w/projects/eco/repos/web", "opened from inside the project: stays there");
+  assert.equal(projectCwd(envelope.entries, "/agent", "/w/projects/ecosystem", has(["/w/projects/eco/project.json"])), "/w/projects/eco", "a sibling folder is not inside");
   const escaping = [{ ...link, data: { name: "eco", rel: "../other" } }];
   assert.equal(projectCwd(escaping, "/agent", "/here", () => true), "/w/projects/eco");
   delete process.env.PI_PROJECTS_DIR;

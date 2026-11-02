@@ -153,7 +153,8 @@ A conversation started in a [pi-projects](https://github.com/bry-guy/pi-projects
 project carries a `pi-project` entry naming the project. When it arrives on a
 machine that has that project (under `PI_PROJECTS_DIR`), it opens at the
 project folder's root (whichever repository it last ran in), and its file goes
-in that folder's session list. The project name is also sent to the server, so
+in that folder's session list. Opened from inside the project (a repository or
+worktree, as pi-web does for repository sessions), it stays where it was opened. The project name is also sent to the server, so
 hosts can list a project's conversations. pi-projects keeps `project.json` and
 `memory.md` in their own git repo; pi-sync never shares code from that repo.
 

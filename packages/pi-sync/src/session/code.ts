@@ -29,7 +29,8 @@ export interface GitResult {
 
 export async function git(cwd: string, args: string[], options: { env?: Record<string, string>; timeoutMs?: number } = {}): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile("git", args, {
+    // Agents can write .git (hooks, fsmonitor); host git must never run repo-controlled code.
+    execFile("git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], {
       cwd,
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
       timeout: options.timeoutMs ?? 10_000,

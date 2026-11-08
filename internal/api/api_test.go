@@ -587,3 +587,37 @@ func TestHTTPListReportsProject(t *testing.T) {
 		t.Fatalf("invalid project must be rejected, got %d", rejected.StatusCode)
 	}
 }
+
+func TestTokenRequiredExceptHealth(t *testing.T) {
+	filesystem, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(filesystem, nil)
+	handler.Token = "secret"
+	router := httptest.NewServer(handler)
+	defer router.Close()
+	status := func(path, auth string) int {
+		request, _ := http.NewRequest(http.MethodGet, router.URL+path, nil)
+		if auth != "" {
+			request.Header.Set("Authorization", auth)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+	if got := status("/v1/health", ""); got != http.StatusOK {
+		t.Fatalf("health without token: %d", got)
+	}
+	for _, auth := range []string{"", "Bearer wrong", "secret"} {
+		if got := status("/v1/sessions", auth); got != http.StatusUnauthorized {
+			t.Fatalf("sessions with %q: %d", auth, got)
+		}
+	}
+	if got := status("/v1/sessions", "Bearer secret"); got != http.StatusOK {
+		t.Fatalf("sessions with token: %d", got)
+	}
+}

@@ -57,3 +57,25 @@ test("client sanitizes protocol errors", async () => {
     return true;
   });
 });
+
+test("client sends the sync token as a bearer token", async () => {
+  let seen;
+  const fetch = async (_url, init) => {
+    seen = init.headers.Authorization;
+    return Response.json({ formatVersion: 1, sessions: [] });
+  };
+  await new SyncClient({ baseUrl: "http://sync.test", fetch, token: "t1" }).list();
+  assert.equal(seen, "Bearer t1");
+  const previous = process.env.PI_SYNC_TOKEN;
+  process.env.PI_SYNC_TOKEN = "t2";
+  try {
+    await new SyncClient({ baseUrl: "http://sync.test", fetch }).list();
+    assert.equal(seen, "Bearer t2");
+    delete process.env.PI_SYNC_TOKEN;
+    await new SyncClient({ baseUrl: "http://sync.test", fetch }).list();
+    assert.equal(seen, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.PI_SYNC_TOKEN;
+    else process.env.PI_SYNC_TOKEN = previous;
+  }
+});

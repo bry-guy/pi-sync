@@ -45,8 +45,8 @@ spec:
             - name: PI_SYNC_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: pi-syncd-token
-                  key: token
+                  name: pi-sync-token
+                  key: PI_SYNC_TOKEN
                   optional: true
           ports:
             - name: http

@@ -25,7 +25,8 @@ commit as `buildId`. Argo CD syncs the pin from `main`. Feature branches and
 
 Roll back by reverting the `deploy(production)` commit on `main`.
 
-Set `PI_SYNC_SERVER_URL` for the Pi package, then install it directly from Git:
+Set `PI_SYNC_SERVER_URL` for the Pi package (and `PI_SYNC_TOKEN` when the server requires one), then install it
+directly from Git:
 
 ```sh
 pi install git:github.com/bry-guy/pi-sync

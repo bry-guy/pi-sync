@@ -42,6 +42,12 @@ spec:
               value: /data
             - name: GOMEMLIMIT
               value: 200MiB
+            - name: PI_SYNC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pi-syncd-token
+                  key: token
+                  optional: true
           ports:
             - name: http
               containerPort: 8080

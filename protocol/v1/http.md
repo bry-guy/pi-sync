@@ -1,7 +1,9 @@
 # Pi synchronization protocol v1
 
 `pi-syncd` is intended to be reachable only through a trusted private network.
-There is no application-level authentication in v1.
+When the server sets `PI_SYNC_TOKEN`, every request except `GET /v1/health` must send
+`Authorization: Bearer <token>` or gets `401 unauthorized`. Without it there is no authentication, so keep the
+server on a private network. Clients read the token from `PI_SYNC_TOKEN`. Over the internet, serve it behind HTTPS.
 
 ## Session envelope
 
@@ -74,8 +76,8 @@ most hourly per label). The list is display-only; it never changes a conversatio
 ETag or `updatedAt`.
 
 Lease tokens are returned only by acquisition and are sent in
-`X-Pi-Sync-Lease`. `Authorization: Bearer` and `X-Lease-Token` are accepted
-as compatibility aliases. Updates must also send `If-Match` with the exact ETag
+`X-Pi-Sync-Lease`. `X-Lease-Token` is accepted as a compatibility alias
+(`Authorization` carries the sync token). Updates must also send `If-Match` with the exact ETag
 returned by acquisition or the previous update.
 
 A workspace pointer may carry `"wip": { "commit": "<hex>", "branch": "<local branch>" }`:

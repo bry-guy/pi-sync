@@ -22,6 +22,8 @@ export interface SyncClientOptions {
   timeoutMs?: number;
   /** This client's label, sent so the server can list the clients a conversation is on. */
   device?: string;
+  /** Shared sync token sent as a bearer token; defaults to PI_SYNC_TOKEN. */
+  token?: string;
 }
 
 export interface RequestOptions {
@@ -78,6 +80,7 @@ export class SyncClient {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly defaultTimeoutMs: number;
   private readonly device: string | undefined;
+  private readonly token: string | undefined;
 
   constructor(options: SyncClientOptions | string) {
     const config = typeof options === "string" ? { baseUrl: options } : options;
@@ -88,6 +91,7 @@ export class SyncClient {
     this.fetchImpl = config.fetch ?? globalThis.fetch.bind(globalThis);
     this.defaultTimeoutMs = config.timeoutMs ?? 10_000;
     this.device = config.device;
+    this.token = config.token ?? (process.env.PI_SYNC_TOKEN?.trim() || undefined);
   }
 
   async health(options: RequestOptions = {}): Promise<HealthResponse> {
@@ -270,7 +274,9 @@ export class SyncClient {
       else signal.addEventListener("abort", abortFromCaller, { once: true });
     }
     try {
-      const headers = this.device ? { ...(init.headers as Record<string, string> | undefined), "X-Pi-Sync-Device": this.device } : init.headers;
+      const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
+      if (this.device) headers["X-Pi-Sync-Device"] = this.device;
+      if (this.token) headers.Authorization = `Bearer ${this.token}`;
       const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
       const length = Number(response.headers.get("content-length") ?? 0);
       if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {

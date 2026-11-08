@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,6 +30,8 @@ var BuildID = "unknown"
 type Server struct {
 	store  *store.Store
 	leases *lease.Registry
+	// Token, when set, is required as "Authorization: Bearer <token>" on every request except health.
+	Token string
 }
 
 func New(filesystem *store.Store, leases *lease.Registry) *Server {
@@ -50,6 +53,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeHealth(w)
+		return
+	}
+	if s.Token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.Token)) != 1 {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "a valid sync token is required", nil)
 		return
 	}
 	if r.URL.Path == "/v1/usage" {

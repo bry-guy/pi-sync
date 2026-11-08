@@ -37,7 +37,10 @@ export async function git(cwd: string, args: string[], options: { env?: Record<s
       maxBuffer: 16 * 1024 * 1024,
     }, (error, stdout, stderr) => {
       const code = error ? (typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1) : 0;
-      resolve({ stdout: String(stdout), stderr: String(stderr), code });
+      // A timeout kills git silently; say so, or callers report an empty reason.
+      const killed = (error as { killed?: boolean } | null)?.killed;
+      const why = killed ? `${String(stderr)}\ntimed out after ${Math.round((options.timeoutMs ?? 10_000) / 1000)}s (offline, or an SSH agent waiting for approval)` : String(stderr);
+      resolve({ stdout: String(stdout), stderr: why, code });
     });
   });
 }

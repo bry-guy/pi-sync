@@ -107,7 +107,13 @@ const out = async (cwd: string, args: string[]) => {
   const result = await git(cwd, args);
   return result.code === 0 ? result.stdout.trim() : undefined;
 };
-const lastLine = (text: string) => text.trim().split("\n").at(-1) ?? "";
+// git's own last line is often a fragment ("and the repository exists."), so name the common causes plainly.
+const lastLine = (text: string) => {
+  if (/Permission denied|correct access rights|Repository not found|access denied|denied to|returned error: 403/i.test(text))
+    return "no permission to push to this repo's remote (use /sync code to stop syncing it)";
+  const lines = text.trim().split("\n");
+  return lines.findLast((l) => /^(fatal|error):/.test(l)) ?? lines.at(-1) ?? "";
+};
 const isAncestor = async (cwd: string, older: string, newer: string) => older === newer || (await git(cwd, ["merge-base", "--is-ancestor", older, newer])).code === 0;
 
 const refsUnder = async (repo: string, prefix: string) => new Map(

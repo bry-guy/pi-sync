@@ -113,7 +113,9 @@ function sanitizeRemote(value: string | undefined): string | undefined {
 export function defaultGitRunner(cwd: string): GitCommandRunner {
   return async (command, args) => {
     try {
-      const result = await execFileAsync(command, args, { cwd, maxBuffer: 256 * 1024 });
+      // Never run repo hooks or fsmonitor from host git (a repo could plant either).
+      const safe = command === "git" ? ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args] : args;
+      const result = await execFileAsync(command, safe, { cwd, maxBuffer: 256 * 1024 });
       return { stdout: result.stdout, code: 0 };
     } catch (error) {
       const value = error as { stdout?: string; code?: number };

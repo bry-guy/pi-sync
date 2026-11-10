@@ -192,6 +192,9 @@ const inProjectOrder = <T>(root: string, run: () => Promise<T>): Promise<T> => {
   return next;
 };
 
+// Module level: a session switch re-runs the factory, and two copies must not check out code at once.
+let arriving: Promise<void> | undefined;
+
 export default function syncExtension(pi: ExtensionAPI) {
   const store = new BindingStore(getAgentDir());
   // Read once per load; /reload picks up edits.
@@ -789,7 +792,6 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   // Per conversation: the code target the user declined or that could not be applied, so it is not asked again.
   const codeSettled = new Map<string, string>();
-  let arriving: Promise<void> | undefined;
   // Per conversation: the workspace pointer last checked, so the poll does not fetch again until a turn changes it.
   const arrivalChecked = new Map<string, string>();
 

@@ -70,6 +70,7 @@ const messages: Record<string, string> = {
   invalid_session: "The synchronized session data was rejected by the server.",
   request_too_large: "The synchronized session is too large.",
   not_found: "The synchronization endpoint was not found.",
+  unauthorized: "The sync server rejected this device's token. Set PI_SYNC_TOKEN and restart pi.",
 };
 
 // A page holds up to one 32 MiB entry, and older servers answer with whole conversations up to a request's size.
@@ -336,6 +337,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function statusCode(status: number): string {
   switch (status) {
     case 400: return "invalid_request";
+    case 401: case 403: return "unauthorized";
     case 404: return "not_found";
     case 409: return "conflict";
     case 412: return "stale_etag";

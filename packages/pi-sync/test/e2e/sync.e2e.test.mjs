@@ -20,8 +20,8 @@ let root, daemonBin, daemon, llm, peers = [];
 
 const git = (cwd, ...args) => { try { return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch (error) { if (args[0] === "config") return ""; throw error; } };
 
-const startDaemon = async (dataDir) => {
-  daemon = spawn(daemonBin, [], { env: { ...process.env, PI_SYNC_LISTEN: `127.0.0.1:${SYNC_PORT}`, PI_SYNC_DATA_DIR: dataDir }, stdio: "ignore" });
+const startDaemon = async (dataDir, env = {}) => {
+  daemon = spawn(daemonBin, [], { env: { ...process.env, PI_SYNC_LISTEN: `127.0.0.1:${SYNC_PORT}`, PI_SYNC_DATA_DIR: dataDir, ...env }, stdio: "ignore" });
   for (let i = 0; i < 50; i++) {
     try {
       if ((await fetch(`${process.env.SYNC_URL}/v1/health`)).ok) return;
@@ -443,6 +443,16 @@ test("sending anyway while the server is down uploads the turn once it is back",
   await sleep(5000);
   assert.deepEqual(await userTexts(B), ["one", "written offline"]);
   assert.equal(sessionFiles("A").length, 1, "no copy when nobody else moved on");
+});
+
+test("a rejected token never blocks sending, and warns once", { ...opts, timeout: 120_000 }, async () => {
+  const { A } = await handoff();
+  await stopDaemon();
+  await startDaemon(join(caseDir, "data"), { PI_SYNC_TOKEN: "server-only" });
+  await A.prompt("no token one");
+  await A.prompt("no token two");
+  assert.deepEqual((await userTexts(A)).slice(-2), ["no token one", "no token two"]);
+  assert.equal(A.notes.filter((n) => /rejected this device's token/.test(n)).length, 1, JSON.stringify(A.notes));
 });
 
 test("code: auto shares without asking, and a failed push is retried on a later turn", { ...opts, timeout: 120_000 }, async () => {

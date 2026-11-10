@@ -1,0 +1,5 @@
+# Changes here can widen what agents may do, so Bryan reviews them.
+/.pi/ @bry-guy
+/.github/ @bry-guy
+/scripts/deploy.sh @bry-guy
+/deploy/ @bry-guy

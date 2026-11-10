@@ -100,6 +100,8 @@ jobs:
           ref: main
           path: main
           fetch-depth: 0
+          # main takes pull requests only; this key is the ruleset's bypass for the pin commit.
+          ssh-key: ${{ secrets.MAIN_DEPLOY_KEY }}
 
       - name: Validate digest
         run: '[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$SHA" =~ ^[0-9a-f]{40}$ ]]'

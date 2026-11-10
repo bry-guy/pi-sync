@@ -261,10 +261,16 @@ export default function syncExtension(pi: ExtensionAPI) {
   // Desynced checkouts of this session's project, shown after the sync status.
   let desyncedCount = 0;
   let statusText: string | undefined;
+  // What the footer shows now. The poll sets the same text every heartbeat; redrawing it made the TUI jitter.
+  let shownStatus: string | undefined | null = null;
+  const tooLargeWarned = new Set<string>();
   const setStatus = (ctx: ExtensionContext | undefined, text?: string) => {
     statusText = text;
+    const shown = text && desyncedCount ? `${text} · ${desyncedCount} desynced` : text;
     try {
-      if (ctx?.hasUI) ctx.ui.setStatus("pi-sync", text && desyncedCount ? `${text} · ${desyncedCount} desynced` : text);
+      if (!ctx?.hasUI || shown === shownStatus) return;
+      ctx.ui.setStatus("pi-sync", shown);
+      shownStatus = shown;
     } catch {
       // A replaced session invalidates its context; the new session sets its own status.
     }
@@ -584,6 +590,11 @@ export default function syncExtension(pi: ExtensionAPI) {
           notify(ctx, DELETED_MESSAGE, "warning");
         }
         else if (code === "stale_etag") setStatus(ctx, "sync: newer copy elsewhere; will refresh");
+        else if (code === "request_too_large") {
+          setStatus(ctx, "sync: too large to upload");
+          if (!tooLargeWarned.has(held.binding.nativeSessionId)) notify(ctx, "This session is too large to synchronize, so it stays on this device. Start a new session to sync again.", "warning");
+          tooLargeWarned.add(held.binding.nativeSessionId);
+        }
         else if (code === "lease_invalid" || code === "lease_not_found") {
           // The server forgets leases when it restarts. Only call it a take-over if someone else holds or wrote it.
           const remote = await clientFor(held.binding.serverUrl).list().then(
@@ -1570,6 +1581,7 @@ let counted = binding;
   };
 
   pi.on("session_start", async (event, ctx) => {
+    shownStatus = null; // a new session's footer starts empty
     if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
     currentSessionId = ctx.sessionManager.getSessionId();
     const reopened = ctx.sessionManager.getSessionFile();

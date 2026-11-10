@@ -21,7 +21,7 @@ let root, daemonBin, daemon, llm, peers = [];
 const git = (cwd, ...args) => { try { return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch (error) { if (args[0] === "config") return ""; throw error; } };
 
 const startDaemon = async (dataDir, env = {}) => {
-  daemon = spawn(daemonBin, [], { env: { ...process.env, PI_SYNC_LISTEN: `127.0.0.1:${SYNC_PORT}`, PI_SYNC_DATA_DIR: dataDir, ...env }, stdio: "ignore" });
+  daemon = spawn(daemonBin, [], { env: { ...process.env, PI_SYNC_LISTEN: `127.0.0.1:${SYNC_PORT}`, PI_SYNC_DATA_DIR: dataDir, PI_SYNC_TOKEN: "", ...env }, stdio: "ignore" });
   for (let i = 0; i < 50; i++) {
     try {
       if ((await fetch(`${process.env.SYNC_URL}/v1/health`)).ok) return;
@@ -376,8 +376,10 @@ test("code follows the conversation: automatically onto a clean, latest main; af
   assert.match(git(b, "stash", "list"), /pi-sync: local changes/);
   assert.equal(readOr(join(b, "scratch.txt")), undefined);
 
-  // Hand edits between turns travel too, and replace the previous snapshot on B without asking.
+  // Hand edits between turns travel too (B fetches on its next turn or /sync code), and replace the previous snapshot on B without asking.
   writeFileSync(join(a, "new.txt"), "edited by hand\n");
+  assert.ok(await waitFor(() => /edited by hand/.test(git(origin, "log", "-p", "-1", "--format=", ...git(origin, "for-each-ref", "--format=%(refname)", "refs/pi-sync/").split("\n").filter(Boolean))), 90_000), "A shared the hand edit");
+  await B.prompt("/sync code");
   assert.ok(await waitFor(() => readOr(join(b, "new.txt")) === "edited by hand\n", 30_000), `hand edit arrived: ${JSON.stringify(B.notes)}`);
 
   // The snapshot vanishes while the branch moves on: B's copy of the shared work is stashed, never discarded.
@@ -390,6 +392,7 @@ test("code follows the conversation: automatically onto a clean, latest main; af
   git(c, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "elsewhere");
   git(c, "push", "-q", "origin", "feat");
   for (const ref of git(origin, "for-each-ref", "--format=%(refname)", "refs/pi-sync/").split("\n").filter(Boolean)) git(origin, "update-ref", "-d", ref);
+  await B.prompt("/sync code");
   assert.ok(await waitFor(() => readOr(join(b, "other.txt")) === "from elsewhere\n", 30_000), `B moved to the new tip: ${JSON.stringify(B.notes)}`);
   assert.match(git(b, "stash", "show", "--include-untracked", "-p", "stash@{0}"), /edited by hand/, "B's copy of the work is in the stash");
   git(a, "fetch", "-q", "origin");
@@ -399,7 +402,8 @@ test("code follows the conversation: automatically onto a clean, latest main; af
   git(a, "add", "-A");
   git(a, "-c", "user.email=e@x", "-c", "user.name=e", "commit", "-q", "-m", "done");
   git(a, "push", "-q", "-u", "origin", "feat");
-  assert.ok(await waitFor(() => git(origin, "for-each-ref", "refs/pi-sync/") === "", 30_000), "snapshot cleared");
+  assert.ok(await waitFor(() => git(origin, "for-each-ref", "refs/pi-sync/") === "", 90_000), "snapshot cleared");
+  await B.prompt("/sync code");
   assert.ok(await waitFor(() => { try { return git(b, "rev-parse", "HEAD") === git(a, "rev-parse", "HEAD"); } catch { return false; } }, 30_000), `B fast-forwarded: ${JSON.stringify(B.notes)}`);
   assert.equal(git(b, "status", "--porcelain"), "", "B is clean at the pushed commit");
 });

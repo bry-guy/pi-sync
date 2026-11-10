@@ -79,3 +79,13 @@ test("client sends the sync token as a bearer token", async () => {
     else process.env.PI_SYNC_TOKEN = previous;
   }
 });
+
+test("a rejected token becomes an unauthorized error", async () => {
+  const client = new SyncClient({ baseUrl: "http://sync.test", fetch: async () => new Response("unauthorized", { status: 401 }) });
+  await assert.rejects(() => client.list(), (error) => {
+    assert.ok(error instanceof SyncClientError);
+    assert.equal(error.code, "unauthorized");
+    assert.equal(error.message, "The sync server rejected this device's token. Set PI_SYNC_TOKEN and restart pi.");
+    return true;
+  });
+});

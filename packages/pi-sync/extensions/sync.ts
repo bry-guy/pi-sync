@@ -71,9 +71,12 @@ const shared = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.shar
   freshEnroll: new Set<string>(),
   // A catch-up re-opens the session file; this device's model and thinking level to restore, by file.
   keptSettings: new Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>(),
+  // The rejected-token warning shows once per process, not on every message or poll.
+  tokenWarned: false,
 }) as {
   freshEnroll: Set<string>;
   keptSettings: Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>;
+  tokenWarned: boolean;
 };
 const { freshEnroll, keptSettings } = shared;
 
@@ -81,7 +84,7 @@ type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
 type Replay = { sessionId: string; text: string; images?: unknown[]; compact?: { customInstructions?: string } };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
-type Acquired = { ok: true; acquired: { etag: string; count?: number; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean };
+type Acquired = { ok: true; acquired: { etag: string; count?: number; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean; unauthorized?: boolean };
 type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
 
 function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
@@ -395,6 +398,13 @@ export default function syncExtension(pi: ExtensionAPI) {
     setStatus(ctx, "sync: history deleted; next message starts a new chat");
   };
 
+  const tokenRejected = (ctx: ExtensionContext) => {
+    setStatus(ctx, "sync: token rejected (set PI_SYNC_TOKEN)");
+    if (shared.tokenWarned) return;
+    shared.tokenWarned = true;
+    notify(ctx, "The sync server rejected this device's token. Set PI_SYNC_TOKEN and restart pi.", "warning");
+  };
+
   const explainFailure = async (ctx: ExtensionContext, binding: SyncBinding, error: unknown): Promise<string> => {
     const code = error instanceof SyncClientError ? error.code : "";
     if (code === "session_deleted") {
@@ -414,6 +424,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (["not_found", "method_not_allowed", "workspace_required", "workspace_mismatch"].includes(code)) {
       setStatus(ctx, "sync: server needs update");
       return `The sync server at ${binding.serverUrl} is older than this pi-sync client. Update pi-syncd to keep syncing.`;
+    }
+    if (code === "unauthorized") {
+      tokenRejected(ctx);
+      return error instanceof Error ? error.message : "The sync server rejected this device's token.";
     }
     if (code === "network_error" || code === "timeout") {
       setStatus(ctx, "sync: offline");
@@ -437,7 +451,8 @@ export default function syncExtension(pi: ExtensionAPI) {
           ? (typeof error.details?.holder === "string" ? error.details.holder : "another device")
           : undefined;
         const offline = error instanceof SyncClientError && (error.code === "network_error" || error.code === "timeout");
-        return { ok: false, message: await explainFailure(ctx, binding, error), holder, offline };
+        const unauthorized = error instanceof SyncClientError && error.code === "unauthorized";
+        return { ok: false, message: await explainFailure(ctx, binding, error), holder, offline, unauthorized };
       }
     }
   };
@@ -1183,8 +1198,9 @@ let counted = binding;
     let metadata;
     try {
       metadata = (await clientFor(binding.serverUrl).list()).sessions.find((item) => item.sessionId === binding.canonicalSessionId);
-    } catch {
-      setStatus(ctx, "sync: offline");
+    } catch (error) {
+      if (error instanceof SyncClientError && error.code === "unauthorized") tokenRejected(ctx);
+      else setStatus(ctx, "sync: offline");
       return;
     }
     if (generation !== pollGeneration || lease || busy || !ctx.isIdle() || hasPendingInput(ctx)) return;
@@ -1665,6 +1681,8 @@ let counted = binding;
       );
       if (takeOver) reserved = await exclusive(() => acquire(ctx, binding, true));
     }
+    // A sync problem may delay uploads but never blocks local work: the turn stays here and uploads later.
+    if (!reserved.ok && reserved.unauthorized) return { action: "continue" as const };
     if (!reserved.ok && reserved.offline && ctx.hasUI) {
       const sendAnyway = await ctx.ui.confirm(
         "Sync server unreachable",

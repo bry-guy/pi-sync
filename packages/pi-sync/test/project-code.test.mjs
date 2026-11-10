@@ -255,3 +255,48 @@ test("checkouts: a branch deleted on one machine is not brought back by another"
   assert.equal(existsSync(wt(laptop, "old")), false);
   assert.equal(git(web.app, "branch", "--list", "old").trim(), "old", "the other machine keeps its own branch");
 });
+
+const remoteTip = (m, key) => git(m.app, "ls-remote", "origin", `refs/pi-checkouts/p1/${key}`).split("\t")[0];
+const localRef = (m, kind, key) => { try { return git(m.app, "rev-parse", "--verify", "--quiet", `refs/${kind}/p1/${key}`); } catch { return ""; } };
+
+test("checkouts: a theirs ref dropped by another process's stale listing still ends in a shared removal", async () => {
+  const { laptop } = setup();
+  git(laptop.app, "worktree", "add", "-q", "-b", "gone", wt(laptop, "gone"));
+  await sync(laptop, "macbook");
+  const snapshot = remoteTip(laptop, "wt/gone");
+  // What a pass that listed the remote before this key was pushed does to it.
+  git(laptop.app, "update-ref", "-d", "refs/pi-checkouts-theirs/p1/wt/gone");
+  git(laptop.app, "worktree", "remove", "--force", wt(laptop, "gone"));
+  assert.equal((await sync(laptop, "macbook", { fetch: false }))["wt/gone"].result, "shared");
+  const tip = remoteTip(laptop, "wt/gone");
+  assert.match(git(laptop.app, "log", "-1", "--format=%B", tip), /^Removed: yes$/m);
+  assert.equal(git(laptop.app, "log", "-1", "--format=%P", tip), snapshot);
+});
+
+test("checkouts: a new key shared by one pass keeps both local refs when a racing pass lost its theirs ref", async () => {
+  const { laptop } = setup();
+  await sync(laptop, "macbook");
+  // Pass B shares a new key; pass A, which listed the remote before that push, drops the theirs ref and carries on.
+  git(laptop.app, "worktree", "add", "-q", "-b", "fresh", wt(laptop, "fresh"));
+  assert.equal((await sync(laptop, "macbook"))["wt/fresh"].result, "shared");
+  git(laptop.app, "update-ref", "-d", "refs/pi-checkouts-theirs/p1/wt/fresh");
+  assert.equal((await sync(laptop, "macbook", { fetch: false }))["wt/fresh"].result, "unchanged");
+  const tip = remoteTip(laptop, "wt/fresh");
+  assert.equal(localRef(laptop, "pi-checkouts", "wt/fresh"), tip);
+  assert.equal(localRef(laptop, "pi-checkouts-theirs", "wt/fresh"), tip);
+});
+
+test("checkouts: a remote snapshot with no local record and no checkout is followed (re-created)", async () => {
+  const { laptop, web } = setup();
+  git(laptop.app, "worktree", "add", "-q", "-b", "merged", wt(laptop, "merged"));
+  await sync(laptop, "macbook");
+  await sync(web, "web");
+  // Web lost its refs, then removed the worktree and deleted the merged branch.
+  git(web.app, "update-ref", "-d", "refs/pi-checkouts/p1/wt/merged");
+  git(web.app, "update-ref", "-d", "refs/pi-checkouts-theirs/p1/wt/merged");
+  git(web.app, "worktree", "remove", "--force", wt(web, "merged"));
+  git(web.app, "branch", "-q", "-D", "merged");
+  assert.equal((await sync(web, "web", { fetch: false }))["wt/merged"], undefined, "share only: nothing to share");
+  assert.equal((await sync(web, "web"))["wt/merged"].result, "created");
+  assert.equal(existsSync(wt(web, "merged")), true);
+});

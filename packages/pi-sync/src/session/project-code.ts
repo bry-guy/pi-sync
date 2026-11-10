@@ -223,9 +223,12 @@ async function fetchTheirs(ctx: Ctx): Promise<string | undefined> {
   return undefined;
 }
 
-async function refreshTheirs(ctx: Ctx, key: string): Promise<void> {
+/** Refetches one key's remote state; true when the remote says it has none. */
+async function refreshTheirs(ctx: Ctx, key: string): Promise<boolean> {
   const fetched = await git(ctx.repo, ["fetch", "--no-tags", "--quiet", ctx.remote, `+${knownRef(ctx.project, key)}:${theirsRef(ctx.project, key)}`], { timeoutMs: 60_000 });
-  if (fetched.code !== 0 && /couldn't find remote ref|no such ref/i.test(fetched.stderr)) await git(ctx.repo, ["update-ref", "-d", theirsRef(ctx.project, key)]);
+  const gone = fetched.code !== 0 && /couldn't find remote ref|no such ref/i.test(fetched.stderr);
+  if (gone) await git(ctx.repo, ["update-ref", "-d", theirsRef(ctx.project, key)]);
+  return gone;
 }
 
 const refOf = (repo: string, ref: string) => out(repo, ["rev-parse", "--verify", "--quiet", ref]);
@@ -237,11 +240,17 @@ async function syncCheckout(ctx: Ctx, key: string, path: string | undefined, app
   const current = path ? await stateOf(path) : undefined;
   if (path && !current) return { ...base, result: "failed", message: `${ctx.name} ${key}: could not read the checkout.` };
   let K = await refOf(repo, knownRef(project, key));
-  const T = await refOf(repo, theirsRef(project, key));
+  let T = await refOf(repo, theirsRef(project, key));
   if (K && !T && !retried) {
-    // The shared state is gone from the remote (cleared by hand, or never pushed): start over from this checkout.
-    await git(repo, ["update-ref", "-d", knownRef(project, key)]);
-    K = undefined;
+    // A listing taken before another pi process pushed this key can drop its theirs ref, so ask the remote itself.
+    const gone = await refreshTheirs(ctx, key);
+    T = await refOf(repo, theirsRef(project, key));
+    if (!T && !gone) return { ...base, result: "failed", message: `${labelOf(ctx, key)}: could not check its state on the remote.` };
+    if (!T) {
+      // The shared state is gone from the remote (cleared by hand, or never pushed): start over from this checkout.
+      await git(repo, ["update-ref", "-d", knownRef(project, key)]);
+      K = undefined;
+    }
   }
   const known = K ? await sharedOf(repo, K) : undefined;
   const theirs = T ? await sharedOf(repo, T) : undefined;

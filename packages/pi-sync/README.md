@@ -46,6 +46,11 @@ conversation out of `allSessions`.
   `/sync open <id>` to open one directly.
 - `/sync status`, `/sync refresh`, and `/sync detach` inspect, force-refresh,
   or stop syncing on this device. Detaching leaves the server copy unchanged.
+- `/sync attach` on a detached conversation syncs it again. If no other device
+  wrote to it meanwhile, the turns made here while detached are uploaded (in
+  several requests when large) and the file stays as it is. If the server copy
+  moved on too, this device takes the server copy and keeps its own detached
+  turns as a separate “(unsynced copy)” conversation in `/resume`.
 
 Once a conversation is shared, synchronization runs in the background:
 

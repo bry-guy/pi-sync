@@ -81,7 +81,7 @@ const shared = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.shar
 const { freshEnroll, keptSettings } = shared;
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
-type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean };
+type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean; uploaded?: { entries: number; turns: number } };
 type Replay = { sessionId: string; text: string; images?: unknown[]; compact?: { customInstructions?: string } };
 type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
 type Acquired = { ok: true; acquired: { etag: string; count?: number; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean; unauthorized?: boolean };
@@ -133,6 +133,36 @@ function syncedPrefix(local: readonly { id?: unknown }[], binding: SyncBinding):
   const count = binding.syncedCount;
   if (!count || !binding.syncedLastId || local.length < count || local[count - 1]?.id !== binding.syncedLastId) return 0;
   return count;
+}
+
+/**
+ * Whether `local` starts with the whole canonical conversation and only adds entries onto it: then its local-only
+ * entries are uploads still to make (a re-attach, or a lost upload response), not a second writer's turns.
+ */
+export function extendsCanonical(local: readonly { id?: unknown; parentId?: unknown }[], canonical: readonly { id?: unknown }[]): boolean {
+  if (canonical.length === 0 || local.length < canonical.length || canonical.some((entry, index) => local[index]?.id !== entry.id)) return false;
+  const known = new Set(canonical.map((entry) => entry.id));
+  for (const entry of local.slice(canonical.length)) {
+    if (!known.has(entry.parentId)) return false;
+    known.add(entry.id);
+  }
+  return true;
+}
+
+/** Splits entries into requests of at most `limit` bytes (one oversized entry still goes alone); none gives one empty batch. */
+export function inBatches<T>(entries: readonly T[], limit: number): T[][] {
+  const batches: T[][] = [[]];
+  let size = 0;
+  for (const entry of entries) {
+    const bytes = Buffer.byteLength(JSON.stringify(entry));
+    if (size + bytes > limit && batches.at(-1)!.length > 0) {
+      batches.push([]);
+      size = 0;
+    }
+    batches.at(-1)!.push(entry);
+    size += bytes;
+  }
+  return batches;
 }
 
 function defaultDeviceLabel(): string {
@@ -526,13 +556,22 @@ export default function syncExtension(pi: ExtensionAPI) {
         workspace: workspace ?? (await idleWorkspace(ctx, binding)),
         ...(projectLink(entries) ? { project: projectLink(entries)!.name } : {}),
       };
+      // A long tail (a re-attach after days detached) goes in several requests. Each one is recorded as synchronized,
+      // so a failure part-way leaves a copy that is simply ahead, and the next check sends the rest.
+      let next = binding;
+      let count = base;
       try {
-        const response = await client.append(binding.canonicalSessionId, token, binding.lastEtag, { baseCount: base, entries: withoutLocalSettings(entries.slice(base)), ...header });
-        const envelope = { formatVersion: 1 as const, sessionId: binding.canonicalSessionId, piSessionVersion: 3, createdAt: "", parentSessionId: binding.parentSessionId ?? null, ...header, entries };
-        const next = syncedBinding(binding, envelope, response.etag, file);
-        await store.set(next);
+        for (const batch of inBatches(withoutLocalSettings(entries.slice(base)), ENROLL_BATCH_BYTES)) {
+          count += batch.length;
+          const headEntryId = count === entries.length ? header.headEntryId : batch.at(-1)!.id;
+          const response = await client.append(binding.canonicalSessionId, token, next.lastEtag, { baseCount: count - batch.length, entries: batch, ...header, headEntryId });
+          const envelope = { formatVersion: 1 as const, sessionId: binding.canonicalSessionId, piSessionVersion: 3, createdAt: "", parentSessionId: binding.parentSessionId ?? null, ...header, headEntryId, entries: entries.slice(0, count) };
+          next = syncedBinding(next, envelope, response.etag, file);
+          await store.set(next);
+        }
         return next;
       } catch (error) {
+        if (next !== binding) throw error;
         if (!(error instanceof SyncClientError) || (error.code !== "not_found" && error.code !== "method_not_allowed")) throw error;
       }
     }
@@ -1011,6 +1050,12 @@ export default function syncExtension(pi: ExtensionAPI) {
     binding: SyncBinding,
     snapshot: SessionResponse,
   ): Promise<{ binding: SyncBinding; headEntryId: string; copyTitle?: string }> => {
+    // Only ahead (a picked copy whose uploads were pending): keep the file; the next check uploads its new entries.
+    if (local && extendsCanonical(local.entries, snapshot.session.entries)) {
+      const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
+      await store.set(next);
+      return { binding: next, headEntryId: local.headEntryId };
+    }
     const remoteIds = new Set(snapshot.session.entries.map((entry: PiEntry) => entry.id));
     const localOnly = local?.entries.filter((entry) => !remoteIds.has(entry.id)) ?? [];
     const diverged = localOnly.some((entry) => CONTEXT_ENTRY_TYPES.has(entry.type));
@@ -1104,21 +1149,31 @@ export default function syncExtension(pi: ExtensionAPI) {
       const fetched = await fetchCanonical(ctx, binding, localEntries);
       if (!fetched.ok) return { kind: "refused" as const, message: fetched.message };
       const { snapshot } = fetched;
+      // This copy is the server's plus entries it never uploaded (re-attached, or an upload's reply was lost):
+      // record it as synchronized up to the server's state, so the entries upload below instead of forking.
+      let bound = binding;
+      if (snapshot.etag !== binding.lastEtag && extendsCanonical(localEntries, snapshot.session.entries)) {
+        bound = syncedBinding(binding, snapshot.session, snapshot.etag, ctx.sessionManager.getSessionFile() ?? binding.materializedFile);
+        await store.set(bound);
+      }
       // Uploading a copy that lacks canonical entries would roll the conversation back, so it catches up instead.
-      if (snapshot.etag === binding.lastEtag && holdsCanonical(localEntries, binding, snapshot.session.entries)) {
+      if (snapshot.etag === bound.lastEtag && holdsCanonical(localEntries, bound, snapshot.session.entries)) {
         const canonical = snapshot.session.entries;
-let counted = binding;
-                // First check with a binding that has no count: record it, so later turns send only what they add.
-        if (binding.syncedCount === undefined && canonical.length > 0 && localEntries[canonical.length - 1]?.id === canonical.at(-1)?.id) {
-          counted = { ...binding, syncedCount: canonical.length, syncedLastId: canonical.at(-1)!.id };
+        let counted = bound;
+        // First check with a binding that has no count: record it, so later turns send only what they add.
+        if (bound.syncedCount === undefined && canonical.length > 0 && localEntries[canonical.length - 1]?.id === canonical.at(-1)?.id) {
+          counted = { ...bound, syncedCount: canonical.length, syncedLastId: canonical.at(-1)!.id };
           await store.set(counted);
         }
+        let uploaded: CheckResult["uploaded"];
         // Already current; push idle local changes (renames, model switches) under a brief lease.
-        if (localChanged(ctx, binding)) {
+        if (localChanged(ctx, bound)) {
           const reserved = await acquire(ctx, counted);
           if (!reserved.ok) return { kind: "refused" as const, message: reserved.message };
           try {
-            await upload(ctx, counted, reserved.acquired.lease.token);
+            const next = await upload(ctx, counted, reserved.acquired.lease.token);
+            const sent = localEntries.slice(counted.syncedCount ?? 0, next.syncedCount);
+            uploaded = { entries: sent.length, turns: sent.filter((entry) => entry.type === "message" && (entry as any).message?.role === "user").length };
             setStatus(ctx, "sync: up to date");
           } catch {
             setStatus(ctx, "sync: upload pending");
@@ -1128,7 +1183,7 @@ let counted = binding;
         } else {
           setStatus(ctx, "sync: up to date");
         }
-        return { kind: "current" as const };
+        return { kind: "current" as const, uploaded };
       }
       let local: SessionEnvelope | undefined;
       try {
@@ -1150,7 +1205,7 @@ let counted = binding;
       // Another refresh may have caught up first; the replay still runs here.
       if (replay?.compact) ctx.compact(replay.compact);
       else if (replay) pi.sendUserMessage(replay.text);
-      return { outcome: "unchanged", sessionId };
+      return { outcome: "unchanged", sessionId, uploaded: result.uploaded };
     }
     // Automatic catch-ups stay quiet: the new turns appearing is the signal.
     const message = mode === "manual" ? "Synchronized conversation refreshed." : undefined;
@@ -1315,17 +1370,7 @@ let counted = binding;
   /** Uploads a new conversation; one that does not fit in a request is sent as a first part plus appends. */
   const enrollInBatches = async (url: string, envelope: SessionEnvelope): Promise<{ etag: string }> => {
     const client = clientFor(url);
-    const batches: PiEntry[][] = [[]];
-    let size = 0;
-    for (const entry of envelope.entries) {
-      const bytes = Buffer.byteLength(JSON.stringify(entry));
-      if (size + bytes > ENROLL_BATCH_BYTES && batches.at(-1)!.length > 0) {
-        batches.push([]);
-        size = 0;
-      }
-      batches.at(-1)!.push(entry);
-      size += bytes;
-    }
+    const batches = inBatches(envelope.entries, ENROLL_BATCH_BYTES);
     const first = batches[0]!;
     if (batches.length === 1) return client.enroll(envelope);
     let { etag } = await client.enroll({ ...envelope, entries: first, headEntryId: first.at(-1)!.id });
@@ -1382,11 +1427,15 @@ let counted = binding;
       if (!(error instanceof SyncClientError) || error.code !== "duplicate_enrollment") {
         return fail(ctx, "sync_enrollment_failed", error instanceof Error ? error.message : "Could not synchronize this conversation.");
       }
-      // The server already has it (re-attach after detach or a lost binding): adopt the server copy,
-      // preserving any local-only turns as a separate session.
+      // The server already has it (re-attach after detach or a lost binding): a copy that is only ahead uploads
+      // what it added; otherwise adopt the server copy, preserving local-only turns as a separate session.
       await store.set(base);
-      await refreshCurrent(ctx, "auto");
-      return;
+      const result = await refreshCurrent(ctx, "auto");
+      if (result.outcome !== "unchanged") return;
+      const { uploaded } = result;
+      notify(ctx, uploaded?.entries
+        ? `Conversation synchronized again: uploaded ${uploaded.turns} ${uploaded.turns === 1 ? "turn" : "turns"} (${uploaded.entries} entries) made while detached.`
+        : "Conversation synchronized again.", "info");
     }
     startPoll(ctx);
   };

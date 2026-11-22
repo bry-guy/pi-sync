@@ -19,6 +19,8 @@ test("anything else is not an extension", () => {
   assert.equal(extendsCanonical([...server, { id: "d", parentId: "zz" }], server), false, "tail hangs off an unknown entry");
   assert.equal(extendsCanonical([...server, { id: "d", parentId: null }], server), false, "second root");
   assert.equal(extendsCanonical(chain("a"), []), false, "empty canonical");
+  assert.equal(extendsCanonical([...server, { id: "b", parentId: "c" }], server), false, "tail repeats a canonical id");
+  assert.equal(extendsCanonical([...server, { id: "d", parentId: "c" }, { id: "d", parentId: "d" }], server), false, "tail repeats its own id");
 });
 
 test("batches stay under the byte limit and keep order", () => {

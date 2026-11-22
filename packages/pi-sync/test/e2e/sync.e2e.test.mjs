@@ -3,6 +3,7 @@
 import { after, before, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -317,6 +318,251 @@ test("detach then attach adopts the server copy without duplicates", { ...opts, 
   await A.prompt("three");
   await sleep(2500);
   assert.deepEqual(await userTexts(B), ["one", "two", "three"]);
+});
+
+const fileLines = (file) => readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+/** The ids the server holds for `sessionId`, in order, read page by page. */
+const serverIds = async (sessionId) => {
+  const ids = [];
+  for (;;) {
+    const page = await (await fetch(`${process.env.SYNC_URL}/v1/sessions/${sessionId}/entries?from=${ids.length}`)).json();
+    ids.push(...page.session.entries.map((entry) => entry.id));
+    if (page.complete) return ids;
+  }
+};
+
+test("re-attaching a copy that is only ahead uploads its new turns instead of forking", { ...opts, timeout: 120_000 }, async () => {
+  const A = peer("A");
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("two");
+  await A.prompt("/sync detach");
+  await A.prompt("three");
+  await A.prompt("four");
+  const { sessionFile, sessionId } = await A.state();
+  const before = readFileSync(sessionFile, "utf8");
+  await A.prompt("/sync attach");
+  assert.ok(A.notes.some((note) => /uploaded 2 turns/.test(note)), JSON.stringify(A.notes));
+  const after = readFileSync(sessionFile, "utf8");
+  assert.ok(after.startsWith(before), "the file is not rewritten");
+  assert.ok(after.slice(before.length).split("\n").filter(Boolean).every((line) => JSON.parse(line).customType === "pi-sync-link"), "only link entries are appended");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+  assert.deepEqual(await serverIds(sessionId), fileLines(sessionFile).slice(1).map((entry) => entry.id), "the server holds every entry in order");
+
+  const B = peer("B");
+  await ready(B);
+  B.answers.push((options) => options[0]);
+  await B.prompt("/sync");
+  await sleep(300);
+  assert.deepEqual(await userTexts(B), ["one", "two", "three", "four"]);
+  await A.prompt("five");
+  await sleep(2500);
+  assert.deepEqual(await userTexts(B), ["one", "two", "three", "four", "five"]);
+});
+
+test("re-attaching after both sides moved on still keeps this device's turns as a copy", { ...opts, timeout: 90_000 }, async () => {
+  const { A, B } = await handoff();
+  await A.prompt("/sync detach");
+  await A.prompt("a alone");
+  await B.prompt("b moved on");
+  await A.prompt("/sync attach");
+  await sleep(500);
+  assert.deepEqual(await userTexts(A), ["one", "b moved on"]);
+  assert.equal(sessionFiles("A").length, 2, "A's detached turn is saved as a separate copy");
+  assert.ok(A.notes.some((note) => /\(unsynced copy\)/.test(note)), JSON.stringify(A.notes));
+});
+
+test("re-attaching with a tail too large for one request uploads it in batches", { ...opts, timeout: 300_000 }, async () => {
+  const A = peer("A");
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("/sync detach");
+  const { sessionFile, sessionId } = await A.state();
+  await A.stop();
+  peers.splice(peers.indexOf(A), 1);
+  // Over the 64 MB request limit, so only batched appends can carry it.
+  let parent = fileLines(sessionFile).at(-1).id;
+  const pad = "o".repeat(40_000);
+  const tail = [];
+  for (let i = 0; i < 1700; i++) {
+    const id = `om${String(i).padStart(6, "0")}`;
+    tail.push(JSON.stringify({ type: "custom", customType: "om.observations.recorded", data: { text: pad, i }, id, parentId: parent, timestamp: "2026-10-01T00:00:01.000Z" }));
+    parent = id;
+  }
+  writeFileSync(sessionFile, `${readFileSync(sessionFile, "utf8")}${tail.join("\n")}\n`);
+  const A2 = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["--session", sessionFile] });
+  peers.push(A2);
+  await ready(A2);
+  await A2.prompt("two");
+  await A2.prompt("/sync attach");
+  assert.ok(A2.notes.some((note) => /uploaded 1 turn \(/.test(note)), JSON.stringify(A2.notes));
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+  assert.deepEqual(await serverIds(sessionId), fileLines(sessionFile).slice(1).map((entry) => entry.id), "the server holds every entry in order");
+});
+
+/**
+ * A proxy in front of pi-syncd that counts appends. `onAppend(n)` decides the n-th one: "fail" answers 503 without
+ * forwarding; "lose" forwards it and then drops the connection, so the server stores it but the client never hears.
+ */
+const startProxy = async (onAppend = () => undefined) => {
+  const appends = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", async () => {
+      const body = Buffer.concat(chunks);
+      let action;
+      if (req.method === "POST" && /\/entries$/.test(req.url.split("?")[0])) {
+        const parsed = JSON.parse(body.toString());
+        appends.push({ baseCount: parsed.baseCount, count: parsed.entries.length });
+        action = onAppend(appends.length);
+      }
+      if (action === "fail") {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "unavailable", message: "injected failure" } }));
+      }
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers["content-length"];
+      try {
+        const upstream = await fetch(`${process.env.SYNC_URL}${req.url}`, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body });
+        const payload = Buffer.from(await upstream.arrayBuffer());
+        if (action === "lose") return req.socket.destroy();
+        const out = Object.fromEntries([...upstream.headers].filter(([key]) => !["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)));
+        res.writeHead(upstream.status, out);
+        res.end(payload);
+      } catch {
+        req.socket.destroy();
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(SYNC_PORT + 2, "127.0.0.1", resolve));
+  const close = () => { server.closeAllConnections(); server.close(); };
+  proxies.push(close);
+  return { url: `http://127.0.0.1:${SYNC_PORT + 2}`, appends, close };
+};
+let proxies = [];
+beforeEach(() => { for (const close of proxies) close(); proxies = []; });
+after(() => { for (const close of proxies) close(); });
+const bindingOf = (name, sessionId) => JSON.parse(readFileSync(join(caseDir, `agent${name}`, "sync-bindings.json"), "utf8")).bindings.find((item) => item.nativeSessionId === sessionId);
+const onlyLinksAdded = (before, after) => after.startsWith(before) && after.slice(before.length).split("\n").filter(Boolean).every((line) => JSON.parse(line).customType === "pi-sync-link");
+
+test("re-attaching a copy with no new turns binds without a copy or a rewrite", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A");
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("two");
+  await A.prompt("/sync detach");
+  const { sessionFile, sessionId } = await A.state();
+  const before = readFileSync(sessionFile, "utf8");
+  await A.prompt("/sync attach");
+  assert.equal(A.notes.at(-1), "Conversation synchronized again.");
+  assert.ok(onlyLinksAdded(before, readFileSync(sessionFile, "utf8")), "only link entries are appended");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+  assert.ok(bindingOf("A", sessionId), "bound");
+  assert.deepEqual(await serverIds(sessionId), fileLines(sessionFile).slice(1).map((entry) => entry.id));
+});
+
+test("a re-attach upload that fails between batches keeps the first batch and sends only the rest next time", { ...opts, timeout: 180_000 }, async () => {
+  let failSecond = false;
+  const proxy = await startProxy((n) => (failSecond && n === 2 ? "fail" : undefined));
+  const env = { PI_SYNC_SERVER_URL: proxy.url };
+  const A = peer("A", "a", env);
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("/sync detach");
+  const { sessionFile, sessionId } = await A.state();
+  await A.stop();
+  peers.splice(peers.indexOf(A), 1);
+  // About 12 MB: two 8 MB appends.
+  let parent = fileLines(sessionFile).at(-1).id;
+  const pad = "o".repeat(40_000);
+  const tail = [];
+  for (let i = 0; i < 300; i++) {
+    const id = `om${String(i).padStart(6, "0")}`;
+    tail.push(JSON.stringify({ type: "custom", customType: "om.observations.recorded", data: { text: pad, i }, id, parentId: parent, timestamp: "2026-10-01T00:00:01.000Z" }));
+    parent = id;
+  }
+  writeFileSync(sessionFile, `${readFileSync(sessionFile, "utf8")}${tail.join("\n")}\n`);
+  const A2 = new Pi("A", { cwd: join(caseDir, "git", "a"), agentDir: join(caseDir, "agentA"), args: ["--session", sessionFile], env });
+  peers.push(A2);
+  await ready(A2);
+  await A2.prompt("two");
+  proxy.appends.length = 0;
+  failSecond = true;
+  await A2.prompt("/sync attach");
+  failSecond = false;
+  const [first] = proxy.appends;
+  assert.equal(proxy.appends.length, 2, JSON.stringify(proxy.appends));
+  const total = fileLines(sessionFile).length - 1 - first.baseCount;
+  assert.match(A2.notes.at(-1), new RegExp(`${first.count} of ${total} entries are uploaded, the rest will be sent on the next check`));
+  assert.equal(A2.status["pi-sync"], "sync: upload pending");
+  const synced = first.baseCount + first.count;
+  assert.equal(bindingOf("A", sessionId).syncedCount, synced, "the binding records the first batch");
+  assert.deepEqual(await serverIds(sessionId), fileLines(sessionFile).slice(1, 1 + synced).map((entry) => entry.id));
+
+  await A2.prompt("/sync refresh");
+  assert.equal(proxy.appends[2]?.baseCount, synced, `the next check starts after the first batch: ${JSON.stringify(proxy.appends)}`);
+  assert.equal(A2.status["pi-sync"], "sync: up to date");
+  assert.deepEqual(await serverIds(sessionId), fileLines(sessionFile).slice(1).map((entry) => entry.id), "every entry once, in order");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+  assert.ok(!A2.notes.some((note) => /unsynced copy/.test(note)), JSON.stringify(A2.notes));
+});
+
+test("an append the server stored but whose reply was lost is neither forked nor duplicated", { ...opts, timeout: 120_000 }, async () => {
+  let lose = false;
+  const proxy = await startProxy(() => {
+    if (!lose) return undefined;
+    lose = false;
+    return "lose";
+  });
+  const A = peer("A", "a", { PI_SYNC_SERVER_URL: proxy.url });
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("two");
+  lose = true;
+  await A.prompt("three");
+  await sleep(500);
+  assert.equal(lose, false, "an append was lost");
+  await A.prompt("four");
+  await A.prompt("five");
+  const { sessionFile, sessionId } = await A.state();
+  const expected = fileLines(sessionFile).slice(1).map((entry) => entry.id);
+  assert.deepEqual(await eventually(() => serverIds(sessionId), expected), expected, "every entry once, in order");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
+  assert.ok(!A.notes.some((note) => /unsynced copy/.test(note)), JSON.stringify(A.notes));
+  assert.deepEqual(await userTexts(A), ["one", "two", "three", "four", "five"]);
+});
+
+test("an idle copy follows a head another device moved without adding entries, without a rewrite", { ...opts, timeout: 90_000 }, async () => {
+  const A = peer("A");
+  await ready(A);
+  await A.prompt("one");
+  await A.prompt("/sync attach");
+  await A.prompt("two");
+  const { sessionFile, sessionId } = await A.state();
+  await sleep(500);
+  const before = readFileSync(sessionFile, "utf8");
+  // Another device runs /tree back to the first reply: a header-only append under its own lease.
+  const reply = fileLines(sessionFile).find((entry) => entry.type === "message" && entry.message.role === "assistant");
+  const leased = await (await fetch(`${process.env.SYNC_URL}/v1/sessions/${sessionId}/lease?entries=none`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ holder: "other" }) })).json();
+  const count = (await serverIds(sessionId)).length;
+  const moved = await fetch(`${process.env.SYNC_URL}/v1/sessions/${sessionId}/entries`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Pi-Sync-Lease": leased.lease.token, "If-Match": leased.etag },
+    body: JSON.stringify({ baseCount: count, entries: [], headEntryId: reply.id, title: "t" }),
+  });
+  assert.equal(moved.status, 200, await moved.clone().text());
+  await fetch(`${process.env.SYNC_URL}/v1/sessions/${sessionId}/lease`, { method: "DELETE", headers: { "X-Pi-Sync-Lease": leased.lease.token } });
+  await A.prompt("/sync refresh");
+  assert.deepEqual(await eventually(() => userTexts(A), ["one"]), ["one"]);
+  assert.ok(onlyLinksAdded(before, readFileSync(sessionFile, "utf8")), "the file is not rewritten");
+  assert.equal(sessionFiles("A").length, 1, "no unsynced copy");
 });
 
 test("resuming an older copy of the file catches up instead of rolling the conversation back", { ...opts, timeout: 90_000 }, async () => {

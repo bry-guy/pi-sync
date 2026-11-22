@@ -234,7 +234,10 @@ Implement:
   is rewritten in place; otherwise one file is created. Pi then switches to it
   and restores the stored head.
 - `/sync attach`: enroll the current persistent session. If the server already
-  has it, for example after a detach, adopt the server copy. If the server
+  has it, for example after a detach, a copy that only adds entries onto the
+  server's keeps its file and uploads them in appends of at most 8 MB (a failure
+  part-way keeps what was sent; the next check sends the rest). Otherwise adopt
+  the server copy, keeping local-only turns as a separate session. If the server
   reported the record missing, upload this copy again.
 - `/sync detach`: finish any turn, then remove the device-local binding. The
   canonical server copy and other clients remain unchanged.

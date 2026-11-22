@@ -66,8 +66,10 @@ When `/sync attach` is run for a `setup_required` binding:
 3. Call the existing `POST /v1/sessions` create-if-absent endpoint.
 4. On `201`, update the binding's ETag, fingerprint, workspace metadata, and
    state. The next prompt takes the lease as usual.
-5. On `409 duplicate_enrollment`, adopt the existing canonical copy. Any local
-   conversation entries it lacks are saved as a separate session first.
+5. On `409 duplicate_enrollment`, a local file that holds the whole canonical
+   copy plus new entries is kept and its new entries are uploaded as appends.
+   Otherwise adopt the existing canonical copy; any local conversation entries
+   it lacks are saved as a separate session first.
 6. On any other failure, preserve `setup_required` and the local file.
 
 A session without a binding continues to use `/sync attach` for normal initial

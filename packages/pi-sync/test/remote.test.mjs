@@ -106,8 +106,8 @@ test("RemoteHost registers, deduplicates messages by clientMessageId, streams ev
 
   host.start();
   try {
-    // Wait for registration.
-    for (let i = 0; i < 40 && !relay.registered; i++) await new Promise((r) => setTimeout(r, 15));
+    // Wait for registration and client online transition.
+    for (let i = 0; i < 40 && !(relay.registered && statuses.at(-1) === "online"); i++) await new Promise((r) => setTimeout(r, 15));
     assert.equal(relay.registered?.sessionId, "s-local");
     assert.equal(statuses.at(-1), "online");
 

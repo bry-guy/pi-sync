@@ -1658,6 +1658,9 @@ export default function syncExtension(pi: ExtensionAPI) {
   const ASK_USER_BLOCKED = "rpiv:ask-user:blocked";
   const ASK_USER_ANSWER = "rpiv:ask-user:answer";
   const ASK_USER_ANSWER_RESULT = "rpiv:ask-user:answer-result";
+  const SUMMARIZE_WORKING = "pi-summarize:working";
+  const SUMMARIZE_ACTIVITY = "pi-summarize:activity";
+  const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
   let remoteHost: RemoteHost | undefined;
   let remoteCtx: ExtensionContext | undefined;
@@ -1670,6 +1673,52 @@ export default function syncExtension(pi: ExtensionAPI) {
     if (!model?.id) return undefined;
     return model.provider ? `${model.provider}/${model.id}` : model.id;
   };
+
+  const thinkingLevelsFor = (ctx: ExtensionContext): string[] => {
+    const model = ctx.model as { reasoning?: boolean } | undefined;
+    return model?.reasoning === false ? ["off"] : [...ALL_THINKING_LEVELS];
+  };
+
+  const contextSnapshot = (ctx: ExtensionContext) => {
+    const model = (ctx.model ?? {}) as { contextWindow?: number; provider?: string; id?: string };
+    const usageHint = ctx.getContextUsage?.();
+    const window = Number(model.contextWindow ?? usageHint?.contextWindow) || null;
+    const branch = ctx.sessionManager.getBranch() as Array<{
+      type?: string;
+      message?: { role?: string; usage?: { input?: number; cacheRead?: number; cacheWrite?: number } };
+    }>;
+    const lastAssistant = [...branch]
+      .reverse()
+      .find((entry) => entry?.type === "message" && entry.message?.role === "assistant" && entry.message?.usage);
+    const usage = lastAssistant?.message?.usage;
+    const input = Number(usage?.input) || 0;
+    const cacheRead = Number(usage?.cacheRead) || 0;
+    const cacheWrite = Number(usage?.cacheWrite) || 0;
+    const used = usage
+      ? input + cacheRead + cacheWrite
+      : typeof usageHint?.tokens === "number"
+        ? usageHint.tokens
+        : null;
+    return {
+      window,
+      used,
+      remaining: window && used != null ? Math.max(0, window - used) : null,
+      percent: window && used != null ? Math.min(100, Math.round((used / window) * 100)) : null,
+      input,
+      cacheRead,
+      cacheWrite,
+      model: modelLabel(ctx) ?? null,
+    };
+  };
+
+  const remoteStatePatch = (ctx: ExtensionContext, extra: Record<string, unknown> = {}) => ({
+    title: conversationTitle(ctx),
+    model: modelLabel(ctx),
+    thinkingLevel: String(pi.getThinkingLevel?.() ?? "off"),
+    thinkingLevels: thinkingLevelsFor(ctx),
+    context: contextSnapshot(ctx),
+    ...extra,
+  });
 
   const remotePreference = (ctx: ExtensionContext): boolean | undefined => {
     const marker = [...ctx.sessionManager.getBranch()]
@@ -1766,8 +1815,7 @@ export default function syncExtension(pi: ExtensionAPI) {
         sessionId,
         device: deviceLabel,
         cwd: ctx.cwd,
-        title: conversationTitle(ctx),
-        model: modelLabel(ctx),
+        ...remoteStatePatch(ctx),
         streaming: !ctx.isIdle(),
         ...(pendingQuestion ? { pendingQuestion } : {}),
         ...(waitingDialog ? { waitingDialog } : {}),
@@ -1783,7 +1831,7 @@ export default function syncExtension(pi: ExtensionAPI) {
             sessionId,
             device: deviceLabel,
             cwd: ctx.cwd,
-            title: conversationTitle(ctx),
+            ...remoteStatePatch(ctx),
             model: modelLabel(ctx) ?? null,
             streaming: !ctx.isIdle(),
             pendingQuestion: pendingQuestion ?? null,
@@ -1820,11 +1868,57 @@ export default function syncExtension(pi: ExtensionAPI) {
           return { status: 200, body: { ok: true } };
         },
         onAnswerQuestion: (payload) => answerAskUser(payload),
+        onSetThinking: (payload) => {
+          const requested = typeof payload?.level === "string" ? payload.level.trim() : "off";
+          if (!ALL_THINKING_LEVELS.includes(requested as (typeof ALL_THINKING_LEVELS)[number])) {
+            return { status: 400, body: { error: "invalid_thinking_level", message: `Unsupported thinking level "${requested}".` } };
+          }
+          pi.setThinkingLevel(requested as ReturnType<ExtensionAPI["getThinkingLevel"]>);
+          const level = String(pi.getThinkingLevel());
+          const levels = thinkingLevelsFor(ctx);
+          remoteHost?.updateMeta({ thinkingLevel: level, thinkingLevels: levels });
+          remoteHost?.pushEvent({ type: "session_meta", thinkingLevel: level, thinkingLevels: levels });
+          return { status: 200, body: { level, levels, supported: levels.length > 1 } };
+        },
+        onSetModel: async (payload) => {
+          const ref = typeof payload?.model === "string" ? payload.model.trim() : "";
+          const slash = ref.indexOf("/");
+          const candidate = slash > 0 ? ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1)) : undefined;
+          if (!candidate) {
+            return { status: 400, body: { error: "model_unavailable", message: `Model "${ref}" is not available on ${deviceLabel}.` } };
+          }
+          const ok = await pi.setModel(candidate);
+          if (!ok) {
+            return { status: 400, body: { error: "model_unavailable", message: `Could not switch to model "${ref}" on ${deviceLabel}.` } };
+          }
+          const patch = remoteStatePatch(ctx);
+          remoteHost?.updateMeta(patch);
+          remoteHost?.pushEvent({ type: "session_meta", ...patch });
+          return { status: 200, body: { ok: true, model: patch.model } };
+        },
       },
     });
     remoteHost = host;
     host.start();
   };
+
+  pi.events.on(SUMMARIZE_WORKING, (raw: unknown) => {
+    if (!remoteHost) return;
+    const text = (raw as { text?: unknown })?.text;
+    remoteHost.pushEvent({ type: "working_message", message: typeof text === "string" && text ? text : null });
+  });
+
+  pi.events.on(SUMMARIZE_ACTIVITY, (raw: unknown) => {
+    if (!remoteHost || !remoteCtx) return;
+    const data = (raw as { data?: Record<string, unknown> })?.data;
+    if (!data || typeof data.text !== "string") return;
+    const branch = remoteCtx.sessionManager.getBranch() as Array<{ id?: string; type?: string; customType?: string; timestamp?: string; data?: Record<string, unknown> }>;
+    const matched = [...branch]
+      .reverse()
+      .find((entry) => entry.type === "custom" && entry.customType === "pi-summarize" && entry.data?.at === data.at && entry.data?.text === data.text);
+    const entry = matched ?? { id: randomUUID(), type: "custom", customType: "pi-summarize", timestamp: new Date().toISOString(), data };
+    remoteHost.pushEvent({ type: "summary", entry });
+  });
 
   pi.events.on(ASK_USER_PROMPT, (raw: unknown) => {
     const payload = raw as { toolCallId?: string; questions?: unknown[] };
@@ -2108,7 +2202,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     endProjectTurn();
     if (remoteHost) {
-      remoteHost.updateMeta({ streaming: true, title: conversationTitle(ctx), model: modelLabel(ctx) });
+      remoteHost.updateMeta(remoteStatePatch(ctx, { streaming: true }));
       remoteHost.pushEvent({ type: "turn_start" });
     }
     const project = projectOf(ctx.cwd);
@@ -2180,16 +2274,30 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   pi.on("session_info_changed", async (_event, ctx) => {
     if (!remoteHost) return;
-    const title = conversationTitle(ctx);
-    remoteHost.updateMeta({ title });
-    remoteHost.pushEvent({ type: "session_meta", title, model: modelLabel(ctx) ?? null });
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
   });
 
   pi.on("model_select", async (_event, ctx) => {
     if (!remoteHost) return;
-    const model = modelLabel(ctx);
-    remoteHost.updateMeta({ model });
-    remoteHost.pushEvent({ type: "session_meta", title: conversationTitle(ctx), model: model ?? null });
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  pi.on("thinking_level_select", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
   });
 
   /** Whether auto-enrollment applies to this session (allSessions=on, allSessions=projects inside a pi-project, or freshEnroll). */
@@ -2238,7 +2346,9 @@ export default function syncExtension(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     endProjectTurn();
     if (remoteHost) {
-      remoteHost.updateMeta({ streaming: false, title: conversationTitle(ctx), model: modelLabel(ctx) });
+      const patch = remoteStatePatch(ctx, { streaming: false });
+      remoteHost.updateMeta(patch);
+      remoteHost.pushEvent({ type: "session_meta", ...patch });
       remoteHost.pushEvent({ type: "turn_end", ok: true });
     }
     await finishTurn(ctx);

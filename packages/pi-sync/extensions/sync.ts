@@ -1896,6 +1896,18 @@ export default function syncExtension(pi: ExtensionAPI) {
           remoteHost?.pushEvent({ type: "session_meta", ...patch });
           return { status: 200, body: { ok: true, model: patch.model } };
         },
+        onClose: () => {
+          if (!ctx.isIdle()) {
+            return {
+              status: 409,
+              body: { error: "session_streaming", message: "Stop the current response before closing this session." },
+            };
+          }
+          notify(ctx, "Closing session from pi-web…", "info");
+          // Let postReply flush the 200 response to pi-syncd before session_shutdown tears down the host.
+          setTimeout(() => ctx.shutdown(), 100);
+          return { status: 200, body: { ok: true } };
+        },
       },
     });
     remoteHost = host;

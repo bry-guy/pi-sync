@@ -49,7 +49,7 @@ type SessionMeta struct {
 type Command struct {
 	ReqID     string          `json:"reqId"`
 	SessionID string          `json:"sessionId"`
-	Type      string          `json:"type"` // "transcript" | "message" | "stop" | "answer_question" | "set_thinking" | "set_model"
+	Type      string          `json:"type"` // "transcript" | "message" | "stop" | "answer_question" | "set_thinking" | "set_model" | "close"
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -535,6 +535,8 @@ func (r *Relay) handleControllerSession(w http.ResponseWriter, req *http.Request
 		r.dispatchRPC(w, req.Context(), sessionID, "message", body)
 	case action == "stop" && len(parts) == 2 && req.Method == http.MethodPost:
 		r.dispatchRPC(w, req.Context(), sessionID, "stop", nil)
+	case action == "close" && len(parts) == 2 && req.Method == http.MethodPost:
+		r.dispatchRPC(w, req.Context(), sessionID, "close", nil)
 	case action == "thinking" && len(parts) == 2 && req.Method == http.MethodPost:
 		body, ok := readBody(w, req, maxRegisterBytes)
 		if !ok {

@@ -171,22 +171,25 @@ func TestRemoteRPCRoundTripAndEvents(t *testing.T) {
 	pollDone := make(chan struct{})
 	go func() {
 		defer close(pollDone)
-		pollRes := doReq(t, "GET", srv.URL+"/v1/remote/host/poll?hostId=h1&wait=5", "sync-tok", nil)
-		defer pollRes.Body.Close()
-		var body struct {
-			Commands []Command `json:"commands"`
-		}
-		if err := json.NewDecoder(pollRes.Body).Decode(&body); err != nil {
-			return
-		}
-		for _, cmd := range body.Commands {
-			rep := doReq(t, "POST", srv.URL+"/v1/remote/host/reply", "sync-tok", map[string]any{
-				"hostId": "h1",
-				"reqId":  cmd.ReqID,
-				"status": http.StatusOK,
-				"body":   map[string]any{"ok": true, "echo": cmd.Type},
-			})
-			rep.Body.Close()
+		for range 2 {
+			pollRes := doReq(t, "GET", srv.URL+"/v1/remote/host/poll?hostId=h1&wait=5", "sync-tok", nil)
+			var body struct {
+				Commands []Command `json:"commands"`
+			}
+			err := json.NewDecoder(pollRes.Body).Decode(&body)
+			pollRes.Body.Close()
+			if err != nil {
+				return
+			}
+			for _, cmd := range body.Commands {
+				rep := doReq(t, "POST", srv.URL+"/v1/remote/host/reply", "sync-tok", map[string]any{
+					"hostId": "h1",
+					"reqId":  cmd.ReqID,
+					"status": http.StatusOK,
+					"body":   map[string]any{"ok": true, "echo": cmd.Type},
+				})
+				rep.Body.Close()
+			}
 		}
 	}()
 
@@ -202,6 +205,20 @@ func TestRemoteRPCRoundTripAndEvents(t *testing.T) {
 	}
 	if ack["echo"] != "message" {
 		t.Fatalf("unexpected ack: %v", ack)
+	}
+
+	// Controller sends close RPC; host receives command type "close".
+	closeRes := doReq(t, "POST", srv.URL+"/v1/remote/sessions/s1/close", "ctrl-tok", nil)
+	defer closeRes.Body.Close()
+	if closeRes.StatusCode != http.StatusOK {
+		t.Fatalf("controller close rpc: got %d", closeRes.StatusCode)
+	}
+	var closeAck map[string]any
+	if err := json.NewDecoder(closeRes.Body).Decode(&closeAck); err != nil {
+		t.Fatal(err)
+	}
+	if closeAck["echo"] != "close" {
+		t.Fatalf("unexpected close ack: %v", closeAck)
 	}
 	<-pollDone
 

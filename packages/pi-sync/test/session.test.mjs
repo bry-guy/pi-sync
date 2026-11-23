@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deriveRepositoryIdentity, deriveWorkspacePointer, materializeNativeJsonl, normalizeNativeJsonl, repositoryIdentity, restoreHead } from "../dist/src/session/index.js";
+import { deriveRepositoryIdentity, deriveWorkspacePointer, forkEnvelope, materializeNativeJsonl, normalizeNativeJsonl, projectLink, repositoryIdentity, restoreHead } from "../dist/src/session/index.js";
 
 test("normalizes and materializes a portable Pi JSONL session", async () => {
   const native = [
@@ -157,4 +157,31 @@ test("the pi-projects state repo never shares code", async () => {
   } finally {
     delete process.env.PI_PROJECTS_DIR;
   }
+});
+
+test("forkEnvelope creates a fresh unbound session without breaking entry parent links", () => {
+  const source = {
+    formatVersion: 1,
+    sessionId: "chat-1",
+    piSessionVersion: 3,
+    createdAt: "2026-01-01T00:00:00Z",
+    parentSessionId: null,
+    headEntryId: "e3",
+    title: "Ideation chat",
+    project: "eco",
+    workspace: { gitRemote: "https://github.com/owner/repo.git", branch: "main", commit: "0123456789abcdef0123456789abcdef01234567" },
+    entries: [
+      { type: "message", id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "idea" } },
+      { type: "custom", customType: "pi-project", id: "e2", parentId: "e1", timestamp: "2026-01-01T00:00:02Z", data: { name: "eco", rel: "" } },
+      { type: "custom", customType: "pi-sync-link", id: "e3", parentId: "e2", timestamp: "2026-01-01T00:00:03Z", data: { detached: true } },
+    ],
+  };
+  const forked = forkEnvelope(source, "local-fork-1", "2026-01-02T00:00:00Z");
+  assert.equal(forked.sessionId, "local-fork-1");
+  assert.equal(forked.parentSessionId, "chat-1");
+  assert.equal(forked.headEntryId, "e3");
+  assert.equal(forked.project, undefined);
+  assert.equal(forked.workspace, undefined);
+  assert.equal(projectLink(forked.entries), undefined);
+  assert.deepEqual(forked.entries.map((e) => [e.id, e.parentId]), [["e1", null], ["e2", "e1"], ["e3", "e2"]]);
 });

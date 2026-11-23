@@ -48,6 +48,13 @@ spec:
                   name: pi-sync-token
                   key: PI_SYNC_TOKEN
                   optional: true
+            # Enables /v1/remote/* controller routes; held only by pi-syncd and pi-ez-web (never workers).
+            - name: PI_SYNC_REMOTE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pi-sync-remote-token
+                  key: PI_SYNC_REMOTE_TOKEN
+                  optional: true
           ports:
             - name: http
               containerPort: 8080

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bry-guy/pi-sync/internal/lease"
+	"github.com/bry-guy/pi-sync/internal/remote"
 	"github.com/bry-guy/pi-sync/internal/session"
 	"github.com/bry-guy/pi-sync/internal/store"
 )
@@ -30,15 +31,24 @@ var BuildID = "unknown"
 type Server struct {
 	store  *store.Store
 	leases *lease.Registry
-	// Token, when set, is required as "Authorization: Bearer <token>" on every request except health.
+	remote *remote.Relay
+	// Token, when set, is required as "Authorization: Bearer <token>" on sync routes and remote host routes.
 	Token string
+	// RemoteToken, when set, enables /v1/remote/* and is required on controller routes (never given to workers).
+	RemoteToken string
 }
 
 func New(filesystem *store.Store, leases *lease.Registry) *Server {
 	if leases == nil {
 		leases = lease.New(lease.RealClock{}, lease.DefaultExpiry)
 	}
-	return &Server{store: filesystem, leases: leases}
+	return &Server{store: filesystem, leases: leases, remote: remote.New()}
+}
+
+func (s *Server) Close() {
+	if s.remote != nil {
+		s.remote.Close()
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +63,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.writeHealth(w)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/remote/") {
+		s.remote.ServeHTTP(w, r, s.Token, s.RemoteToken)
 		return
 	}
 	if s.Token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.Token)) != 1 {

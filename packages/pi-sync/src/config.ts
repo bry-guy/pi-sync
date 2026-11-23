@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export type CodeSharing = "ask" | "auto" | "off";
+export type AutoSyncMode = "off" | "projects" | "on";
 
 /**
  * Client settings: `~/.pi/agent/pi-sync.json` (dotfiles), then `<agent dir>/pi-sync.json` when Pi uses another
@@ -13,8 +14,10 @@ export interface SyncConfig {
   deviceLabel?: string;
   /** Uncommitted code: ask once per repository, share without asking, or never share. `off` wins over a repository's answer. */
   code: CodeSharing;
-  /** Synchronize every conversation after its first reply, not only ones attached with /sync attach. */
-  allSessions: boolean;
+  /** Auto-enroll conversations after their first reply: off, only inside pi-projects ("projects"), or everywhere ("on"). */
+  allSessions: AutoSyncMode;
+  /** Expose unsynced interactive sessions on this machine for remote control via pi-syncd. */
+  remoteControl: boolean;
   /** Tests only (PI_SYNC_HEARTBEAT_MS): the heartbeat must stay well inside the server's 120 s lease expiry. */
   heartbeatMs: number;
   /** Settings that were ignored, for one warning at startup. */
@@ -62,6 +65,15 @@ export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = pr
     problems.push(`${key} must be one of ${allowed.join(", ")}`);
     return fallback;
   };
+  const autoSyncMode = (key: string, envName: string): AutoSyncMode => {
+    const value = pick(key, envName);
+    if (value === undefined) return "off";
+    if (value === true || value === "on" || value === "true" || value === "1") return "on";
+    if (value === false || value === "off" || value === "false" || value === "0") return "off";
+    if (value === "projects") return "projects";
+    problems.push(`${key} must be on, off, or projects`);
+    return "off";
+  };
   const onOff = (key: string, envName: string): boolean => {
     const value = pick(key, envName);
     if (value === undefined) return false;
@@ -77,7 +89,8 @@ export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = pr
     serverUrl: serverUrl && /^https?:\/\//i.test(serverUrl) ? serverUrl : undefined,
     deviceLabel: text("deviceLabel", "PI_SYNC_DEVICE_LABEL")?.slice(0, 64),
     code: choice("code", "PI_SYNC_CODE", ["ask", "auto", "off"] as const, "ask"),
-    allSessions: onOff("allSessions", "PI_SYNC_ALL_SESSIONS"),
+    allSessions: autoSyncMode("allSessions", "PI_SYNC_ALL_SESSIONS"),
+    remoteControl: onOff("remoteControl", "PI_SYNC_REMOTE_CONTROL"),
     heartbeatMs: heartbeat,
     problems,
   };

@@ -54,6 +54,10 @@ import {
   restoreHead,
   configPaths,
   loadConfig,
+  RemoteHost,
+  type RemoteHostStatus,
+  type RemoteMessagePayload,
+  type RemoteAnswerPayload,
 } from "../src/index.js";
 
 const REQUEST_TIMEOUT_MS = 8_000;
@@ -1403,6 +1407,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   const enrollCurrent = async (ctx: ExtensionCommandContext, args: string) => {
+    await stopRemoteHost(ctx);
     const path = ctx.sessionManager.getSessionFile();
     if (!path || !existsSync(path)) return fail(ctx, "sync_not_persistent", "Send at least one message before synchronizing this conversation.");
     const sessionId = ctx.sessionManager.getSessionId();
@@ -1647,6 +1652,234 @@ export default function syncExtension(pi: ExtensionAPI) {
     notify(ctx, `Sync ${binding.serverUrl}: ${remote}; this device is “${deviceLabel}”; ${workspace}`, "info");
   };
 
+  // ---------- Remote control host (mutually exclusive with sync) ----------
+  const REMOTE_ENTRY = "pi-sync-remote";
+  const ASK_USER_PROMPT = "rpiv:ask-user:prompt";
+  const ASK_USER_BLOCKED = "rpiv:ask-user:blocked";
+  const ASK_USER_ANSWER = "rpiv:ask-user:answer";
+  const ASK_USER_ANSWER_RESULT = "rpiv:ask-user:answer-result";
+
+  let remoteHost: RemoteHost | undefined;
+  let remoteCtx: ExtensionContext | undefined;
+  let pendingQuestion: { toolCallId: string; questions: unknown[] } | undefined;
+  let waitingDialog: string | undefined;
+  let pendingRemoteClientMsgId: string | undefined;
+
+  const modelLabel = (ctx: ExtensionContext): string | undefined => {
+    const model = ctx.model as { provider?: string; id?: string } | undefined;
+    if (!model?.id) return undefined;
+    return model.provider ? `${model.provider}/${model.id}` : model.id;
+  };
+
+  const remotePreference = (ctx: ExtensionContext): boolean | undefined => {
+    const marker = [...ctx.sessionManager.getBranch()]
+      .reverse()
+      .find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === REMOTE_ENTRY) as { data?: { enabled?: unknown } } | undefined;
+    return typeof marker?.data?.enabled === "boolean" ? marker.data.enabled : undefined;
+  };
+
+  const setRemoteStatus = (ctx: ExtensionContext | undefined, status?: RemoteHostStatus) => {
+    if (!ctx?.hasUI) return;
+    try {
+      const label = status === "online"
+        ? "remote: on"
+        : status === "offline"
+          ? "remote: offline"
+          : status === "connecting"
+            ? "remote: connecting"
+            : undefined;
+      ctx.ui.setStatus("pi-remote", label);
+    } catch {
+      // Stale ctx during teardown.
+    }
+  };
+
+  const stopRemoteHost = async (ctx?: ExtensionContext) => {
+    const active = remoteHost;
+    const prevCtx = ctx ?? remoteCtx;
+    remoteHost = undefined;
+    remoteCtx = undefined;
+    pendingQuestion = undefined;
+    waitingDialog = undefined;
+    pendingRemoteClientMsgId = undefined;
+    setRemoteStatus(prevCtx, undefined);
+    if (active) await active.stop().catch(() => undefined);
+  };
+
+  const shouldRemoteControl = (ctx: ExtensionContext, binding: SyncBinding | undefined): boolean => {
+    if (!configuredUrl() || !ctx.hasUI || process.env.PI_ROLE || binding) return false;
+    const pref = remotePreference(ctx);
+    if (pref === false) return false;
+    if (pref === true) return true;
+    return config.remoteControl && !shouldAutoEnroll(ctx, ctx.sessionManager.getSessionId());
+  };
+
+  const answerAskUser = (payload: RemoteAnswerPayload): Promise<{ status: number; body: unknown }> => {
+    const body = (payload.body && typeof payload.body === "object" ? payload.body : {}) as Record<string, unknown>;
+    const toolCallId = typeof body.toolCallId === "string" && body.toolCallId
+      ? body.toolCallId
+      : pendingQuestion?.toolCallId;
+    if (!toolCallId) {
+      return Promise.resolve({ status: 409, body: { error: "stale_extension_ui_request", message: "No open questionnaire on this host." } });
+    }
+    const verdictId = randomUUID();
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (status: number, resBody: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve({ status, body: resBody });
+      };
+      const unsubscribe = pi.events.on(ASK_USER_ANSWER_RESULT, (raw: unknown) => {
+        const res = raw as { ok?: boolean; code?: string; reason?: string; requestId?: string };
+        if (res?.requestId !== verdictId) return;
+        if (res.ok) done(200, { ok: true });
+        else {
+          const status = res.code === "not_found" ? 409 : 400;
+          done(status, { error: res.code || "invalid_answer", message: res.reason || "Answer was rejected." });
+        }
+      });
+      const timer = setTimeout(() => done(504, { error: "answer_timeout", message: "Timed out waiting for questionnaire verdict." }), 3_000);
+      timer.unref?.();
+      pi.events.emit(ASK_USER_ANSWER, {
+        toolCallId,
+        requestId: verdictId,
+        ...(body.cancel === true || body.cancelled === true ? { cancel: true } : {}),
+        ...(Array.isArray(body.answers) ? { answers: body.answers } : {}),
+        ...(typeof body.globalNote === "string" ? { globalNote: body.globalNote } : {}),
+      });
+    });
+  };
+
+  const startRemoteHost = async (ctx: ExtensionContext) => {
+    await stopRemoteHost(ctx);
+    const url = configuredUrl();
+    if (!url || !ctx.hasUI) return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    remoteCtx = ctx;
+    const host = new RemoteHost({
+      baseUrl: url,
+      token: process.env.PI_SYNC_TOKEN?.trim() || undefined,
+      meta: {
+        sessionId,
+        device: deviceLabel,
+        cwd: ctx.cwd,
+        title: conversationTitle(ctx),
+        model: modelLabel(ctx),
+        streaming: !ctx.isIdle(),
+        ...(pendingQuestion ? { pendingQuestion } : {}),
+        ...(waitingDialog ? { waitingDialog } : {}),
+      },
+      onStatus: (status) => {
+        if (remoteHost !== host) return;
+        setRemoteStatus(ctx, status);
+      },
+      handlers: {
+        onTranscript: () => ({
+          status: 200,
+          body: {
+            sessionId,
+            device: deviceLabel,
+            cwd: ctx.cwd,
+            title: conversationTitle(ctx),
+            model: modelLabel(ctx) ?? null,
+            streaming: !ctx.isIdle(),
+            pendingQuestion: pendingQuestion ?? null,
+            waitingDialog: waitingDialog ?? null,
+            entries: ctx.sessionManager.getBranch(),
+          },
+        }),
+        onMessage: async (payload: RemoteMessagePayload) => {
+          const text = typeof payload.text === "string" ? payload.text : "";
+          const images = Array.isArray(payload.images) ? payload.images : [];
+          if (!text.trim() && images.length === 0) {
+            return { status: 400, body: { error: "empty_message", message: "Message text or image is required." } };
+          }
+          const idle = ctx.isIdle();
+          const mode = payload.mode === "steer" || payload.mode === "followUp" ? payload.mode : "prompt";
+          if (!idle && mode === "prompt") {
+            return { status: 409, body: { error: "session_busy", message: "Session is currently running a turn." } };
+          }
+          const content = images.length > 0
+            ? [...(text ? [{ type: "text" as const, text }] : []), ...(images as any[])]
+            : text;
+          pendingRemoteClientMsgId = payload.clientMessageId;
+          try {
+            pi.sendUserMessage(content as any, idle ? undefined : { deliverAs: mode === "steer" ? "steer" : "followUp" });
+            notify(ctx, "Remote prompt received from pi-web.", "info");
+            return { status: 200, body: { ok: true } };
+          } catch (error) {
+            pendingRemoteClientMsgId = undefined;
+            return { status: 409, body: { error: "send_failed", message: error instanceof Error ? error.message : String(error) } };
+          }
+        },
+        onStop: () => {
+          ctx.abort();
+          return { status: 200, body: { ok: true } };
+        },
+        onAnswerQuestion: (payload) => answerAskUser(payload),
+      },
+    });
+    remoteHost = host;
+    host.start();
+  };
+
+  pi.events.on(ASK_USER_PROMPT, (raw: unknown) => {
+    const payload = raw as { toolCallId?: string; questions?: unknown[] };
+    if (!payload?.toolCallId || !Array.isArray(payload.questions)) return;
+    pendingQuestion = { toolCallId: payload.toolCallId, questions: payload.questions };
+    waitingDialog = undefined;
+    if (remoteHost) {
+      remoteHost.updateMeta({ pendingQuestion, waitingDialog: "" });
+      remoteHost.pushEvent({ type: "ask_user_prompt", toolCallId: payload.toolCallId, questions: payload.questions });
+    }
+  });
+
+  pi.events.on(ASK_USER_BLOCKED, (raw: unknown) => {
+    const payload = raw as { active?: boolean; toolCallId?: string };
+    if (payload?.active !== false) return;
+    if (pendingQuestion && (!payload.toolCallId || pendingQuestion.toolCallId === payload.toolCallId)) {
+      const closedId = pendingQuestion.toolCallId;
+      pendingQuestion = undefined;
+      if (remoteHost) {
+        remoteHost.updateMeta({ pendingQuestion: null });
+        remoteHost.pushEvent({ type: "ask_user_cleared", toolCallId: closedId });
+      }
+    }
+  });
+
+  pi.registerCommand("remote", {
+    description: "Enable, disable, or inspect remote control for this session",
+    handler: async (args, ctx) => {
+      const [sub = "status"] = args.trim().split(/\s+/);
+      await store.load();
+      if (sub === "on") {
+        const url = configuredUrl();
+        if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /remote.");
+        const binding = await bindingFor(ctx.sessionManager.getSessionId());
+        if (binding) await detachCurrent(ctx);
+        pi.appendEntry(REMOTE_ENTRY, { enabled: true });
+        await startRemoteHost(ctx);
+        notify(ctx, `Remote control enabled for this session on “${deviceLabel}”.`, "info");
+        return;
+      }
+      if (sub === "off") {
+        await stopRemoteHost(ctx);
+        pi.appendEntry(REMOTE_ENTRY, { enabled: false });
+        notify(ctx, "Remote control disabled for this session.", "info");
+        return;
+      }
+      if (sub === "status" || sub === "") {
+        const state = remoteHost ? remoteHost.getStatus() : "off";
+        notify(ctx, `Remote control: ${state} (device “${deviceLabel}”). Use /remote on or /remote off.`, "info");
+        return;
+      }
+      notify(ctx, "Usage: /remote [on|off|status]", "error");
+    },
+  });
+
   pi.registerCommand("sync", {
     description: "Open, attach, detach, refresh, or inspect synchronized conversations",
     handler: async (args, ctx) => {
@@ -1717,6 +1950,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       return; // Not on the server, or unreachable: stay unsynchronized and silent.
     }
     if (currentSessionId !== sessionId || (await store.get(sessionId))) return;
+    await stopRemoteHost(ctx);
     await store.set({ ...base, lastEtag: etag });
     setStatus(ctx, "sync: reconnected");
     startPoll(ctx);
@@ -1724,6 +1958,7 @@ export default function syncExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     shownStatus = null; // a new session's footer starts empty
+    await stopRemoteHost();
     if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
     currentSessionId = ctx.sessionManager.getSessionId();
     const reopened = ctx.sessionManager.getSessionFile();
@@ -1741,6 +1976,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     let binding = await bindingFor(currentSessionId);
     if (!binding) {
       setStatus(ctx);
+      if (shouldRemoteControl(ctx, undefined)) void startRemoteHost(ctx);
       if (event.reason === "startup" && !hasMessages(ctx)) void warnArrival(ctx).catch(() => undefined);
       else void reconnect(ctx).catch(() => undefined);
       return;
@@ -1871,6 +2107,10 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
   pi.on("agent_start", async (_event, ctx) => {
     endProjectTurn();
+    if (remoteHost) {
+      remoteHost.updateMeta({ streaming: true, title: conversationTitle(ctx), model: modelLabel(ctx) });
+      remoteHost.pushEvent({ type: "turn_start" });
+    }
     const project = projectOf(ctx.cwd);
     turnRoot = project?.root;
     if (!project) return;
@@ -1881,10 +2121,75 @@ export default function syncExtension(pi: ExtensionAPI) {
   pi.on("agent_end", async () => endProjectTurn());
 
   pi.on("before_agent_start", async (event, ctx) => {
+    if (remoteHost && (event as { messageType?: string }).messageType !== "custom") {
+      const clientMessageId = pendingRemoteClientMsgId;
+      pendingRemoteClientMsgId = undefined;
+      remoteHost.pushEvent({
+        type: "user_message",
+        text: event.prompt ?? "",
+        images: event.images ?? [],
+        ...(clientMessageId ? { clientMessageId } : {}),
+        at: Date.now(),
+      });
+    }
     if (!lease) return;
     const previous = lastDevice(ctx);
     if (previous !== deviceLabel) pi.appendEntry(DEVICE_ENTRY, { device: deviceLabel });
     return { systemPrompt: `${event.systemPrompt}\n\n${locationPrompt({ device: deviceLabel, previous, cwd: ctx.cwd, platform: process.platform, workspace: lease.binding.workspace })}` };
+  });
+
+  pi.on("message_start", async (event) => {
+    if (!remoteHost) return;
+    const role = (event as { message?: { role?: string } }).message?.role;
+    if (role === "assistant") remoteHost.pushEvent({ type: "message_start", role: "assistant" });
+  });
+
+  pi.on("message_update", async (event) => {
+    if (!remoteHost) return;
+    const e = (event as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
+    if (e?.type === "text_delta" && e.delta) remoteHost.pushEvent({ type: "text_delta", delta: e.delta });
+    else if (e?.type === "thinking_delta" && e.delta) remoteHost.pushEvent({ type: "thinking_delta", delta: e.delta });
+  });
+
+  pi.on("message_end", async (event) => {
+    if (!remoteHost) return;
+    const role = (event as { message?: { role?: string } }).message?.role;
+    if (role === "assistant") remoteHost.pushEvent({ type: "message_end", role: "assistant" });
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    if (!remoteHost) return;
+    const e = event as { toolCallId?: string; toolName?: string; args?: unknown };
+    remoteHost.pushEvent({ type: "tool_start", toolId: e.toolCallId, name: e.toolName, args: e.args });
+  });
+
+  pi.on("ui_prompt_start", async (event) => {
+    if (!remoteHost || pendingQuestion) return;
+    const title = typeof (event as { title?: unknown })?.title === "string" ? (event as { title: string }).title : "Waiting for input on local terminal";
+    waitingDialog = title;
+    remoteHost.updateMeta({ waitingDialog: title });
+    remoteHost.pushEvent({ type: "waiting_dialog", title });
+  });
+
+  pi.on("ui_prompt_end", async () => {
+    if (!remoteHost || !waitingDialog) return;
+    waitingDialog = undefined;
+    remoteHost.updateMeta({ waitingDialog: "" });
+    remoteHost.pushEvent({ type: "waiting_dialog", title: "" });
+  });
+
+  pi.on("session_info_changed", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const title = conversationTitle(ctx);
+    remoteHost.updateMeta({ title });
+    remoteHost.pushEvent({ type: "session_meta", title, model: modelLabel(ctx) ?? null });
+  });
+
+  pi.on("model_select", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const model = modelLabel(ctx);
+    remoteHost.updateMeta({ model });
+    remoteHost.pushEvent({ type: "session_meta", title: conversationTitle(ctx), model: model ?? null });
   });
 
   /** Whether auto-enrollment applies to this session (allSessions=on, allSessions=projects inside a pi-project, or freshEnroll). */
@@ -1921,13 +2226,21 @@ export default function syncExtension(pi: ExtensionAPI) {
     startPoll(ctx);
   };
 
-  pi.on("tool_execution_end", async (_event, ctx) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (remoteHost) {
+      const e = event as { toolCallId?: string; toolName?: string; isError?: boolean; result?: unknown };
+      remoteHost.pushEvent({ type: "tool_end", toolId: e.toolCallId, name: e.toolName, ok: !e.isError, result: e.result });
+    }
     // Not awaited: sharing must never slow the agent down.
     void shareDuringTurn(ctx).catch(() => undefined);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     endProjectTurn();
+    if (remoteHost) {
+      remoteHost.updateMeta({ streaming: false, title: conversationTitle(ctx), model: modelLabel(ctx) });
+      remoteHost.pushEvent({ type: "turn_end", ok: true });
+    }
     await finishTurn(ctx);
     await autoEnroll(ctx).catch(() => undefined);
   });
@@ -1958,8 +2271,13 @@ export default function syncExtension(pi: ExtensionAPI) {
   pi.on("session_compact", async (_event, ctx) => finishTurn(ctx));
   pi.on("session_compact_failed", async (_event, ctx) => finishTurn(ctx));
 
+  pi.on("session_before_switch", async (_event, ctx) => {
+    await stopRemoteHost(ctx);
+  });
+
   pi.on("session_shutdown", async (_event, ctx) => {
     endProjectTurn();
+    await stopRemoteHost(ctx);
     stopPoll();
     await finishTurn(ctx);
     // Leaving: share hand edits made since the last turn, without holding up exit for long.

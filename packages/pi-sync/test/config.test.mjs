@@ -9,17 +9,18 @@ const dir = () => mkdtempSync(join(tmpdir(), "pi-sync-config-"));
 
 test("defaults without a file or environment", () => {
   const config = loadConfig(configPath(dir()), {});
-  assert.deepEqual(config, { serverUrl: undefined, deviceLabel: undefined, code: "ask", allSessions: "off", heartbeatMs: 20_000, problems: [] });
+  assert.deepEqual(config, { serverUrl: undefined, deviceLabel: undefined, code: "ask", allSessions: "off", remoteControl: false, heartbeatMs: 20_000, problems: [] });
 });
 
 test("the file sets values and the environment overrides them", () => {
   const d = dir();
-  writeFileSync(configPath(d), JSON.stringify({ serverUrl: "https://file", code: "auto", allSessions: true, deviceLabel: "laptop" }));
-  assert.deepEqual(loadConfig(configPath(d), {}), { serverUrl: "https://file", deviceLabel: "laptop", code: "auto", allSessions: "on", heartbeatMs: 20_000, problems: [] });
-  const env = loadConfig(configPath(d), { PI_SYNC_SERVER_URL: "https://env", PI_SYNC_CODE: "off", PI_SYNC_ALL_SESSIONS: "off" });
+  writeFileSync(configPath(d), JSON.stringify({ serverUrl: "https://file", code: "auto", allSessions: true, remoteControl: "on", deviceLabel: "laptop" }));
+  assert.deepEqual(loadConfig(configPath(d), {}), { serverUrl: "https://file", deviceLabel: "laptop", code: "auto", allSessions: "on", remoteControl: true, heartbeatMs: 20_000, problems: [] });
+  const env = loadConfig(configPath(d), { PI_SYNC_SERVER_URL: "https://env", PI_SYNC_CODE: "off", PI_SYNC_ALL_SESSIONS: "off", PI_SYNC_REMOTE_CONTROL: "off" });
   assert.equal(env.serverUrl, "https://env");
   assert.equal(env.code, "off");
   assert.equal(env.allSessions, "off");
+  assert.equal(env.remoteControl, false);
   const projects = loadConfig(configPath(d), { PI_SYNC_ALL_SESSIONS: "projects" });
   assert.equal(projects.allSessions, "projects");
   assert.deepEqual(projects.problems, []);

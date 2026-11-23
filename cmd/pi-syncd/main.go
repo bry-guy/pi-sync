@@ -38,7 +38,9 @@ func main() {
 	}
 	go maintain(filesystem, leases, retention)
 	handler := api.New(filesystem, leases)
+	defer handler.Close()
 	handler.Token = os.Getenv("PI_SYNC_TOKEN")
+	handler.RemoteToken = os.Getenv("PI_SYNC_REMOTE_TOKEN")
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           handler,

@@ -16,6 +16,8 @@ export interface SyncConfig {
   code: CodeSharing;
   /** Auto-enroll conversations after their first reply: off, only inside pi-projects ("projects"), or everywhere ("on"). */
   allSessions: AutoSyncMode;
+  /** Expose unsynced interactive sessions on this machine for remote control via pi-syncd. */
+  remoteControl: boolean;
   /** Tests only (PI_SYNC_HEARTBEAT_MS): the heartbeat must stay well inside the server's 120 s lease expiry. */
   heartbeatMs: number;
   /** Settings that were ignored, for one warning at startup. */
@@ -72,6 +74,14 @@ export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = pr
     problems.push(`${key} must be on, off, or projects`);
     return "off";
   };
+  const onOff = (key: string, envName: string): boolean => {
+    const value = pick(key, envName);
+    if (value === undefined) return false;
+    if (value === true || value === "on" || value === "true" || value === "1") return true;
+    if (value === false || value === "off" || value === "false" || value === "0") return false;
+    problems.push(`${key} must be on or off`);
+    return false;
+  };
   const heartbeat = Math.min(30_000, Math.max(250, Number(env.PI_SYNC_HEARTBEAT_MS) || 20_000));
   const serverUrl = env.PI_SYNC_SERVER_URL?.trim() || env.PI_SYNC_URL?.trim() || text("serverUrl", "PI_SYNC_SERVER_URL");
   if (serverUrl && !/^https?:\/\//i.test(serverUrl)) problems.push("serverUrl must start with http:// or https://");
@@ -80,6 +90,7 @@ export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = pr
     deviceLabel: text("deviceLabel", "PI_SYNC_DEVICE_LABEL")?.slice(0, 64),
     code: choice("code", "PI_SYNC_CODE", ["ask", "auto", "off"] as const, "ask"),
     allSessions: autoSyncMode("allSessions", "PI_SYNC_ALL_SESSIONS"),
+    remoteControl: onOff("remoteControl", "PI_SYNC_REMOTE_CONTROL"),
     heartbeatMs: heartbeat,
     problems,
   };

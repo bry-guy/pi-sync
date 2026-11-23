@@ -3,3 +3,4 @@ export * from "./client/index.js";
 export * from "./session/index.js";
 export * from "./bindings.js";
 export * from "./config.js";
+export * from "./remote/host.js";

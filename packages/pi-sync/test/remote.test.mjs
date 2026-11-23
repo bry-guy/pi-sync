@@ -87,6 +87,7 @@ test("RemoteHost registers, deduplicates messages by clientMessageId, streams ev
   const relay = await startMockRelay();
   const messages = [];
   let stopped = 0;
+  let closed = 0;
   const statuses = [];
 
   const host = new RemoteHost({
@@ -101,6 +102,7 @@ test("RemoteHost registers, deduplicates messages by clientMessageId, streams ev
       onMessage: (payload) => { messages.push(payload); return { status: 200, body: { ok: true } }; },
       onStop: () => { stopped++; return { status: 200, body: { ok: true } }; },
       onAnswerQuestion: (payload) => ({ status: 200, body: { ok: true, id: payload.requestId } }),
+      onClose: () => { closed++; return { status: 200, body: { ok: true } }; },
     },
   });
 
@@ -111,18 +113,21 @@ test("RemoteHost registers, deduplicates messages by clientMessageId, streams ev
     assert.equal(relay.registered?.sessionId, "s-local");
     assert.equal(statuses.at(-1), "online");
 
-    // Enqueue transcript, duplicate messages, and stop.
+    // Enqueue transcript, duplicate messages, stop, and close.
     relay.enqueue({ reqId: "r1", sessionId: "s-local", type: "transcript" });
     relay.enqueue({ reqId: "r2", sessionId: "s-local", type: "message", payload: { text: "hi", clientMessageId: "c1" } });
     relay.enqueue({ reqId: "r3", sessionId: "s-local", type: "message", payload: { text: "hi", clientMessageId: "c1" } });
     relay.enqueue({ reqId: "r4", sessionId: "s-local", type: "stop" });
+    relay.enqueue({ reqId: "r5", sessionId: "s-local", type: "close" });
 
-    for (let i = 0; i < 50 && relay.replies.size < 4; i++) await new Promise((r) => setTimeout(r, 20));
+    for (let i = 0; i < 50 && relay.replies.size < 5; i++) await new Promise((r) => setTimeout(r, 20));
     assert.equal(relay.replies.get("r1")?.status, 200);
     assert.deepEqual(relay.replies.get("r1")?.body, { entries: [{ id: "e1" }] });
     assert.equal(messages.length, 1, "duplicate clientMessageId must only dispatch once");
     assert.equal(relay.replies.get("r3")?.body?.duplicate, true);
     assert.equal(stopped, 1);
+    assert.equal(closed, 1);
+    assert.equal(relay.replies.get("r5")?.status, 200);
 
     // Push live events and confirm batch flush.
     host.pushEvent({ type: "text_delta", delta: "hello" });

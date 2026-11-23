@@ -9,17 +9,20 @@ const dir = () => mkdtempSync(join(tmpdir(), "pi-sync-config-"));
 
 test("defaults without a file or environment", () => {
   const config = loadConfig(configPath(dir()), {});
-  assert.deepEqual(config, { serverUrl: undefined, deviceLabel: undefined, code: "ask", allSessions: false, heartbeatMs: 20_000, problems: [] });
+  assert.deepEqual(config, { serverUrl: undefined, deviceLabel: undefined, code: "ask", allSessions: "off", heartbeatMs: 20_000, problems: [] });
 });
 
 test("the file sets values and the environment overrides them", () => {
   const d = dir();
   writeFileSync(configPath(d), JSON.stringify({ serverUrl: "https://file", code: "auto", allSessions: true, deviceLabel: "laptop" }));
-  assert.deepEqual(loadConfig(configPath(d), {}), { serverUrl: "https://file", deviceLabel: "laptop", code: "auto", allSessions: true, heartbeatMs: 20_000, problems: [] });
+  assert.deepEqual(loadConfig(configPath(d), {}), { serverUrl: "https://file", deviceLabel: "laptop", code: "auto", allSessions: "on", heartbeatMs: 20_000, problems: [] });
   const env = loadConfig(configPath(d), { PI_SYNC_SERVER_URL: "https://env", PI_SYNC_CODE: "off", PI_SYNC_ALL_SESSIONS: "off" });
   assert.equal(env.serverUrl, "https://env");
   assert.equal(env.code, "off");
-  assert.equal(env.allSessions, false);
+  assert.equal(env.allSessions, "off");
+  const projects = loadConfig(configPath(d), { PI_SYNC_ALL_SESSIONS: "projects" });
+  assert.equal(projects.allSessions, "projects");
+  assert.deepEqual(projects.problems, []);
 });
 
 test("bad values fall back to defaults and are reported", () => {
@@ -27,7 +30,7 @@ test("bad values fall back to defaults and are reported", () => {
   writeFileSync(configPath(d), JSON.stringify({ code: "always", allSessions: "maybe", serverUrl: "pi-sync.local", heartbeatMs: 500_000 }));
   const config = loadConfig(configPath(d), {});
   assert.equal(config.code, "ask");
-  assert.equal(config.allSessions, false);
+  assert.equal(config.allSessions, "off");
   assert.equal(config.serverUrl, undefined);
   assert.equal(config.heartbeatMs, 20_000);
   assert.equal(config.problems.length, 3, "heartbeatMs is not a file setting");
@@ -53,7 +56,8 @@ test("the agent dir's file overrides the dotfiles one per key, and env overrides
   const paths = configPaths(agent, home);
   const merged = loadConfig(paths, {});
   assert.equal(merged.code, "auto");
-  assert.equal(merged.allSessions, false);
-  assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "on" }).allSessions, true);
+  assert.equal(merged.allSessions, "off");
+  assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "on" }).allSessions, "on");
+  assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "projects" }).allSessions, "projects");
   assert.equal(configPaths(join(home, ".pi", "agent"), home).length, 1);
 });

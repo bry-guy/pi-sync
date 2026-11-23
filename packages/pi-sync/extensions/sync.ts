@@ -36,6 +36,7 @@ import {
   type WorkspacePointer,
   appendSessionFile,
   defaultSessionDir,
+  forkEnvelope,
   materializeSessionFile,
   nativeHeaderLine,
   projectCwd,
@@ -1526,6 +1527,59 @@ export default function syncExtension(pi: ExtensionAPI) {
     await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyTitle, undefined);
   };
 
+  /** Forks a synchronized conversation into a brand-new local unbound session (no lease, no binding). */
+  const forkSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
+    let snapshot: SessionResponse;
+    try {
+      snapshot = await clientFor(url).get(sessionId);
+    } catch (error) {
+      return fail(ctx, "sync_unavailable", error instanceof Error ? error.message : "Could not fetch the synchronized conversation.");
+    }
+    const newId = randomUUID();
+    const forked = forkEnvelope(snapshot.session, newId);
+    const target = join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${newId}.jsonl`);
+    try {
+      await materializeSessionFile(target, forked, { cwd: ctx.cwd });
+    } catch (error) {
+      return fail(ctx, "sync_fork_failed", error instanceof Error ? error.message : "Could not write the forked session file.");
+    }
+    const opened = title || snapshot.session.title;
+    await reopen(ctx, target, forked.headEntryId, `Forked “${opened || "conversation"}” into a new local session.`, undefined, undefined);
+  };
+
+  const forkPick = async (ctx: ExtensionCommandContext) => {
+    const current = await bindingFor(ctx.sessionManager.getSessionId());
+    const url = configuredUrl() ?? current?.serverUrl;
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync fork.");
+    if (!ctx.hasUI) return fail(ctx, "sync_ui_required", "The fork picker requires an interactive UI.");
+    let sessions;
+    try {
+      sessions = (await clientFor(url).list()).sessions;
+    } catch (error) {
+      return fail(ctx, "sync_unavailable", error instanceof Error ? error.message : "Could not list synchronized conversations.");
+    }
+    if (sessions.length === 0) {
+      notify(ctx, "No synchronized conversations found to fork.", "info");
+      return;
+    }
+    // Prefer chats (no project/workspace) first since chat -> local build is the primary fork flow.
+    const ranked = [...sessions].sort((left, right) => {
+      const leftChat = !left.project && !left.workspace ? 0 : 1;
+      const rightChat = !right.project && !right.workspace ? 0 : 1;
+      if (leftChat !== rightChat) return leftChat - rightChat;
+      return (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt);
+    });
+    const rows = ranked.map((item) => {
+      const title = usefulTitle(item.title, item.sessionId) || `untitled ${item.sessionId.slice(-8)}`;
+      const where = item.project ? `project:${item.project}` : item.workspace ? `${repositoryIdentity(item.workspace)?.split("/").slice(-1)[0]}:${item.workspace.branch}` : "chat";
+      return { item, label: [title, where, relativeAge(item.updatedAt)].filter(Boolean).join(" · ") };
+    });
+    const selected = await ctx.ui.select("Fork synchronized conversation into a new local session", rows.map((row) => row.label));
+    const row = rows.find((candidate) => candidate.label === selected);
+    if (!row) return;
+    await forkSynced(ctx, url, row.item.sessionId, row.item.title);
+  };
+
   /**
    * On a fresh start in a repository, warns about the shared conversation this client hasn't caught up with, naming
    * the clients it is on. Opening it stays a deliberate /sync.
@@ -1630,8 +1684,16 @@ export default function syncExtension(pi: ExtensionAPI) {
         if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
         return openSynced(ctx, url, rest[0]);
       }
+      if (command === "fork") {
+        if (rest[0]) {
+          const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
+          if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync fork.");
+          return forkSynced(ctx, url, rest[0]);
+        }
+        return forkPick(ctx);
+      }
       if (command === "") return syncPick(ctx);
-      notify(ctx, "Usage: /sync, /sync attach [server URL], /sync detach, /sync refresh, /sync status, or /sync code [on|off]", "error");
+      notify(ctx, "Usage: /sync, /sync fork [id], /sync attach [server URL], /sync detach, /sync refresh, /sync status, or /sync code [on|off]", "error");
     },
   });
 
@@ -1825,14 +1887,22 @@ export default function syncExtension(pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${locationPrompt({ device: deviceLabel, previous, cwd: ctx.cwd, platform: process.platform, workspace: lease.binding.workspace })}` };
   });
 
-  /** With allSessions on, a conversation is synchronized once it has a reply, unless it was detached here. */
+  /** Whether auto-enrollment applies to this session (allSessions=on, allSessions=projects inside a pi-project, or freshEnroll). */
+  const shouldAutoEnroll = (ctx: ExtensionContext, sessionId: string): boolean => {
+    if (freshEnroll.has(sessionId)) return true;
+    if (config.allSessions === "on") return true;
+    if (config.allSessions === "projects") return !!projectOf(ctx.cwd);
+    return false;
+  };
+
+  /** With allSessions on (or projects inside a pi-project), a conversation is synchronized once it has a reply, unless detached here. */
   const autoEnroll = async (ctx: ExtensionContext) => {
     const url = config.serverUrl;
     const path = ctx.sessionManager.getSessionFile();
     // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
     // pi-background runs (PI_BACKGROUND=1) are the user's own sessions moved off-screen, so they enroll.
     const sessionId = ctx.sessionManager.getSessionId();
-    if (!(config.allSessions || freshEnroll.has(sessionId)) || !url || !(ctx.hasUI || process.env.PI_BACKGROUND) || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    if (!shouldAutoEnroll(ctx, sessionId) || !url || !(ctx.hasUI || process.env.PI_BACKGROUND) || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
     if (await bindingFor(sessionId)) return;
     const envelope = await normalizeCurrent(ctx);
     try {

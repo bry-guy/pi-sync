@@ -36,6 +36,32 @@ export function withoutLocalSettings(entries: PiEntry[]): PiEntry[] {
   );
 }
 
+const FORK_STRIPPED_CUSTOM_TYPES = new Set(["pi-project", "pi-sync-link", "pi-sync-device"]);
+
+/**
+ * Produces a fresh, unbound local envelope forked from a synchronized conversation.
+ * Project/sync metadata entries are replaced with neutral placeholders so parent chains and headEntryId stay valid.
+ */
+export function forkEnvelope(envelope: SessionEnvelope, newSessionId: string, now = new Date().toISOString()): SessionEnvelope {
+  const entries = envelope.entries.map((entry) => {
+    const customType = (entry as { customType?: unknown }).customType;
+    if (entry.type === "custom" && typeof customType === "string" && FORK_STRIPPED_CUSTOM_TYPES.has(customType)) {
+      return { type: "custom", customType: "pi-sync-local-setting", id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp } as PiEntry;
+    }
+    return entry;
+  });
+  return validateEnvelope({
+    formatVersion: 1,
+    sessionId: newSessionId,
+    piSessionVersion: envelope.piSessionVersion,
+    createdAt: now,
+    parentSessionId: envelope.sessionId,
+    headEntryId: envelope.headEntryId,
+    title: envelope.title,
+    entries,
+  });
+}
+
 /** The pi-projects link (`pi-project` custom entry): project id, folder name, and cwd relative to it. */
 export function projectLink(entries: readonly PiEntry[]): { name: string; rel: string; projectId?: string } | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {

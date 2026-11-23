@@ -7,6 +7,9 @@ export interface RemoteSessionMeta {
   cwd: string;
   title?: string;
   model?: string;
+  thinkingLevel?: string;
+  thinkingLevels?: string[];
+  context?: unknown;
   streaming: boolean;
   waitingDialog?: string;
   pendingQuestion?: unknown;
@@ -15,7 +18,7 @@ export interface RemoteSessionMeta {
 export interface RemoteCommand {
   reqId: string;
   sessionId: string;
-  type: "transcript" | "message" | "stop" | "answer_question";
+  type: "transcript" | "message" | "stop" | "answer_question" | "set_thinking" | "set_model";
   payload?: unknown;
 }
 
@@ -41,6 +44,8 @@ export interface RemoteHostHandlers {
   onMessage: (payload: RemoteMessagePayload) => Promise<RemoteReply> | RemoteReply;
   onStop: () => Promise<RemoteReply> | RemoteReply;
   onAnswerQuestion: (payload: RemoteAnswerPayload) => Promise<RemoteReply> | RemoteReply;
+  onSetThinking?: (payload: { level?: string }) => Promise<RemoteReply> | RemoteReply;
+  onSetModel?: (payload: { model?: string }) => Promise<RemoteReply> | RemoteReply;
 }
 
 export type RemoteHostStatus = "connecting" | "online" | "offline" | "disabled";
@@ -68,6 +73,8 @@ const IMMEDIATE_EVENTS = new Set([
   "ask_user_prompt",
   "ask_user_cleared",
   "waiting_dialog",
+  "working_message",
+  "summary",
   "compaction_start",
   "compaction_end",
   "session_meta",
@@ -273,6 +280,10 @@ export class RemoteHost {
         reply = await this.handlers.onStop();
       } else if (cmd.type === "answer_question") {
         reply = await this.handlers.onAnswerQuestion((cmd.payload ?? { requestId: "" }) as RemoteAnswerPayload);
+      } else if (cmd.type === "set_thinking" && this.handlers.onSetThinking) {
+        reply = await this.handlers.onSetThinking((cmd.payload ?? {}) as { level?: string });
+      } else if (cmd.type === "set_model" && this.handlers.onSetModel) {
+        reply = await this.handlers.onSetModel((cmd.payload ?? {}) as { model?: string });
       } else {
         reply = { status: 400, body: { error: "unknown_command", message: `unsupported command ${String(cmd.type)}` } };
       }

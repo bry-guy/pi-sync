@@ -36,6 +36,9 @@ type SessionMeta struct {
 	Cwd             string          `json:"cwd"`
 	Title           string          `json:"title,omitempty"`
 	Model           string          `json:"model,omitempty"`
+	ThinkingLevel   string          `json:"thinkingLevel,omitempty"`
+	ThinkingLevels  []string        `json:"thinkingLevels,omitempty"`
+	Context         json.RawMessage `json:"context,omitempty"`
 	Streaming       bool            `json:"streaming"`
 	WaitingDialog   string          `json:"waitingDialog,omitempty"`
 	PendingQuestion json.RawMessage `json:"pendingQuestion,omitempty"`
@@ -46,7 +49,7 @@ type SessionMeta struct {
 type Command struct {
 	ReqID     string          `json:"reqId"`
 	SessionID string          `json:"sessionId"`
-	Type      string          `json:"type"` // "transcript" | "message" | "stop" | "answer_question"
+	Type      string          `json:"type"` // "transcript" | "message" | "stop" | "answer_question" | "set_thinking" | "set_model"
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -532,6 +535,26 @@ func (r *Relay) handleControllerSession(w http.ResponseWriter, req *http.Request
 		r.dispatchRPC(w, req.Context(), sessionID, "message", body)
 	case action == "stop" && len(parts) == 2 && req.Method == http.MethodPost:
 		r.dispatchRPC(w, req.Context(), sessionID, "stop", nil)
+	case action == "thinking" && len(parts) == 2 && req.Method == http.MethodPost:
+		body, ok := readBody(w, req, maxRegisterBytes)
+		if !ok {
+			return
+		}
+		if !json.Valid(body) {
+			writeErr(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		r.dispatchRPC(w, req.Context(), sessionID, "set_thinking", body)
+	case action == "model" && len(parts) == 2 && req.Method == http.MethodPost:
+		body, ok := readBody(w, req, maxRegisterBytes)
+		if !ok {
+			return
+		}
+		if !json.Valid(body) {
+			writeErr(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		r.dispatchRPC(w, req.Context(), sessionID, "set_model", body)
 	case action == "extension-ui" && len(parts) == 3 && parts[2] != "" && req.Method == http.MethodPost:
 		body, ok := readBody(w, req, maxRegisterBytes)
 		if !ok {

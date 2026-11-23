@@ -1756,7 +1756,8 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   const shouldRemoteControl = (ctx: ExtensionContext, binding: SyncBinding | undefined): boolean => {
-    if (!configuredUrl() || !ctx.hasUI || process.env.PI_ROLE || binding) return false;
+    // Project sessions synchronize; remote control would detach them, so the two never mix.
+    if (!configuredUrl() || !ctx.hasUI || process.env.PI_ROLE || binding || projectOf(ctx.cwd)) return false;
     const pref = remotePreference(ctx);
     if (pref === false) return false;
     if (pref === true) return true;
@@ -1964,6 +1965,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       if (sub === "on") {
         const url = configuredUrl();
         if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /remote.");
+        if (projectOf(ctx.cwd)) return fail(ctx, "remote_project_session", "Project sessions synchronize instead of using remote control; open them from the project in pi-web.");
         const binding = await bindingFor(ctx.sessionManager.getSessionId());
         if (binding) await detachCurrent(ctx);
         pi.appendEntry(REMOTE_ENTRY, { enabled: true });

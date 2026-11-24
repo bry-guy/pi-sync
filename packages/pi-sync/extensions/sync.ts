@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import {
@@ -53,6 +52,7 @@ import {
   repositoryIdentity,
   restoreHead,
   configPaths,
+  defaultDeviceLabel,
   loadConfig,
   RemoteHost,
   type RemoteHostStatus,
@@ -171,9 +171,6 @@ export function inBatches<T>(entries: readonly T[], limit: number): T[][] {
   return batches;
 }
 
-function defaultDeviceLabel(): string {
-  return hostname().split(".")[0]?.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 64) || "pi";
-}
 
 /** Tells the agent which machine this turn runs on, and that earlier turns may have run elsewhere. */
 export function locationPrompt(input: { device: string; previous?: string; cwd: string; platform: string; workspace?: WorkspacePointer }): string {
@@ -254,7 +251,7 @@ export default function syncExtension(pi: ExtensionAPI) {
     const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === LINK_ENTRY) as { data?: { detached?: boolean } } | undefined;
     return marker?.data?.detached === true;
   };
-  const deviceLabel = config.deviceLabel || defaultDeviceLabel();
+  const deviceLabel = config.deviceLabel || defaultDeviceLabel(getAgentDir());
   let currentSessionId: string | undefined;
   let lease: HeldLease | undefined;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;

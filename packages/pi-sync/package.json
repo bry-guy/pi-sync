@@ -27,7 +27,8 @@
     "dist",
     "skills",
     "extensions",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "pi-package",
@@ -36,6 +37,15 @@
     "sync"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bry-guy/pi-sync.git",
+    "directory": "packages/pi-sync"
+  },
+  "homepage": "https://github.com/bry-guy/pi-sync#readme",
+  "bugs": {
+    "url": "https://github.com/bry-guy/pi-sync/issues"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",

@@ -7,6 +7,16 @@ synchronization protocol. It wraps and extends Pi from
 
 The extension is intended to be installed as a trusted Pi package.
 
+## Install
+
+```sh
+pi install npm:@bry-guy/pi-sync
+# or from git (builds from the repository root):
+pi install git:github.com/bry-guy/pi-sync
+```
+
+Then set `serverUrl` (below) to your pi-syncd.
+
 ## Settings
 
 Settings live in `~/.pi/agent/pi-sync.json`. When Pi runs with another

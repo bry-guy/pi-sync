@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 
 export type CodeSharing = "ask" | "auto" | "off";
@@ -94,4 +94,25 @@ export function loadConfig(paths: string | string[], env: NodeJS.ProcessEnv = pr
     heartbeatMs: heartbeat,
     problems,
   };
+}
+
+/**
+ * The name other devices see when none is configured: the host name, chosen once and kept in
+ * `<agent dir>/sync-device.json`. A Mac's host name changes with the network ("MacBookPro.home.arpa" at home,
+ * "name.local" elsewhere), and a device that renames itself looks like two devices to everything that compares names.
+ */
+export function defaultDeviceLabel(agentDir: string, host = hostname()): string {
+  const path = join(agentDir, "sync-device.json");
+  let file: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) file = parsed;
+  } catch {}
+  if (typeof file.name === "string" && file.name) return file.name;
+  const name = host.split(".")[0]?.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 64) || "pi";
+  try {
+    writeFileSync(`${path}.${process.pid}`, JSON.stringify({ ...file, name }) + "\n");
+    renameSync(`${path}.${process.pid}`, path);
+  } catch {} // an agent dir that can't be written: the name is just not remembered
+  return name;
 }

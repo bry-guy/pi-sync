@@ -27,7 +27,7 @@ Each one can be overridden by an environment variable. Edits take effect after
 | Setting | Environment | Values | Default |
 |---|---|---|---|
 | `serverUrl` | `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) | http(s) URL of pi-syncd | none: sync is off |
-| `deviceLabel` | `PI_SYNC_DEVICE_LABEL` | name other devices see | host name |
+| `deviceLabel` | `PI_SYNC_DEVICE_LABEL` | name other devices see | host name at first run, then kept in `sync-device.json` |
 | `code` | `PI_SYNC_CODE` | `ask` once per repository, `auto` share without asking (announced once per remote; anyone who can read the remote can read the code), `off` never, whatever a repository says | `ask` |
 | `allSessions` | `PI_SYNC_ALL_SESSIONS` | `on`: every conversation syncs after its first reply; `off`: only `/sync attach` | `off` |
 

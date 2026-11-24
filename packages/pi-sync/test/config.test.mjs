@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { configPath, loadConfig } from "../dist/src/index.js";
+import { configPath, defaultDeviceLabel, loadConfig } from "../dist/src/index.js";
 
 const dir = () => mkdtempSync(join(tmpdir(), "pi-sync-config-"));
 
@@ -61,4 +61,13 @@ test("the agent dir's file overrides the dotfiles one per key, and env overrides
   assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "on" }).allSessions, "on");
   assert.equal(loadConfig(paths, { PI_SYNC_ALL_SESSIONS: "projects" }).allSessions, "projects");
   assert.equal(configPaths(join(home, ".pi", "agent"), home).length, 1);
+});
+
+test("the default device label is the host name at first run and does not follow it afterwards", () => {
+  const d = dir();
+  writeFileSync(join(d, "sync-device.json"), JSON.stringify({ version: 1, label: "pi-0123456789abcdef" }));
+  assert.equal(defaultDeviceLabel(d, "MacBookPro.home.arpa"), "macbookpro");
+  assert.equal(defaultDeviceLabel(d, "brainbook-m1.local"), "macbookpro");
+  assert.deepEqual(JSON.parse(readFileSync(join(d, "sync-device.json"), "utf8")), { version: 1, label: "pi-0123456789abcdef", name: "macbookpro" });
+  assert.equal(defaultDeviceLabel(join(d, "missing"), "Other.local"), "other", "an unwritable folder still gets a name");
 });

@@ -1646,12 +1646,10 @@ export default function syncExtension(pi: ExtensionAPI) {
     const newest = (items: typeof sessions) => items
       .filter((item) => (item.updatedAt ?? item.createdAt) > dayAgo && bindings.get(item.sessionId)?.lastEtag !== item.etag)
       .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
-    let candidate = project ? newest(sessions.filter((item) => item.project === project.name)) : undefined;
-    if (!candidate && repository) {
-      const branch = (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim();
-      if (!branch) return;
-      candidate = newest(sessions.filter((item) => repositoryIdentity(item.workspace) === repository && (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch));
-    }
+    // The checkout's own branch comes first, as before projects were covered: its code would land here.
+    const branch = repository ? (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim() : undefined;
+    const candidate = (branch ? newest(sessions.filter((item) => repositoryIdentity(item.workspace) === repository && (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch)) : undefined)
+      ?? (project ? newest(sessions.filter((item) => item.project === project.name)) : undefined);
     if (!candidate) return;
     const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "A conversation";
     notify(ctx, arrivalWarning(title, candidate, deviceLabel), "warning");

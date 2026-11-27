@@ -749,6 +749,71 @@ test("allSessions synchronizes a conversation after its first reply", { ...opts,
   assert.deepEqual(await userTexts(B), ["never attached"]);
 });
 
+/** A peer in its own copy of pi project "eco", with a stand-in for pi-projects (see project-peer.ts). */
+const projectPeer = (name, env = {}) => {
+  const projects = join(caseDir, `projects${name}`);
+  mkdirSync(join(projects, "eco"), { recursive: true });
+  writeFileSync(join(projects, "eco", "project.json"), JSON.stringify({ id: "eco-id", name: "eco" }));
+  const pi = new Pi(name, { cwd: join(projects, "eco"), agentDir: join(caseDir, `agent${name}`), args: ["-e", fileURLToPath(new URL("./project-peer.ts", import.meta.url))], env: { PI_PROJECTS_DIR: projects, ...env } });
+  peers.push(pi);
+  return pi;
+};
+const serverSessions = async () => (await (await fetch(`${process.env.SYNC_URL}/v1/sessions`)).json()).sessions;
+
+test("allSessions=projects synchronizes a project conversation, and none outside a project", { ...opts, timeout: 90_000 }, async () => {
+  const A = projectPeer("A", { PI_SYNC_ALL_SESSIONS: "projects" }), C = peer("C", "a", { PI_SYNC_ALL_SESSIONS: "projects" });
+  await ready(A);
+  await ready(C);
+  await A.prompt("in the project");
+  await C.prompt("outside it");
+  await sleep(1500);
+  assert.deepEqual((await serverSessions()).map((item) => item.project), ["eco"]);
+});
+
+test("starting pi in a project warns about a project conversation made on another device", { ...opts, timeout: 90_000 }, async () => {
+  const A = projectPeer("A", { PI_SYNC_ALL_SESSIONS: "projects" });
+  await ready(A);
+  await A.prompt("from A");
+  await sleep(1500);
+  const B = projectPeer("B");
+  await sleep(4000);
+  const warnings = B.notes.filter((note) => note.includes("is synchronized on other clients"));
+  assert.equal(warnings.length, 1, `B warned once on start: ${JSON.stringify(B.notes)}`);
+  assert.match(warnings[0], /“from A”.*: A\b/, "the warning names the conversation and the client it is on");
+  assert.deepEqual(await userTexts(B), [], "nothing was opened without asking");
+  // A itself has the conversation and is up to date: nothing to say.
+  await A.stop();
+  const again = projectPeer("A");
+  await sleep(4000);
+  assert.deepEqual(again.notes.filter((note) => note.includes("is synchronized on other clients")), []);
+});
+
+test("other extensions list and open shared conversations through the public handle", { ...opts, timeout: 90_000 }, async () => {
+  const A = projectPeer("A", { PI_SYNC_ALL_SESSIONS: "projects" });
+  await ready(A);
+  await A.prompt("from A");
+  await sleep(1500);
+  const B = projectPeer("B");
+  await ready(B);
+  const list = async (pi) => {
+    const seen = pi.notes.length;
+    await pi.prompt("/handle-list");
+    await waitFor(() => pi.notes.slice(seen).some((note) => note.startsWith("handle-list ")));
+    return pi.notes.slice(seen).find((note) => note.startsWith("handle-list "))?.slice("handle-list ".length);
+  };
+  const [listed] = JSON.parse(await list(B));
+  assert.deepEqual({ ...listed, sessionId: "", updatedAt: "", devices: listed.devices.map((device) => device.label) }, { sessionId: "", title: "from A", project: "eco", updatedAt: "", devices: ["A"], local: false });
+  await B.prompt(`/handle-open ${listed.sessionId}`);
+  await sleep(500);
+  assert.deepEqual(await userTexts(B), ["from A"]);
+  assert.equal(JSON.parse(await list(B))[0].local, true, "this device has a file for it now");
+  const C = projectPeer("C", { PI_SYNC_SERVER_URL: "" });
+  await ready(C);
+  assert.equal(await list(C), "rejected", "no server configured");
+  await stopDaemon();
+  assert.equal(await list(B), "rejected", "server unreachable");
+});
+
 test("the agent is told which machine it runs on and when the conversation moved", { ...opts, timeout: 90_000 }, async () => {
   const { A, B } = await handoff();
   const reply = async (pi) => (await pi.messages()).filter((m) => m.role === "assistant").map((m) => typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join("")).at(-1);

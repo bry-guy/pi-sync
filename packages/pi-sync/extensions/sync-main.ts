@@ -1,0 +1,2408 @@
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve as resolvePath } from "node:path";
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  BindingStore,
+  type SyncBinding,
+  SyncClient,
+  SyncClientError,
+  type SessionEnvelope,
+  type SessionResponse,
+  type PiEntry,
+  deriveRepositoryIdentity,
+  deriveWorkspacePointer,
+  captureWorkspace,
+  applyCode,
+  git as gitRun,
+  planCode,
+  rememberSnapshot,
+  shareIdle,
+  snapshotRef,
+  deleteSnapshot,
+  sweepSnapshots,
+  hasUnsharedCode,
+  pushSnapshot,
+  setShareSetting,
+  shareSetting,
+  type Snapshot,
+  type WorkspacePointer,
+  appendSessionFile,
+  defaultSessionDir,
+  forkEnvelope,
+  materializeSessionFile,
+  nativeHeaderLine,
+  projectCwd,
+  projectLink,
+  projectsDir,
+  projectFor,
+  projectRepos,
+  syncProject,
+  resolveCheckout,
+  projectDesyncs,
+  type Project,
+  normalizeSessionFile,
+  withoutLocalSettings,
+  repositoryIdentity,
+  restoreHead,
+  configPaths,
+  defaultDeviceLabel,
+  loadConfig,
+  RemoteHost,
+  type RemoteHostStatus,
+  type RemoteMessagePayload,
+  type RemoteAnswerPayload,
+} from "../src/index.js";
+
+const REQUEST_TIMEOUT_MS = 8_000;
+const ENROLL_BATCH_BYTES = 8 * 1024 * 1024;
+// While another device runs a turn, poll faster so its reply arrives soon after it finishes.
+const REMOTE_POLL_MS = 3_000;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Local-only entries of these types mean two devices really wrote the same conversation.
+// Other local-only entries (model changes, names, extension state) are carried onto the newer copy.
+const CONTEXT_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+// State that must outlive this extension instance: session replacement re-creates it, and hosts may re-evaluate
+// this module per session (pi-ez-web loads extensions without a module cache). One process may also host many
+// sessions, so entries are keyed by the session or file they are meant for, never a single shared slot.
+const shared = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.shared")] ??= {
+  // New sessions that continue a deleted synchronized conversation and should enroll after their first reply.
+  freshEnroll: new Set<string>(),
+  // A catch-up re-opens the session file; this device's model and thinking level to restore, by file.
+  keptSettings: new Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>(),
+  // The rejected-token warning shows once per process, not on every message or poll.
+  tokenWarned: false,
+}) as {
+  freshEnroll: Set<string>;
+  keptSettings: Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>;
+  tokenWarned: boolean;
+};
+const { freshEnroll, keptSettings } = shared;
+
+type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
+type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean; uploaded?: { entries: number; turns: number; pending?: number; error?: string } };
+type Replay = { sessionId: string; text: string; images?: unknown[]; compact?: { customInstructions?: string } };
+type HeldLease = { binding: SyncBinding; token: string; lost: boolean; timer?: ReturnType<typeof setInterval> };
+type Acquired = { ok: true; acquired: { etag: string; count?: number; session: SessionEnvelope; lease: { token: string } } } | { ok: false; message: string; holder?: string; offline?: boolean; unauthorized?: boolean };
+type Fetched = { ok: true; snapshot: SessionResponse } | { ok: false; message: string };
+
+function usefulTitle(title: unknown, ...placeholders: (string | undefined)[]): string {
+  if (typeof title !== "string") return "";
+  const value = title.trim();
+  return value && !placeholders.includes(value) ? value : "";
+}
+
+function firstUserText(entries: readonly { type: string; message?: any }[]): string {
+  const entry = entries.find((candidate) => candidate.type === "message" && candidate.message?.role === "user");
+  const content = entry?.message?.content;
+  const text = typeof content === "string" ? content : Array.isArray(content) ? content.find((part: any) => part?.type === "text")?.text ?? "" : "";
+  return String(text).replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
+function conversationTitle(ctx: ExtensionContext, binding?: SyncBinding): string {
+  const sessionId = ctx.sessionManager.getSessionId();
+  return usefulTitle(ctx.sessionManager.getSessionName(), sessionId) ||
+    usefulTitle(binding?.title, binding?.nativeSessionId, binding?.canonicalSessionId) ||
+    firstUserText(ctx.sessionManager.getEntries() as any[]);
+}
+
+/**
+ * Identifies the entry set and head in O(1). Entries only ever append, and the local file starts with the synchronized
+ * entries in canonical order, so the count and last id stand for the whole list.
+ */
+function entriesFingerprint(entries: readonly { id?: unknown }[], headEntryId: string | null | undefined): string {
+  return `ids-c${entries.length}-${String(entries.at(-1)?.id ?? "")}-${headEntryId ?? ""}`;
+}
+
+/**
+ * How many of this device's synchronized entries the local copy still starts with: the binding's count when the copy
+ * is intact, otherwise 0 (an older file reopened through /resume, or a binding from before counts were recorded).
+ */
+/**
+ * Whether the local copy holds the whole canonical conversation. Bindings written before counts were recorded (or by
+ * hosts such as pi-ez-web) fall back to comparing ids.
+ */
+function holdsCanonical(local: readonly { id?: unknown }[], binding: SyncBinding, canonical: readonly { id?: unknown }[]): boolean {
+  if (binding.syncedCount !== undefined) return syncedPrefix(local, binding) === canonical.length;
+  const ids = new Set(local.map((entry) => entry.id));
+  return canonical.every((entry) => ids.has(entry.id));
+}
+
+function syncedPrefix(local: readonly { id?: unknown }[], binding: SyncBinding): number {
+  const count = binding.syncedCount;
+  if (!count || !binding.syncedLastId || local.length < count || local[count - 1]?.id !== binding.syncedLastId) return 0;
+  return count;
+}
+
+/**
+ * Whether `local` starts with the whole canonical conversation and only adds entries onto it: then its local-only
+ * entries are uploads still to make (a re-attach, or a lost upload response), not a second writer's turns.
+ */
+export function extendsCanonical(local: readonly { id?: unknown; parentId?: unknown }[], canonical: readonly { id?: unknown }[]): boolean {
+  if (canonical.length === 0 || local.length < canonical.length || canonical.some((entry, index) => local[index]?.id !== entry.id)) return false;
+  const known = new Set(canonical.map((entry) => entry.id));
+  for (const entry of local.slice(canonical.length)) {
+    // A repeated id would be refused by the server, leaving the upload pending for good.
+    if (known.has(entry.id) || !known.has(entry.parentId)) return false;
+    known.add(entry.id);
+  }
+  return true;
+}
+
+/** Splits entries into requests of at most `limit` bytes (one oversized entry still goes alone); none gives one empty batch. */
+export function inBatches<T>(entries: readonly T[], limit: number): T[][] {
+  const batches: T[][] = [[]];
+  let size = 0;
+  for (const entry of entries) {
+    const bytes = Buffer.byteLength(JSON.stringify(entry));
+    if (size + bytes > limit && batches.at(-1)!.length > 0) {
+      batches.push([]);
+      size = 0;
+    }
+    batches.at(-1)!.push(entry);
+    size += bytes;
+  }
+  return batches;
+}
+
+
+/** Tells the agent which machine this turn runs on, and that earlier turns may have run elsewhere. */
+export function locationPrompt(input: { device: string; previous?: string; cwd: string; platform: string; workspace?: WorkspacePointer }): string {
+  const lines = [
+    `Location: this conversation is synchronized across machines with pi-sync. This turn runs on "${input.device}" (${input.platform}), in ${input.cwd}.`,
+  ];
+  if (input.previous && input.previous !== input.device) {
+    lines.push(`The previous turn ran on "${input.previous}". Files, running processes, uncommitted changes, and tool output from there may not exist here; check before relying on them, and don't assume this machine's state matches earlier messages.`);
+  } else {
+    lines.push("Earlier turns may have run on other machines; check local state before relying on what earlier messages describe.");
+  }
+  if (input.workspace) {
+    lines.push(`Synchronized workspace: upstream branch ${input.workspace.branch} at pushed commit ${input.workspace.commit}. Follow the synchronized-workspace skill before handing work to another runtime.`);
+  }
+  return lines.join("\n");
+}
+
+/** “title” is synchronized on other clients: a, b. Open it with /sync. */
+export function arrivalWarning(title: string, item: { leaseHolder: string | null; devices?: { label: string }[] }, self: string): string {
+  const others = [...new Set([item.leaseHolder, ...(item.devices ?? []).map((device) => device.label)])].filter((label): label is string => !!label && label !== self);
+  const where = others.length ? `other clients: ${others.join(", ")}` : "other clients";
+  return `“${title}” is synchronized on ${where}. Open it with /sync.`;
+}
+
+function relativeAge(value: string | undefined): string {
+  if (!value) return "";
+  const seconds = Math.max(0, (Date.now() - Date.parse(value)) / 1000);
+  if (!Number.isFinite(seconds)) return "";
+  if (seconds < 90) return "just now";
+  if (seconds < 90 * 60) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 36 * 3600) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
+}
+
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+// Per project folder, shared by every session in this process (pi-web runs many): one checkout sync at a time.
+const projectRuns = new Map<string, Promise<unknown>>();
+// Turns running in each project folder in this process: arrival changes checkouts only when none is (an agent may
+// be editing any repository there).
+const projectTurns = new Map<string, number>();
+const inProjectOrder = <T>(root: string, run: () => Promise<T>): Promise<T> => {
+  const next = (projectRuns.get(root) ?? Promise.resolve()).catch(() => undefined).then(run);
+  projectRuns.set(root, next.catch(() => undefined));
+  return next;
+};
+
+// Module level: a session switch re-runs the factory, and two copies must not check out code at once.
+let arriving: Promise<void> | undefined;
+
+export default function syncExtension(pi: ExtensionAPI) {
+  const store = new BindingStore(getAgentDir());
+  // Read once per load; /reload picks up edits.
+  const config = loadConfig(configPaths(getAgentDir()));
+  const HEARTBEAT_MS = config.heartbeatMs;
+  // Last binding seen per session in this process: an older pi-sync process sharing the file can
+  // rewrite it without ours, so a missing binding we still know about is written back.
+  const remembered = new Map<string, SyncBinding>();
+  const bindingFor = async (sessionId: string): Promise<SyncBinding | undefined> => {
+    const stored = await store.get(sessionId);
+    if (stored) {
+      remembered.set(sessionId, stored);
+      return stored;
+    }
+    const known = remembered.get(sessionId);
+    if (known) await store.set(known);
+    return known;
+  };
+  const LINK_ENTRY = "pi-sync-link";
+  const detachedHere = (ctx: ExtensionContext) => {
+    const marker = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === LINK_ENTRY) as { data?: { detached?: boolean } } | undefined;
+    return marker?.data?.detached === true;
+  };
+  const deviceLabel = config.deviceLabel || defaultDeviceLabel(getAgentDir());
+  let currentSessionId: string | undefined;
+  let lease: HeldLease | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let remoteWork: { ctx: ExtensionContext; holder: string; timer: ReturnType<typeof setInterval> } | undefined;
+  let pollGeneration = 0;
+  let refreshDispatched = false;
+  let busy: Promise<unknown> | undefined;
+  let pendingReplay: Replay | undefined;
+
+  const notify = (ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") => {
+    try {
+      if (ctx?.hasUI) ctx.ui.notify(message, level);
+    } catch {
+      // A replaced session invalidates its context; the message is no longer relevant.
+    }
+  };
+
+  /** Shows a spinner above the editor while another device holds the lease; no holder hides it. */
+  const showRemoteWork = (ctx: ExtensionContext, holder?: string) => {
+    if (remoteWork && remoteWork.holder === holder && remoteWork.ctx === ctx) return;
+    if (remoteWork) {
+      clearInterval(remoteWork.timer);
+      try {
+        remoteWork.ctx.ui.setWidget("pi-sync-remote", undefined);
+      } catch {
+        // A replaced session invalidates its context; its widgets went with it.
+      }
+      remoteWork = undefined;
+    }
+    if (!holder || !ctx.hasUI) return;
+    let frame = 0;
+    const render = () => {
+      try {
+        const theme = ctx.ui.theme;
+        ctx.ui.setWidget("pi-sync-remote", [`${theme.fg("accent", SPINNER_FRAMES[frame++ % SPINNER_FRAMES.length] ?? "")} ${theme.fg("muted", `Working on ${holder}…`)}`]);
+      } catch {
+        // A replaced session invalidates its context; the next poll owns the widget.
+      }
+    };
+    render();
+    const timer = setInterval(render, 100);
+    timer.unref?.();
+    remoteWork = { ctx, holder, timer };
+  };
+
+  // Desynced checkouts of this session's project, shown after the sync status.
+  let desyncedCount = 0;
+  let statusText: string | undefined;
+  // What the footer shows now. The poll sets the same text every heartbeat; redrawing it made the TUI jitter.
+  let shownStatus: string | undefined | null = null;
+  const tooLargeWarned = new Set<string>();
+  const setStatus = (ctx: ExtensionContext | undefined, text?: string) => {
+    statusText = text;
+    const shown = text && desyncedCount ? `${text} · ${desyncedCount} desynced` : text;
+    try {
+      if (!ctx?.hasUI || shown === shownStatus) return;
+      ctx.ui.setStatus("pi-sync", shown);
+      shownStatus = shown;
+    } catch {
+      // A replaced session invalidates its context; the new session sets its own status.
+    }
+  };
+
+  /** Command failures are thrown for host integrations (pi-ez-web) and only shown in interactive Pi. */
+  const fail = (ctx: ExtensionContext, code: string, message: string): never | void => {
+    notify(ctx, message, "error");
+    if (ctx.mode === "json") throw Object.assign(new Error(message), { code });
+  };
+
+  const configuredUrl = (args = ""): string | undefined => {
+    const candidate = args.trim().split(/\s+/).find((part) => /^https?:\/\//i.test(part));
+    return candidate ?? config.serverUrl;
+  };
+
+  const clientFor = (url: string): SyncClient => new SyncClient({ baseUrl: url, timeoutMs: REQUEST_TIMEOUT_MS, device: deviceLabel });
+
+  /** Serializes network/file operations so a background upload never races a prompt's acquisition. */
+  const exclusive = async <T>(task: () => Promise<T>): Promise<T> => {
+    while (busy) await busy.catch(() => undefined);
+    const running = task();
+    busy = running;
+    try {
+      return await running;
+    } finally {
+      if (busy === running) busy = undefined;
+    }
+  };
+
+  // Fresh sessions already hold model and thinking entries; only messages make a conversation.
+  const hasMessages = (ctx: ExtensionContext) => ctx.sessionManager.getEntries().some((entry) => entry.type === "message");
+
+  const hasPendingInput = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.hasPendingMessages() || (ctx.hasUI && typeof ctx.ui.getEditorText === "function" && ctx.ui.getEditorText().length > 0);
+    } catch {
+      return true;
+    }
+  };
+
+  const gitRunnerFor = (ctx: ExtensionContext) => async (command: string, args: string[]) => {
+    const result = await pi.exec(command, args, { cwd: ctx.cwd, timeout: 5_000 });
+    return { stdout: result.stdout, code: result.code };
+  };
+
+  const repositoryFor = async (ctx: ExtensionContext): Promise<string | undefined> => {
+    try {
+      return await deriveRepositoryIdentity(ctx.cwd, gitRunnerFor(ctx));
+    } catch {
+      return undefined;
+    }
+  };
+
+  const localFingerprint = (ctx: ExtensionContext) =>
+    entriesFingerprint(ctx.sessionManager.getEntries() as { id?: unknown }[], ctx.sessionManager.getLeafId());
+
+  /**
+   * Whether this copy has changes worth an idle upload. Model and thinking switches don't count, nor does a moved
+   * head: each device restores its own settings after a catch-up, and uploading that made two devices with different
+   * settings refresh each other forever. Those changes go up with the next turn.
+   */
+  const localChanged = (ctx: ExtensionContext, binding: SyncBinding) => {
+    if (localFingerprint(ctx) === binding.lastFingerprint) return false;
+    const entries = ctx.sessionManager.getEntries() as { id?: unknown; type?: unknown }[];
+    const synced = binding.syncedCount;
+    if (!synced || synced > entries.length || entries[synced - 1]?.id !== binding.syncedLastId) return true;
+    return entries.slice(synced).some((entry) => entry.type !== "model_change" && entry.type !== "thinking_level_change");
+  };
+
+  const remoteFingerprint = (envelope: SessionEnvelope) => entriesFingerprint(envelope.entries, envelope.headEntryId);
+
+  const normalizeCurrent = async (ctx: ExtensionContext, binding?: SyncBinding, workspace?: WorkspacePointer): Promise<SessionEnvelope> => {
+    const path = ctx.sessionManager.getSessionFile();
+    if (!path) throw new Error("synchronization requires a persistent Pi session");
+    return normalizeSessionFile(path, {
+      requestedSessionId: ctx.sessionManager.getSessionId(),
+      headEntryId: ctx.sessionManager.getLeafId() ?? "",
+      title: conversationTitle(ctx, binding),
+      parentSessionId: binding?.parentSessionId,
+      workspace: workspace ?? (await idleWorkspace(ctx, binding)),
+    });
+  };
+
+  // Idle uploads (renames, model switches) keep the last turn's code snapshot until the next turn replaces it.
+  const idleWorkspace = async (ctx: ExtensionContext, binding?: SyncBinding): Promise<WorkspacePointer | undefined> => {
+    const derived = await deriveWorkspacePointer(ctx.cwd, gitRunnerFor(ctx));
+    const wip = binding?.workspace?.wip;
+    return wip ? { ...(derived ?? binding!.workspace!), wip } : derived;
+  };
+
+  const syncedBinding = (binding: SyncBinding, envelope: SessionEnvelope, etag: string, materializedFile = binding.materializedFile): SyncBinding => {
+    const next: SyncBinding = {
+      ...binding,
+      state: "ready",
+      lastEtag: etag,
+      lastFingerprint: remoteFingerprint(envelope),
+      syncedCount: envelope.entries.length,
+      syncedLastId: envelope.entries.at(-1)?.id ?? "",
+      materializedFile,
+      workspace: envelope.workspace,
+      parentSessionId: envelope.parentSessionId,
+      title: envelope.title,
+    };
+    delete next.leaseToken;
+    delete next.leasePid;
+    delete next.leaseExpiresAt;
+    return next;
+  };
+
+  const markSetupRequired = async (ctx: ExtensionContext, binding: SyncBinding) => {
+    const next: SyncBinding = { ...binding, state: "setup_required" };
+    delete next.leaseToken;
+    delete next.leasePid;
+    delete next.leaseExpiresAt;
+    await store.set(next);
+    setStatus(ctx, "sync: server copy missing (/sync attach)");
+  };
+
+  const DELETED_MESSAGE = "This conversation's synchronized history was deleted from the sync server after a period without activity. Your next message starts a new synchronized chat; this local copy stays in /resume.";
+  const DELETED_ENTRY = "pi-sync-deleted";
+  const deletedHere = (ctx: ExtensionContext) => ctx.sessionManager.getEntries().some((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DELETED_ENTRY);
+
+  /** The server deleted the conversation: stop syncing this copy and remember to start a new chat on the next message. */
+  const forgetDeleted = async (ctx: ExtensionContext, binding: SyncBinding) => {
+    await store.remove(binding.nativeSessionId);
+    if (!deletedHere(ctx)) pi.appendEntry(DELETED_ENTRY, { at: new Date().toISOString() });
+    setStatus(ctx, "sync: history deleted; next message starts a new chat");
+  };
+
+  const tokenRejected = (ctx: ExtensionContext) => {
+    setStatus(ctx, "sync: token rejected (set PI_SYNC_TOKEN)");
+    if (shared.tokenWarned) return;
+    shared.tokenWarned = true;
+    notify(ctx, "The sync server rejected this device's token. Set PI_SYNC_TOKEN and restart pi.", "warning");
+  };
+
+  const explainFailure = async (ctx: ExtensionContext, binding: SyncBinding, error: unknown): Promise<string> => {
+    const code = error instanceof SyncClientError ? error.code : "";
+    if (code === "session_deleted") {
+      await forgetDeleted(ctx, binding);
+      return DELETED_MESSAGE;
+    }
+    if (code === "session_not_found") {
+      await markSetupRequired(ctx, binding);
+      return "The sync server no longer has this conversation. Run /sync attach to upload this copy again.";
+    }
+    if (code === "active_lease") {
+      const holder = error instanceof SyncClientError && typeof error.details?.holder === "string" ? error.details.holder : "another device";
+      setStatus(ctx, `sync: in use on ${holder}`);
+      return `This conversation is running on ${holder}. Wait for it to finish, then send again.`;
+    }
+    // Servers before the lease-free snapshot endpoint and advisory repository scope answer this way.
+    if (["not_found", "method_not_allowed", "workspace_required", "workspace_mismatch"].includes(code)) {
+      setStatus(ctx, "sync: server needs update");
+      return `The sync server at ${binding.serverUrl} is older than this pi-sync client. Update pi-syncd to keep syncing.`;
+    }
+    if (code === "unauthorized") {
+      tokenRejected(ctx);
+      return error instanceof Error ? error.message : "The sync server rejected this device's token.";
+    }
+    if (code === "network_error" || code === "timeout") {
+      setStatus(ctx, "sync: offline");
+      return "The sync server is unreachable, so the prompt was not sent. Retry, or /sync detach to work on this copy alone.";
+    }
+    return error instanceof Error ? error.message : "Could not reach the synchronized conversation.";
+  };
+
+  const acquire = async (ctx: ExtensionContext, binding: SyncBinding, takeOver = false): Promise<Acquired> => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const acquired = await clientFor(binding.serverUrl).acquire(binding.canonicalSessionId, deviceLabel, { timeoutMs: REQUEST_TIMEOUT_MS, takeOver, metadataOnly: true });
+        return { ok: true, acquired };
+      } catch (error) {
+        // Another device's idle upload holds the lease for well under a second; wait that out.
+        if (error instanceof SyncClientError && error.code === "active_lease" && attempt < 4) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          continue;
+        }
+        const holder = error instanceof SyncClientError && error.code === "active_lease"
+          ? (typeof error.details?.holder === "string" ? error.details.holder : "another device")
+          : undefined;
+        const offline = error instanceof SyncClientError && (error.code === "network_error" || error.code === "timeout");
+        const unauthorized = error instanceof SyncClientError && error.code === "unauthorized";
+        return { ok: false, message: await explainFailure(ctx, binding, error), holder, offline, unauthorized };
+      }
+    }
+  };
+
+  /**
+   * The canonical conversation, downloading only the entries after this device's synchronized prefix. `local` is the
+   * copy that prefix is taken from (none for a conversation not yet on this device).
+   */
+  const fetchCanonical = async (ctx: ExtensionContext, binding: SyncBinding, local: readonly PiEntry[] = []): Promise<Fetched> => {
+    const client = clientFor(binding.serverUrl);
+    let from = syncedPrefix(local, binding);
+    for (;;) {
+      try {
+        const delta = await client.entriesSince(binding.canonicalSessionId, from, { prevId: from > 0 ? String(local[from - 1]?.id ?? "") : undefined });
+        // The server's copy must still start with the prefix this device holds; otherwise download it all.
+        if (from > 0 && delta.count < from) {
+          from = 0;
+          continue;
+        }
+        const entries = from === 0 ? delta.session.entries : [...local.slice(0, from), ...delta.session.entries];
+        return { ok: true, snapshot: { ...delta, session: { ...delta.session, entries } } };
+      } catch (error) {
+        if (error instanceof SyncClientError && ["range_not_satisfiable", "prefix_mismatch"].includes(error.code) && from > 0) {
+          from = 0;
+          continue;
+        }
+        // Servers before appends serve only the whole conversation.
+        if (error instanceof SyncClientError && (error.code === "not_found" || error.code === "method_not_allowed")) {
+          try {
+            return { ok: true, snapshot: await client.get(binding.canonicalSessionId) };
+          } catch (legacyError) {
+            return { ok: false, message: await explainFailure(ctx, binding, legacyError) };
+          }
+        }
+        return { ok: false, message: await explainFailure(ctx, binding, error) };
+      }
+    }
+  };
+
+  const release = async (binding: SyncBinding, token: string) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await clientFor(binding.serverUrl).release(binding.canonicalSessionId, token);
+        return;
+      } catch (error) {
+        // An invalid token means the lease is already gone; anything else expires server-side.
+        if (error instanceof SyncClientError && ["lease_invalid", "lease_not_found", "session_not_found"].includes(error.code)) return;
+      }
+    }
+  };
+
+  /** Sends what this device added since it last synchronized; the whole conversation only to older servers. */
+  const upload = async (ctx: ExtensionContext, binding: SyncBinding, token: string, workspace?: WorkspacePointer): Promise<SyncBinding> => {
+    const client = clientFor(binding.serverUrl);
+    const entries = ctx.sessionManager.getEntries() as PiEntry[];
+    const file = ctx.sessionManager.getSessionFile() ?? binding.materializedFile;
+    const base = syncedPrefix(entries, binding);
+    if (base > 0) {
+      const header = {
+        headEntryId: ctx.sessionManager.getLeafId() ?? entries.at(-1)?.id ?? "",
+        title: conversationTitle(ctx, binding),
+        workspace: workspace ?? (await idleWorkspace(ctx, binding)),
+        ...(projectLink(entries) ? { project: projectLink(entries)!.name } : {}),
+      };
+      // A long tail (a re-attach after days detached) goes in several requests. Each one is recorded as synchronized,
+      // so a failure part-way leaves a copy that is simply ahead, and the next check sends the rest.
+      let next = binding;
+      let count = base;
+      try {
+        for (const batch of inBatches(withoutLocalSettings(entries.slice(base)), ENROLL_BATCH_BYTES)) {
+          count += batch.length;
+          const headEntryId = count === entries.length ? header.headEntryId : batch.at(-1)!.id;
+          const response = await client.append(binding.canonicalSessionId, token, next.lastEtag, { baseCount: count - batch.length, entries: batch, ...header, headEntryId });
+          const envelope = { formatVersion: 1 as const, sessionId: binding.canonicalSessionId, piSessionVersion: 3, createdAt: "", parentSessionId: binding.parentSessionId ?? null, ...header, headEntryId, entries: entries.slice(0, count) };
+          next = syncedBinding(next, envelope, response.etag, file);
+          await store.set(next);
+        }
+        return next;
+      } catch (error) {
+        if (next !== binding) throw error;
+        if (!(error instanceof SyncClientError) || (error.code !== "not_found" && error.code !== "method_not_allowed")) throw error;
+      }
+    }
+    const envelope = await normalizeCurrent(ctx, binding, workspace);
+    const response = await client.update(binding.canonicalSessionId, envelope, token, binding.lastEtag);
+    const next = syncedBinding(binding, envelope, response.etag, file);
+    await store.set(next);
+    return next;
+  };
+
+  const stopHeartbeat = () => {
+    if (lease?.timer) clearInterval(lease.timer);
+    if (lease) lease.timer = undefined;
+  };
+
+  const holdLease = (ctx: ExtensionContext, binding: SyncBinding, token: string) => {
+    stopHeartbeat();
+    const held: HeldLease = { binding, token, lost: false };
+    held.timer = setInterval(() => {
+      void clientFor(binding.serverUrl).renew(binding.canonicalSessionId, token, { timeoutMs: 5_000 }).then(
+        () => { held.lost = false; },
+        (error) => {
+          // Transient failures are retried on the next beat; the upload's ETag check is the real guard.
+          if (error instanceof SyncClientError && ["lease_invalid", "lease_not_found", "session_not_found"].includes(error.code)) held.lost = true;
+        },
+      );
+    }, HEARTBEAT_MS);
+    held.timer.unref?.();
+    lease = held;
+    // Persisted so a restart after a crash can release the lease instead of waiting for expiry.
+    void store.set({ ...binding, leaseToken: token, leasePid: process.pid }).catch(() => undefined);
+    // This device runs the turn now (possibly after taking it over), so nothing else is.
+    showRemoteWork(ctx);
+    setStatus(ctx, "sync: working");
+  };
+
+  /** A failed git step is usually another git command holding a lock; try a few times before giving up on this turn. */
+  const captureWithRetry = async (cwd: string): Promise<Snapshot> => {
+    let snapshot: Snapshot = { kind: "skipped", reason: "could not capture the working tree", retryable: true };
+    for (const wait of [0, 500, 2000]) {
+      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        snapshot = await captureWorkspace(cwd);
+      } catch (error) {
+        snapshot = { kind: "skipped", reason: `could not capture the working tree (${error instanceof Error ? error.message : String(error)})`, retryable: true };
+      }
+      if (snapshot.kind !== "skipped" || !snapshot.retryable) return snapshot;
+    }
+    return snapshot;
+  };
+
+  /** Uploads the settled conversation and releases the turn's lease. Never blocks the user. */
+  const finishTurn = async (ctx: ExtensionContext) => {
+    const held = lease;
+    if (!held) return;
+    stopHeartbeat();
+    lease = undefined;
+    let snapshot: Snapshot | undefined;
+    // Project conversations share every repository of the project instead (after the upload, below).
+    const project = projectOf(ctx.cwd);
+    if (!project && await shareEnabled(ctx.cwd)) snapshot = await captureWithRetry(ctx.cwd);
+    let uploaded = false;
+    await exclusive(async () => {
+      try {
+        await upload(ctx, held.binding, held.token, snapshot?.workspace);
+        uploaded = true;
+        setStatus(ctx, "sync: up to date");
+      } catch (error) {
+        const code = error instanceof SyncClientError ? error.code : "";
+        if (code === "session_not_found") await markSetupRequired(ctx, held.binding);
+        else if (code === "session_deleted") {
+          await forgetDeleted(ctx, held.binding);
+          notify(ctx, DELETED_MESSAGE, "warning");
+        }
+        else if (code === "stale_etag") setStatus(ctx, "sync: newer copy elsewhere; will refresh");
+        else if (code === "request_too_large") {
+          setStatus(ctx, "sync: too large to upload");
+          if (!tooLargeWarned.has(held.binding.nativeSessionId)) notify(ctx, "This session is too large to synchronize, so it stays on this device. Start a new session to sync again.", "warning");
+          tooLargeWarned.add(held.binding.nativeSessionId);
+        }
+        else if (code === "lease_invalid" || code === "lease_not_found") {
+          // The server forgets leases when it restarts. Only call it a take-over if someone else holds or wrote it.
+          const remote = await clientFor(held.binding.serverUrl).list().then(
+            (list) => list.sessions.find((item) => item.sessionId === held.binding.canonicalSessionId),
+            () => undefined,
+          );
+          const takenOver = remote && ((remote.leaseHolder && remote.leaseHolder !== deviceLabel) || remote.etag !== held.binding.lastEtag);
+          if (takenOver) {
+            setStatus(ctx, "sync: taken over elsewhere");
+            notify(ctx, "Another device took over this conversation. This reply will be kept as a separate copy when this copy catches up.", "warning");
+          } else {
+            setStatus(ctx, "sync: upload pending"); // the poll re-acquires and uploads
+          }
+        }
+        else setStatus(ctx, "sync: upload pending");
+      } finally {
+        await release(held.binding, held.token);
+        const stored = await bindingFor(held.binding.nativeSessionId);
+        if (stored?.leaseToken === held.token) {
+          delete stored.leaseToken;
+          delete stored.leasePid;
+          await store.set(stored);
+        }
+      }
+    });
+    if (project) void syncProjectCode(ctx, project, { fetch: false, failId: held.binding.canonicalSessionId });
+    else if (uploaded && snapshot) void shareSnapshot(ctx, held.binding, snapshot).then(() => retryPushes(ctx, true)).catch(() => undefined);
+    else void retryPushes(ctx, true).catch(() => undefined);
+  };
+
+  const projectOf = (cwd: string): Project | undefined => projectFor(cwd, projectsDir(getAgentDir()));
+  const projectNoticed = new Set<string>();
+  /**
+   * Syncs the project's checkouts (see syncProject): `fetch` asks the remotes for other machines' states, otherwise
+   * this only shares; checkouts change only when no turn runs in the project. `failId` is the conversation whose
+   * background backoff counts failures (each may be a credential prompt).
+   */
+  const syncProjectCode = (ctx: ExtensionContext, project: Project, options: { fetch: boolean; failId?: string; notifyAll?: boolean }): Promise<void> =>
+    inProjectOrder(project.root, async () => {
+      if (config.code === "off") return;
+      const asked: string[] = [];
+      const results = await syncProject(project, {
+        device: deviceLabel,
+        fetch: options.fetch,
+        apply: (projectTurns.get(project.root) ?? 0) === 0,
+        allowed: async (repo) => {
+          const setting = await shareSetting(repo);
+          if (setting === undefined && config.code === "ask") asked.push(repo.slice(repo.lastIndexOf("/") + 1));
+          return setting ?? config.code === "auto";
+        },
+      });
+      if (options.failId) {
+        if (results.some((item) => item.result === "failed")) idleFailed(options.failId);
+        else if (results.some((item) => item.result !== "unchanged")) idleFailures.delete(options.failId);
+      }
+      const firstShares = [...new Set(results.filter((item) => item.result === "shared" && !autoShareNoticed.has(`project:${item.repo}`)).map((item) => item.repo))];
+      if (firstShares.length && config.code === "auto") {
+        for (const repo of firstShares) autoShareNoticed.add(`project:${repo}`);
+        notify(ctx, `Syncing checkouts (branches, unpushed commits, uncommitted changes) of ${firstShares.join(", ")} through ${firstShares.length > 1 ? "their remotes" : "its remote"} (refs/pi-checkouts/…); anyone who can read a remote can read them. /sync code off stops it for this project.`, "info");
+      }
+      if (asked.length && !projectNoticed.has(`ask:${project.id}`)) {
+        projectNoticed.add(`ask:${project.id}`);
+        notify(ctx, `Checkouts of ${asked.join(", ")} are not synced with your other devices. /sync code on syncs every repository in this project.`, "info");
+      }
+      for (const item of results) {
+        if (!item.message) continue;
+        const key = `${item.repo}:${item.key}:${item.result}:${item.message}`;
+        if (!options.notifyAll && projectNoticed.has(key)) continue;
+        projectNoticed.add(key);
+        notify(ctx, item.message, item.result === "failed" || item.result === "desynced" ? "warning" : "info");
+      }
+      await refreshDesyncs(ctx, project);
+    }).catch(() => undefined);
+
+  const refreshDesyncs = async (ctx: ExtensionContext, project: Project) => {
+    const count = (await projectDesyncs(project).catch(() => [])).filter((item) => item.message).length;
+    if (count === desyncedCount) return;
+    desyncedCount = count;
+    setStatus(ctx, statusText);
+  };
+
+  /** The repository's own /sync code on|off wins; otherwise the configured default. */
+  const shareEnabled = async (cwd: string): Promise<boolean> => config.code !== "off" && ((await shareSetting(cwd)) ?? config.code === "auto");
+  const autoShareNoticed = new Set<string>();
+  // Background remote calls (idle share, arrival fetch, sweep) that failed in a row, by conversation; the poll stops
+  // reaching the remote at MAX_POLL_FAILURES until the next turn, since each may be a credential prompt.
+  const idleFailures = new Map<string, number>();
+  const idleFailed = (id: string) => idleFailures.set(id, (idleFailures.get(id) ?? 0) + 1);
+  const idleBackedOff = (id: string) => (idleFailures.get(id) ?? 0) >= MAX_POLL_FAILURES;
+
+  // Snapshots whose push failed, by conversation. Only the latest matters: each push replaces the conversation's ref.
+  // shortcut: kept in memory, so a restart drops it; the next turn's snapshot covers the same work.
+  const pendingPushes = new Map<string, { cwd: string; remote: string; commit: string; nextAttempt: number; failed: boolean; failures?: number }>();
+  const PUSH_RETRY_MS = 60_000;
+  // A failed push may be a credential prompt (e.g. an SSH agent), so the poll backs off, then waits for the next turn.
+  const MAX_POLL_FAILURES = 3;
+  const OFFLINE_GIT = /could not resolve host|network is unreachable|connection (refused|timed out|reset)|operation timed out|no route to host|temporary failure in name resolution|could not read from remote|unable to access/i;
+
+  // One push or delete at a time per conversation, so an older snapshot can never land after a newer one.
+  const pushChains = new Map<string, Promise<void>>();
+  const inOrder = (id: string, task: () => Promise<void>): Promise<void> => {
+    const next = (pushChains.get(id) ?? Promise.resolve()).then(task, task).catch(() => undefined);
+    pushChains.set(id, next);
+    void next.then(() => { if (pushChains.get(id) === next) pushChains.delete(id); });
+    return next;
+  };
+
+  /** Pushes the conversation's latest pending snapshot, if it is still the latest when its turn comes. */
+  const tryPush = (ctx: ExtensionContext, id: string, commit: string) => inOrder(id, async () => {
+    const pending = pendingPushes.get(id);
+    if (!pending || pending.commit !== commit) return; // superseded or cleared meanwhile
+    const pushed = await pushSnapshot(pending.cwd, pending.remote, commit, id);
+    if (pendingPushes.get(id)?.commit !== commit) return;
+    if (pushed.code === 0) {
+      pendingPushes.delete(id);
+      await rememberSnapshot(pending.cwd, id, commit);
+      if (pending.failed) notify(ctx, "Code that could not be shared earlier is now shared.", "info");
+      return;
+    }
+    // An unreachable remote (offline, or just woken from sleep) is not a credential prompt: keep retrying each minute.
+    const offline = OFFLINE_GIT.test(pushed.stderr);
+    const failures = offline ? (pending.failures ?? 0) : (pending.failures ?? 0) + 1;
+    const nextAttempt = offline ? Date.now() + PUSH_RETRY_MS : failures >= MAX_POLL_FAILURES ? Infinity : Date.now() + PUSH_RETRY_MS * 2 ** (failures - 1);
+    pendingPushes.set(id, { ...pending, failed: true, failures, nextAttempt });
+    if (!pending.failed) notify(ctx, `Code for this turn was not shared yet: push to ${pending.remote} failed (${pushed.stderr.trim().split("\n").at(-1) ?? ""}). pi-sync will retry.`, "warning");
+  });
+
+  /** Retries failed pushes after every turn, and from the poll with backoff until MAX_POLL_FAILURES. */
+  const retryPushes = async (ctx: ExtensionContext, force = false) => {
+    for (const [id, pending] of pendingPushes) {
+      if (pending.failed && (force || Date.now() >= pending.nextAttempt)) await tryPush(ctx, id, pending.commit);
+    }
+  };
+
+  /** Pushes (or clears) the turn's code snapshot after the lease is released, so it never delays the other device. */
+  const shareSnapshot = async (ctx: ExtensionContext, binding: SyncBinding, snapshot: Snapshot) => {
+    const id = binding.canonicalSessionId;
+    idleFailures.delete(id); // a new turn re-enables idle sharing
+    if (snapshot.kind === "skipped") {
+      // A retryable failure is covered by the next turn's snapshot, which captures the whole working tree again.
+      notify(ctx, snapshot.retryable ? `Code for this turn was not shared yet: ${snapshot.reason}. pi-sync will try again after your next turn.` : `Code for this turn was not shared: ${snapshot.reason}.`, "warning");
+      return;
+    }
+    if (snapshot.kind === "clean") {
+      pendingPushes.delete(id);
+      const sharedIdle = (await gitOut(ctx.cwd, ["rev-parse", "--verify", "--quiet", snapshotRef(id)])) !== undefined;
+      if (binding.workspace?.wip || sharedIdle) {
+        await inOrder(id, async () => {
+          await deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote);
+          await gitOut(ctx.cwd, ["update-ref", "-d", snapshotRef(id)]);
+        });
+      }
+      return;
+    }
+    if (config.code === "auto" && !autoShareNoticed.has(snapshot.remote)) {
+      autoShareNoticed.add(snapshot.remote);
+      notify(ctx, `Sharing uncommitted code to ${snapshot.remote} (refs/pi-sync/…); anyone who can read that remote can read it. /sync code off stops it for this repository.`, "info");
+    }
+    const commit = snapshot.workspace.wip!.commit;
+    const failed = pendingPushes.get(id)?.failed ?? false;
+    pendingPushes.set(id, { cwd: ctx.cwd, remote: snapshot.remote, commit, nextAttempt: 0, failed });
+    await tryPush(ctx, id, commit);
+  };
+
+  /** Asks once per repository whether uncommitted work may be pushed to a hidden ref on its remote. */
+  const askToShareCode = async (ctx: ExtensionContext) => {
+    if (config.code !== "ask" || !ctx.hasUI || projectOf(ctx.cwd) || (await shareSetting(ctx.cwd)) !== undefined) return;
+    if (!(await hasUnsharedCode(ctx.cwd))) return;
+    const enabled = await ctx.ui.confirm(
+      "Share uncommitted code with your other devices?",
+      "After each turn, pi-sync can push this checkout's uncommitted and unpushed work to a hidden ref (refs/pi-sync/<conversation>) on this repository's remote, so another device can restore it with /sync code. Anyone who can read the remote can read that ref. Files in .gitignore are never included. Change later with /sync code on|off.",
+    );
+    await setShareSetting(ctx.cwd, enabled);
+  };
+
+  const gitOut = (cwd: string, args: string[]) => gitRun(cwd, args).then((result) => (result.code === 0 ? result.stdout.trim() : undefined));
+
+  // Per conversation: the code target the user declined or that could not be applied, so it is not asked again.
+  const codeSettled = new Map<string, string>();
+  // Per conversation: the workspace pointer last checked, so the poll does not fetch again until a turn changes it.
+  const arrivalChecked = new Map<string, string>();
+
+  /**
+   * Brings this checkout to the conversation's latest code after another device worked on it: automatically when
+   * nothing local can be lost and the checkout is on the latest default branch (or behind on the same branch),
+   * otherwise after asking, stashing local changes first. Never runs while the agent works.
+   */
+  const arriveCode = async (ctx: ExtensionContext, options: { force?: boolean; ask?: boolean; now?: boolean } = {}): Promise<void> => {
+    if (options.force) await arriving; // /sync code must run, not join a background check
+    arriving ??= (async () => {
+      if (config.code === "off" || !ctx.isIdle()) return;
+      const project = projectOf(ctx.cwd);
+      if (project) return arriveProjectCode(ctx, project, options);
+      const id = ctx.sessionManager.getSessionId();
+      const binding = await bindingFor(id);
+      if (!binding?.workspace) return;
+      // This device wrote the latest turn: its checkout is the source, not a destination.
+      if (!options.force && lastDevice(ctx) === deviceLabel) return;
+      // The poll fetches only when a turn recorded new code; each fetch may be an SSH credential prompt.
+      const pointer = JSON.stringify(binding.workspace);
+      if (options.ask === false && arrivalChecked.get(id) === pointer) return;
+      const plan = await planCode(ctx.cwd, binding.workspace, binding.canonicalSessionId);
+      if (plan.kind === "none" && plan.failed) return void idleFailed(binding.canonicalSessionId);
+      arrivalChecked.set(id, pointer);
+      if (plan.kind === "none") return;
+      if (plan.kind === "matches") {
+        if (options.force) notify(ctx, "This checkout already has the conversation's code.", "info");
+        return;
+      }
+      if (plan.kind === "blocked") {
+        if (codeSettled.get(id) !== plan.message || options.force) notify(ctx, plan.message, "warning");
+        codeSettled.set(id, plan.message);
+        return;
+      }
+      const key = `${plan.target.wip ?? plan.target.base}:${plan.stash}`;
+      if (!options.force && codeSettled.get(id) === key) return;
+      if (!plan.automatic) {
+        // Never a dialog from the background poll: the user may be typing into it.
+        if (!ctx.hasUI || options.ask === false) {
+          codeSettled.set(id, key);
+          notify(ctx, `This conversation's code is ${plan.summary}; this checkout is on ${plan.here}. Run /sync code to bring it here.`, "info");
+          return;
+        }
+        const ok = await ctx.ui.confirm(
+          "Bring this conversation's code here?",
+          `The conversation is on ${plan.summary}; this checkout is on ${plan.here}. ${plan.stash ? "Your uncommitted changes will be stashed (git stash list), then " : ""}this checkout switches to ${plan.target.branch}${plan.target.wip ? " with the other device's uncommitted changes" : ""}.`,
+        );
+        if (!ok) {
+          codeSettled.set(id, key);
+          notify(ctx, "Kept this checkout as it is. Run /sync code to bring the conversation's code here later.", "info");
+          return;
+        }
+      }
+      const result = await applyCode(ctx.cwd, plan.target, { stash: plan.stash });
+      codeSettled.set(id, key);
+      notify(ctx, result.message, result.ok ? "info" : "warning");
+    })().catch(() => undefined).finally(() => { arriving = undefined; });
+    return arriving;
+  };
+
+  /**
+   * Brings other machines' checkout states here (and shares this one's): at most every 5 minutes from the idle
+   * poll, unless `now`; never changes checkouts while a turn runs in the project.
+   */
+  let lastProjectArrival = 0;
+  const arriveProjectCode = async (ctx: ExtensionContext, project: Project, options: { force?: boolean; ask?: boolean; now?: boolean }) => {
+    const failId = (await bindingFor(ctx.sessionManager.getSessionId()))?.canonicalSessionId;
+    if (options.ask === false) {
+      if (failId && idleBackedOff(failId)) return;
+      if (!options.now && Date.now() - lastProjectArrival < 5 * 60_000) return;
+    }
+    lastProjectArrival = Date.now();
+    await syncProjectCode(ctx, project, { fetch: true, failId, notifyAll: options.force });
+  };
+
+  /** /sync code in a project: sync now, then settle each desynced or stopped checkout as the user chooses. */
+  const resolveProjectCode = async (ctx: ExtensionCommandContext, project: Project) => {
+    if ((projectTurns.get(project.root) ?? 0) > 0) notify(ctx, "A turn is running in this project; checkouts change after it ends.", "info");
+    await arriveProjectCode(ctx, project, { force: true });
+    const open = await projectDesyncs(project);
+    if (!open.length) {
+      notify(ctx, "Every checkout in this project is in sync.", "info");
+      return;
+    }
+    for (const item of open) {
+      if (!ctx.hasUI) {
+        notify(ctx, item.message ?? `${item.repo} ${item.key}: not synced on this machine.`, "warning");
+        continue;
+      }
+      const choices = item.stopped
+        ? ["Resume syncing", "Leave it"]
+        : ["Take the other machine's version", "Keep mine", "Stop syncing this checkout", "Leave it desynced"];
+      const picked = await ctx.ui.select(item.stopped ? `${item.repo} · ${item.key.replace(/^wt\//, "")}: not synced on this machine` : item.message!.replace(/ Nothing was changed\..*$/, ""), choices);
+      const choice = picked === choices[0] ? (item.stopped ? "resume" : "theirs") : !item.stopped && picked === choices[1] ? "mine" : !item.stopped && picked === choices[2] ? "stop" : undefined;
+      if (!choice) continue;
+      const result = await inProjectOrder(project.root, () => resolveCheckout(project, item.repo, item.key, choice, deviceLabel));
+      if (result.message) notify(ctx, result.message, result.result === "failed" || result.result === "desynced" ? "warning" : "info");
+    }
+    await refreshDesyncs(ctx, project);
+  };
+
+  /** Between turns, the device that wrote the latest turn keeps sharing hand edits (and clears the snapshot once pushed). */
+  let lastIdleShare = 0;
+  // Three polls apart: 60 s by default.
+  const IDLE_SHARE_MS = 3 * HEARTBEAT_MS;
+  const shareBetweenTurns = async (ctx: ExtensionContext, binding: SyncBinding, force = false) => {
+    if (!force && Date.now() - lastIdleShare < IDLE_SHARE_MS) return;
+    if (!force && idleBackedOff(binding.canonicalSessionId)) return;
+    const project = projectOf(ctx.cwd);
+    if (project) {
+      // Any device's hand edits count: a checkout holding only what it received has nothing new to push.
+      lastIdleShare = Date.now();
+      await syncProjectCode(ctx, project, { fetch: false, failId: binding.canonicalSessionId });
+      return;
+    }
+    if (lastDevice(ctx) !== deviceLabel || !(await shareEnabled(ctx.cwd))) return;
+    lastIdleShare = Date.now();
+    const id = binding.canonicalSessionId;
+    await inOrder(id, async () => {
+      if (pendingPushes.has(id)) return; // a turn's push is still due; it covers this
+      const shared = await shareIdle(ctx.cwd, id);
+      if (shared === "failed") idleFailed(id);
+      else if (shared !== "unchanged") idleFailures.delete(id); // "unchanged" never reached the remote
+    });
+  };
+
+  // During a turn, files change before the turn ends; a laptop that sleeps mid-turn would otherwise share nothing.
+  const TURN_SHARE_MS = Math.min(30_000, 3 * HEARTBEAT_MS);
+  const lastTurnShare = new Map<string, number>();
+  /** Pushes the working tree after a tool runs mid-turn, at most every TURN_SHARE_MS; the turn-end push stays final. */
+  const shareDuringTurn = async (ctx: ExtensionContext) => {
+    if (!lease || !currentSessionId) return;
+    const binding = await bindingFor(currentSessionId);
+    if (!binding) return;
+    const id = binding.canonicalSessionId;
+    const project = projectOf(ctx.cwd);
+    if (project) {
+      if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS) return;
+      lastTurnShare.set(id, Date.now());
+      await syncProjectCode(ctx, project, { fetch: false, failId: id });
+      return;
+    }
+    if (Date.now() - (lastTurnShare.get(id) ?? 0) < TURN_SHARE_MS || !(await shareEnabled(ctx.cwd))) return;
+    lastTurnShare.set(id, Date.now());
+    await inOrder(id, async () => {
+      if (pendingPushes.has(id)) return; // a failed turn push is retried on its own
+      await shareIdle(ctx.cwd, id);
+    });
+  };
+
+  /** Removes this conversation's snapshot ref here and on the remote; it is no longer kept current. */
+  const dropSnapshot = async (ctx: ExtensionContext, binding: SyncBinding) => {
+    const id = binding.canonicalSessionId;
+    pendingPushes.delete(id);
+    await inOrder(id, async () => {
+      if ((await gitOut(ctx.cwd, ["rev-parse", "--verify", "--quiet", snapshotRef(id)])) === undefined && !binding.workspace?.wip) return;
+      await deleteSnapshot(ctx.cwd, id, binding.workspace?.gitRemote);
+      await gitOut(ctx.cwd, ["update-ref", "-d", snapshotRef(id)]);
+    }).catch(() => undefined);
+  };
+
+  const syncCode = async (ctx: ExtensionCommandContext, arg: string) => {
+    const project = projectOf(ctx.cwd);
+    if (project && (arg === "on" || arg === "off")) {
+      for (const repo of projectRepos(project)) await setShareSetting(repo, arg === "on");
+      notify(ctx, arg === "on" ? `Every repository's checkouts in ${project.name} will sync with your other devices.` : `Checkouts in ${project.name} will not sync.`, "info");
+      return;
+    }
+    if (project) return void (await resolveProjectCode(ctx, project));
+    if (arg === "on" || arg === "off") {
+      await setShareSetting(ctx.cwd, arg === "on");
+      const current = arg === "off" ? await bindingFor(ctx.sessionManager.getSessionId()) : undefined;
+      if (current) await dropSnapshot(ctx, current);
+      notify(ctx, arg === "on" ? "Uncommitted code will be shared with your other devices after each turn." : "Uncommitted code will not be shared.", "info");
+      return;
+    }
+    const binding = await bindingFor(ctx.sessionManager.getSessionId());
+    if (!binding?.workspace) {
+      notify(ctx, "No code state is recorded for this conversation.", "info");
+      return;
+    }
+    await arriveCode(ctx, { force: true });
+  };
+
+  const dispatchRefresh = () => {
+    if (refreshDispatched) return;
+    refreshDispatched = true;
+    setTimeout(() => {
+      try {
+        pi.sendUserMessage("/sync refresh auto", { expandPromptTemplates: true });
+      } catch {
+        refreshDispatched = false;
+      }
+    }, 0);
+  };
+
+  /** Saves local-only conversation entries as a separate, unsynchronized session before replacing the file. */
+  const saveLocalCopy = async (ctx: ExtensionContext, local: SessionEnvelope): Promise<string> => {
+    const sessionId = randomUUID();
+    const title = `${local.title || firstUserText(local.entries as any[]) || "conversation"} (unsynced copy)`;
+    const path = join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
+    // A session_info entry makes the name show up in /resume and host session lists.
+    const named = { type: "session_info", id: randomUUID().slice(0, 8), parentId: local.headEntryId || null, timestamp: new Date().toISOString(), name: title } as PiEntry;
+    await materializeSessionFile(path, { ...local, sessionId, title, entries: [...local.entries, named], headEntryId: named.id }, { cwd: ctx.cwd });
+    return title;
+  };
+
+  /**
+   * Writes the canonical snapshot over `target`, first preserving any local
+   * conversation entries the snapshot lacks, and records the new binding.
+   */
+  const materializeCanonical = async (
+    ctx: ExtensionContext,
+    target: string,
+    local: SessionEnvelope | undefined,
+    binding: SyncBinding,
+    snapshot: SessionResponse,
+  ): Promise<{ binding: SyncBinding; headEntryId: string; copyTitle?: string }> => {
+    // Only ahead (a picked copy whose uploads were pending): keep the file; the next check uploads its new entries.
+    if (local && extendsCanonical(local.entries, snapshot.session.entries)) {
+      const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
+      await store.set(next);
+      // Same entries, head moved elsewhere (another device's /tree): follow it.
+      const identical = local.entries.length === snapshot.session.entries.length;
+      return { binding: next, headEntryId: identical ? snapshot.session.headEntryId : local.headEntryId };
+    }
+    const remoteIds = new Set(snapshot.session.entries.map((entry: PiEntry) => entry.id));
+    const localOnly = local?.entries.filter((entry) => !remoteIds.has(entry.id)) ?? [];
+    const diverged = localOnly.some((entry) => CONTEXT_ENTRY_TYPES.has(entry.type));
+    const copyTitle = diverged && local ? await saveLocalCopy(ctx, local) : undefined;
+    let headEntryId = snapshot.session.headEntryId;
+    const carried = (diverged ? [] : localOnly).map((entry) => {
+      const rebased = { ...entry, parentId: headEntryId };
+      headEntryId = entry.id;
+      return rebased;
+    });
+    const entries = snapshot.session.entries;
+    const synced = binding.syncedCount ?? 0;
+    // A project conversation reopens in its project folder; others stay where this pi runs.
+    const cwd = projectCwd(entries, getAgentDir(), ctx.cwd, existsSync);
+    const parent = snapshot.session.parentSessionId
+      ? (await store.all()).find((item) => item.canonicalSessionId === snapshot.session.parentSessionId)?.materializedFile
+      : undefined;
+    const where = { cwd, ...(parent && existsSync(parent) ? { parentSessionPath: parent } : {}) };
+    // A pure append onto the file this device last synchronized: add the new lines instead of rewriting it all.
+    const appended = !copyTitle && carried.length === 0 && binding.syncedLastId !== undefined && synced > 0
+      && synced <= entries.length && entries[synced - 1]?.id === binding.syncedLastId
+      && headEntryId === entries.at(-1)?.id
+      && resolvePath(target) === resolvePath(binding.materializedFile)
+      && await appendSessionFile(target, { headerLine: nativeHeaderLine(snapshot.session, where), count: synced, lastId: binding.syncedLastId }, entries.slice(synced));
+    if (!appended) await materializeSessionFile(target, { ...snapshot.session, headEntryId, entries: [...entries, ...carried] }, where);
+    // Recorded as the canonical copy, so carried entries count as local changes and upload on the next check.
+    const next = syncedBinding(binding, snapshot.session, snapshot.etag, target);
+    await store.set(next);
+    return { binding: next, headEntryId, copyTitle };
+  };
+
+  /** Re-opens `target` after it was rewritten, then optionally re-sends the prompt that triggered the refresh. */
+  const reopen = async (ctx: ExtensionCommandContext, target: string, headEntryId: string, message: string | undefined, copyTitle: string | undefined, replay: Replay | undefined) => {
+    // Pi adopts the model of the last reply, which may be another device's; a catch-up must not change this device's choice.
+    keptSettings.set(resolvePath(target), { model: ctx.model, thinking: pi.getThinkingLevel() });
+    const result = await ctx.switchSession(target, {
+      withSession: async (replacement) => {
+        try {
+          // Usually the head is the last entry; navigating anyway prints a needless "Navigated" notice.
+          if (replacement.sessionManager.getLeafId() !== headEntryId) {
+            await restoreHead((entryId, options) => replacement.navigateTree(entryId, options), headEntryId);
+          }
+        } catch {
+          // The materialized file's last entry remains a valid head.
+        }
+        if (copyTitle) replacement.ui.notify(`Turns from this device that never synchronized were kept as “${copyTitle}”. Open it with /resume.`, "warning");
+        if (message) replacement.ui.notify(message, "info");
+        // Before any replayed prompt, so the agent works on the conversation's code.
+        await arriveCode(replacement);
+        if (replay?.compact) {
+          replacement.compact(replay.compact);
+        } else if (replay) {
+          const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
+          await replacement.sendUserMessage(content as any);
+        }
+      },
+    });
+    return !result.cancelled;
+  };
+
+  const refreshCurrent = async (ctx: ExtensionCommandContext, mode: "manual" | "auto" | "check"): Promise<CheckResult> => {
+    if (mode === "auto") refreshDispatched = false;
+    await ctx.waitForIdle();
+    const sessionId = ctx.sessionManager.getSessionId();
+    currentSessionId = sessionId;
+    const replay = pendingReplay?.sessionId === sessionId ? pendingReplay : undefined;
+    pendingReplay = undefined;
+    const binding = await bindingFor(sessionId);
+    const restoreReplay = (message: string) => {
+      notify(ctx, message, "warning");
+      if (replay) {
+        try {
+          ctx.ui.setEditorText(replay.text);
+        } catch {
+          // No editor in this host; the warning already explains what happened.
+        }
+      }
+    };
+    if (!binding) {
+      if (mode === "manual") notify(ctx, "This conversation is not synchronized. Use /sync attach first.", "info");
+      return { outcome: "unchanged", sessionId };
+    }
+    if (binding.state === "setup_required") {
+      if (mode !== "check") restoreReplay("The sync server no longer has this conversation. Run /sync attach to upload this copy again.");
+      return { outcome: "busy", sessionId };
+    }
+    if (lease) return { outcome: "busy", sessionId };
+
+    const result = await exclusive(async () => {
+      const localEntries = ctx.sessionManager.getEntries() as PiEntry[];
+      const fetched = await fetchCanonical(ctx, binding, localEntries);
+      if (!fetched.ok) return { kind: "refused" as const, message: fetched.message };
+      const { snapshot } = fetched;
+      // This copy is the server's plus entries it never uploaded (re-attached, or an upload's reply was lost):
+      // record it as synchronized up to the server's state, so the entries upload below instead of forking.
+      let bound = binding;
+      // A copy with the same entries but another head goes the long way, which follows the server's head.
+      const headMoved = localEntries.length === snapshot.session.entries.length && snapshot.session.headEntryId !== (ctx.sessionManager.getLeafId() ?? "");
+      if (snapshot.etag !== binding.lastEtag && !headMoved && extendsCanonical(localEntries, snapshot.session.entries)) {
+        bound = syncedBinding(binding, snapshot.session, snapshot.etag, ctx.sessionManager.getSessionFile() ?? binding.materializedFile);
+        await store.set(bound);
+      }
+      // Uploading a copy that lacks canonical entries would roll the conversation back, so it catches up instead.
+      if (snapshot.etag === bound.lastEtag && holdsCanonical(localEntries, bound, snapshot.session.entries)) {
+        const canonical = snapshot.session.entries;
+        let counted = bound;
+        // First check with a binding that has no count: record it, so later turns send only what they add.
+        if (bound.syncedCount === undefined && canonical.length > 0 && localEntries[canonical.length - 1]?.id === canonical.at(-1)?.id) {
+          counted = { ...bound, syncedCount: canonical.length, syncedLastId: canonical.at(-1)!.id };
+          await store.set(counted);
+        }
+        let uploaded: CheckResult["uploaded"];
+        // Already current; push idle local changes (renames, model switches) under a brief lease.
+        if (localChanged(ctx, bound)) {
+          const reserved = await acquire(ctx, counted);
+          if (!reserved.ok) return { kind: "refused" as const, message: reserved.message };
+          const from = counted.syncedCount ?? 0;
+          const turns = (sent: PiEntry[]) => sent.filter((entry) => entry.type === "message" && (entry as any).message?.role === "user").length;
+          try {
+            const next = await upload(ctx, counted, reserved.acquired.lease.token);
+            const sent = localEntries.slice(from, next.syncedCount);
+            uploaded = { entries: sent.length, turns: turns(sent) };
+            setStatus(ctx, "sync: up to date");
+          } catch (error) {
+            // Batches that went through are recorded in the binding; the next check sends the rest.
+            const reached = (await bindingFor(sessionId))?.syncedCount ?? from;
+            const sent = localEntries.slice(from, Math.max(from, reached));
+            uploaded = { entries: sent.length, turns: turns(sent), pending: localEntries.length - from - sent.length, error: error instanceof Error ? error.message : String(error) };
+            setStatus(ctx, "sync: upload pending");
+          } finally {
+            await release(counted, reserved.acquired.lease.token);
+          }
+        } else {
+          setStatus(ctx, "sync: up to date");
+        }
+        return { kind: "current" as const, uploaded };
+      }
+      let local: SessionEnvelope | undefined;
+      try {
+        local = await normalizeCurrent(ctx, binding);
+      } catch {
+        local = undefined;
+      }
+      const target = ctx.sessionManager.getSessionFile() ?? binding.materializedFile;
+      const written = await materializeCanonical(ctx, target, local, binding, snapshot);
+      return { kind: "written" as const, written, target, snapshot };
+    });
+
+    if (result.kind === "refused") {
+      if (mode !== "check" || replay) restoreReplay(result.message);
+      return { outcome: "busy", sessionId };
+    }
+    if (result.kind === "current") {
+      if (mode === "manual") notify(ctx, "The synchronized conversation is already current.", "info");
+      // Another refresh may have caught up first; the replay still runs here.
+      if (replay?.compact) ctx.compact(replay.compact);
+      else if (replay) pi.sendUserMessage(replay.text);
+      return { outcome: "unchanged", sessionId, uploaded: result.uploaded };
+    }
+    // Automatic catch-ups stay quiet: the new turns appearing is the signal.
+    const message = mode === "manual" ? "Synchronized conversation refreshed." : undefined;
+    await reopen(ctx, result.target, result.written.headEntryId, message, result.written.copyTitle, replay);
+    return { outcome: result.written.copyTitle ? "conflict" : "refreshed", sessionId, switched: true };
+  };
+
+  /** Host-driven (pi-ez-web) check: refresh when the canonical copy moved, otherwise report. */
+  /** An unlisted conversation was either deleted for inactivity (410) or lost (404). */
+  const isDeleted = (binding: SyncBinding): Promise<boolean> =>
+    clientFor(binding.serverUrl).get(binding.canonicalSessionId, { timeoutMs: REQUEST_TIMEOUT_MS }).then(
+      () => false,
+      (error) => error instanceof SyncClientError && error.code === "session_deleted",
+    );
+
+  const checkCurrent = async (ctx: ExtensionCommandContext): Promise<CheckResult> => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const binding = await bindingFor(sessionId);
+    if (!binding) return { outcome: "unchanged", sessionId };
+    if (lease || binding.state === "setup_required" || !ctx.isIdle()) return { outcome: "busy", sessionId };
+    let metadata;
+    try {
+      metadata = (await clientFor(binding.serverUrl).list()).sessions.find((item) => item.sessionId === binding.canonicalSessionId);
+    } catch {
+      return { outcome: "busy", sessionId };
+    }
+    if (!metadata) {
+      if (await isDeleted(binding)) {
+        await forgetDeleted(ctx, binding);
+        notify(ctx, DELETED_MESSAGE, "warning");
+      }
+      return { outcome: "busy", sessionId };
+    }
+    showRemoteWork(ctx, metadata.leaseHolder ?? undefined);
+    if (metadata.leaseHolder) {
+      setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
+      return { outcome: "busy", sessionId };
+    }
+    if (metadata.etag === binding.lastEtag && !localChanged(ctx, binding)) {
+      setStatus(ctx, "sync: up to date");
+      return { outcome: "unchanged", sessionId };
+    }
+    return refreshCurrent(ctx, "check");
+  };
+
+  // What the last poll saw on the server; a long-poll waits for it to change. Unset when the poll skipped the check.
+  let lastSeen: { url: string; sessionId: string; etag: string; holder: string } | undefined;
+  // Servers without /wait (older pi-syncd), so their clients keep plain polling.
+  const noWait = new Set<string>();
+
+  const poll = async (ctx: ExtensionContext, generation: number) => {
+    lastSeen = undefined;
+    if (pendingPushes.size && !lease) void retryPushes(ctx).catch(() => undefined);
+    if (generation !== pollGeneration || lease || busy || refreshDispatched || !currentSessionId) return;
+    if (!ctx.isIdle() || hasPendingInput(ctx)) return;
+    const binding = await bindingFor(currentSessionId);
+    if (!binding || binding.state === "setup_required") return;
+    let metadata;
+    try {
+      metadata = (await clientFor(binding.serverUrl).list()).sessions.find((item) => item.sessionId === binding.canonicalSessionId);
+    } catch (error) {
+      if (error instanceof SyncClientError && error.code === "unauthorized") tokenRejected(ctx);
+      else setStatus(ctx, "sync: offline");
+      return;
+    }
+    if (generation !== pollGeneration || lease || busy || !ctx.isIdle() || hasPendingInput(ctx)) return;
+    if (metadata) lastSeen = { url: binding.serverUrl, sessionId: binding.canonicalSessionId, etag: metadata.etag, holder: metadata.leaseHolder ?? "" };
+    if (!metadata) {
+      if (await isDeleted(binding)) {
+        await forgetDeleted(ctx, binding);
+        notify(ctx, DELETED_MESSAGE, "warning");
+        return;
+      }
+      await markSetupRequired(ctx, binding);
+      notify(ctx, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.", "warning");
+      return;
+    }
+    showRemoteWork(ctx, metadata.leaseHolder ?? undefined);
+    if (metadata.leaseHolder) {
+      setStatus(ctx, `sync: in use on ${metadata.leaseHolder}`);
+      return;
+    }
+    if (metadata.etag !== binding.lastEtag || localChanged(ctx, binding)) {
+      dispatchRefresh();
+      return;
+    }
+    setStatus(ctx, "sync: up to date");
+    // Code moves without turns too: hand edits here are shared; another device's arrive with its next turn or /sync code.
+    if (Date.now() - lastCodeCheck >= IDLE_SHARE_MS && !idleBackedOff(binding.canonicalSessionId)) {
+      lastCodeCheck = Date.now();
+      await shareBetweenTurns(ctx, binding);
+      // Old per-conversation snapshot refs: in a project, those of its repositories (left from before project sharing).
+      const project = projectOf(ctx.cwd);
+      const sweepIn = project ? projectRepos(project) : [ctx.cwd];
+      if (project || await shareEnabled(ctx.cwd)) {
+        const live = await clientFor(binding.serverUrl).list().then((listed) => new Set(listed.sessions.map((item) => item.sessionId)), () => undefined);
+        if (live?.has(binding.canonicalSessionId)) for (const dir of sweepIn) if ((await sweepSnapshots(dir, live)) < 0) { idleFailed(binding.canonicalSessionId); break; }
+      }
+      if (generation === pollGeneration && ctx.isIdle() && !hasPendingInput(ctx)) await arriveCode(ctx, { ask: false });
+    }
+  };
+  let lastCodeCheck = 0;
+
+  let waitAbort: AbortController | undefined;
+
+  /**
+   * Returns once the server reports a change since the last poll, so the next poll runs right away. Falls back to
+   * sleeping `delay` when the poll skipped its check, the server predates /wait, or the wait fails.
+   */
+  const waitForChange = async (delay: number) => {
+    const seen = lastSeen;
+    const sleep = () => new Promise<void>((resolve) => setTimeout(resolve, delay).unref?.());
+    if (!seen || noWait.has(seen.url)) return sleep();
+    const abort = (waitAbort = new AbortController());
+    // Never longer than the plain poll: local work (hand-edit snapshots, retries) still runs on that cadence.
+    const capped = setTimeout(() => abort.abort(), delay);
+    try {
+      await clientFor(seen.url).wait(seen.sessionId, seen.etag, seen.holder, { signal: abort.signal });
+    } catch (error) {
+      if (error instanceof SyncClientError && (error.code === "not_found" || error.code === "method_not_allowed")) noWait.add(seen.url);
+      if (!abort.signal.aborted) await sleep();
+    } finally {
+      clearTimeout(capped);
+      waitAbort = undefined;
+    }
+  };
+
+  const stopPoll = () => {
+    waitAbort?.abort();
+    pollGeneration++;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = undefined;
+    if (remoteWork) showRemoteWork(remoteWork.ctx);
+  };
+
+  const startPoll = (ctx: ExtensionContext) => {
+    stopPoll();
+    // Print-mode runs and headless subagents end before a poll matters; hosts with a UI (TUI, RPC, pi-ez-web) follow.
+    if (!ctx.hasUI) return;
+    const generation = pollGeneration;
+    // Chained rather than an interval so a slow poll never overlaps the next one.
+    const schedule = (delay: number) => {
+      pollTimer = setTimeout(async () => {
+        try {
+          ctx.sessionManager.getSessionId();
+        } catch {
+          // Stale ctx: the host disposed this session without a shutdown event (pi-ez-web does); stop polling it.
+          if (generation === pollGeneration) stopPoll();
+          return;
+        }
+        await poll(ctx, generation).catch(() => undefined);
+        if (generation !== pollGeneration) return;
+        await waitForChange(remoteWork ? Math.min(REMOTE_POLL_MS, HEARTBEAT_MS) : HEARTBEAT_MS);
+        // A short floor keeps a flapping server from turning this into a busy loop.
+        if (generation === pollGeneration) schedule(100);
+      }, delay);
+      pollTimer.unref?.();
+    };
+    schedule(250);
+  };
+
+  /** Uploads a new conversation; one that does not fit in a request is sent as a first part plus appends. */
+  const enrollInBatches = async (url: string, envelope: SessionEnvelope): Promise<{ etag: string }> => {
+    const client = clientFor(url);
+    const batches = inBatches(envelope.entries, ENROLL_BATCH_BYTES);
+    const first = batches[0]!;
+    if (batches.length === 1) return client.enroll(envelope);
+    let { etag } = await client.enroll({ ...envelope, entries: first, headEntryId: first.at(-1)!.id });
+    const { lease: held } = await client.acquire(envelope.sessionId, deviceLabel, { metadataOnly: true });
+    try {
+      let count = first.length;
+      for (const batch of batches.slice(1)) {
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: batch, headEntryId: batch.at(-1)!.id, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}), ...(envelope.project ? { project: envelope.project } : {}) }));
+        count += batch.length;
+      }
+      if (envelope.headEntryId !== batches.at(-1)!.at(-1)!.id) {
+        ({ etag } = await client.append(envelope.sessionId, held.token, etag, { baseCount: count, entries: [], headEntryId: envelope.headEntryId, title: envelope.title, ...(envelope.workspace ? { workspace: envelope.workspace } : {}), ...(envelope.project ? { project: envelope.project } : {}) }));
+      }
+    } finally {
+      await client.release(envelope.sessionId, held.token).catch(() => undefined);
+    }
+    return { etag };
+  };
+
+  const enrollCurrent = async (ctx: ExtensionCommandContext, args: string) => {
+    await stopRemoteHost(ctx);
+    const path = ctx.sessionManager.getSessionFile();
+    if (!path || !existsSync(path)) return fail(ctx, "sync_not_persistent", "Send at least one message before synchronizing this conversation.");
+    const sessionId = ctx.sessionManager.getSessionId();
+    currentSessionId = sessionId;
+    const existing = await bindingFor(sessionId);
+    const url = configuredUrl(args) ?? existing?.serverUrl;
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL), or run /sync attach <server URL>.");
+    if (existing && existing.state !== "setup_required") {
+      notify(ctx, "This conversation is already synchronized.", "info");
+      startPoll(ctx);
+      return;
+    }
+    if (detachedHere(ctx)) pi.appendEntry(LINK_ENTRY, { detached: false });
+    let envelope: SessionEnvelope;
+    try {
+      envelope = await normalizeCurrent(ctx, existing);
+    } catch (error) {
+      return fail(ctx, "sync_enrollment_failed", error instanceof Error ? error.message : "Could not read this conversation.");
+    }
+    const base: SyncBinding = {
+      nativeSessionId: sessionId,
+      serverUrl: url,
+      canonicalSessionId: sessionId,
+      lastEtag: "",
+      materializedFile: path,
+      state: "ready",
+    };
+    try {
+      const response = await enrollInBatches(url, envelope);
+      await store.set(syncedBinding(base, envelope, response.etag, path));
+      setStatus(ctx, "sync: up to date");
+      notify(ctx, "Conversation synchronized. Open it elsewhere with /sync.", "info");
+    } catch (error) {
+      if (!(error instanceof SyncClientError) || error.code !== "duplicate_enrollment") {
+        return fail(ctx, "sync_enrollment_failed", error instanceof Error ? error.message : "Could not synchronize this conversation.");
+      }
+      // The server already has it (re-attach after detach or a lost binding): a copy that is only ahead uploads
+      // what it added; otherwise adopt the server copy, preserving local-only turns as a separate session.
+      await store.set(base);
+      const result = await refreshCurrent(ctx, "auto");
+      if (result.outcome !== "unchanged") return;
+      const { uploaded } = result;
+      if (uploaded?.error !== undefined) {
+        notify(ctx, `Conversation synchronized again, but uploading what was added while detached stopped: ${uploaded.entries} of ${uploaded.entries + (uploaded.pending ?? 0)} entries are uploaded, the rest will be sent on the next check (${uploaded.error}).`, "warning");
+      } else notify(ctx, uploaded?.turns
+        ? `Conversation synchronized again: uploaded ${uploaded.turns} ${uploaded.turns === 1 ? "turn" : "turns"} (${uploaded.entries} entries) made while detached.`
+        : "Conversation synchronized again.", "info");
+    }
+    startPoll(ctx);
+  };
+
+  const syncPick = async (ctx: ExtensionCommandContext) => {
+    const current = await bindingFor(ctx.sessionManager.getSessionId());
+    const url = configuredUrl() ?? current?.serverUrl;
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
+    if (!ctx.hasUI) return fail(ctx, "sync_ui_required", "The synchronized-session picker requires an interactive UI.");
+    let sessions;
+    try {
+      sessions = (await clientFor(url).list()).sessions;
+    } catch (error) {
+      return fail(ctx, "sync_unavailable", error instanceof Error ? error.message : "Could not list synchronized conversations.");
+    }
+    if (sessions.length === 0) {
+      notify(ctx, "No conversations are synchronized yet. Use /sync attach in a conversation to share it.", "info");
+      return;
+    }
+    const repository = await repositoryFor(ctx);
+    const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
+    const ranked = [...sessions].sort((left, right) => {
+      const leftHere = repositoryIdentity(left.workspace) === repository ? 0 : 1;
+      const rightHere = repositoryIdentity(right.workspace) === repository ? 0 : 1;
+      if (leftHere !== rightHere) return leftHere - rightHere;
+      return (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt);
+    });
+    const rows = ranked.map((item) => {
+      const title = usefulTitle(item.title, item.sessionId) || bindings.get(item.sessionId)?.title || `untitled ${item.sessionId.slice(-8)}`;
+      const where = item.workspace ? `${repositoryIdentity(item.workspace)?.split("/").slice(-1)[0]}:${item.workspace.branch}` : "no repo";
+      const parts = [title, where, relativeAge(item.updatedAt)];
+      if (item.leaseHolder) parts.push(`running on ${item.leaseHolder}`);
+      if (item.sessionId === current?.canonicalSessionId) parts.push("current");
+      else if (bindings.has(item.sessionId)) parts.push("on this device");
+      return { item, label: parts.filter(Boolean).join(" · ") };
+    });
+    const selected = await ctx.ui.select("Synchronized conversations", rows.map((row) => row.label));
+    const row = rows.find((candidate) => candidate.label === selected);
+    if (!row) return;
+    if (row.item.sessionId === current?.canonicalSessionId) {
+      await refreshCurrent(ctx, "manual");
+      return;
+    }
+    await openSynced(ctx, url, row.item.sessionId, row.item.title);
+  };
+
+  /** Opens a shared conversation on this device, reusing its file when this device already has one. */
+  const openSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
+    const existing = await bindingFor(sessionId);
+    const reusable = existing && existsSync(existing.materializedFile) ? existing : undefined;
+    let target = reusable?.materializedFile ?? join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${sessionId}.jsonl`);
+    const binding: SyncBinding = reusable ?? {
+      nativeSessionId: sessionId,
+      serverUrl: url,
+      canonicalSessionId: sessionId,
+      lastEtag: "",
+      materializedFile: target,
+      state: "ready",
+    };
+    const outcome = await exclusive(async () => {
+      let local: SessionEnvelope | undefined;
+      if (reusable) local = await normalizeSessionFile(target).catch(() => undefined);
+      const fetched = await fetchCanonical(ctx, binding, local?.entries);
+      if (!fetched.ok) return { kind: "failed" as const, message: fetched.message };
+      const cwd = projectCwd(fetched.snapshot.session.entries, getAgentDir(), ctx.cwd, existsSync);
+      // A new copy of a project conversation goes where pi lists that folder's sessions (/resume, pi-web), unless sessions live in a custom folder.
+      if (!reusable && resolvePath(cwd) !== resolvePath(ctx.cwd) && resolvePath(ctx.sessionManager.getSessionDir()) === defaultSessionDir(ctx.cwd, getAgentDir())) {
+        target = join(defaultSessionDir(cwd, getAgentDir()), `${Date.now()}_${sessionId}.jsonl`);
+        binding.materializedFile = target;
+      }
+      return { kind: "written" as const, written: await materializeCanonical(ctx, target, local, binding, fetched.snapshot), snapshot: fetched.snapshot };
+    }).catch((error) => ({ kind: "failed" as const, message: error instanceof Error ? error.message : "Could not open the synchronized conversation." }));
+    if (outcome.kind === "failed") return fail(ctx, "sync_unavailable", outcome.message);
+    const opened = title || outcome.snapshot.session.title;
+    await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyTitle, undefined);
+  };
+
+  /** Forks a synchronized conversation into a brand-new local unbound session (no lease, no binding). */
+  const forkSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
+    let snapshot: SessionResponse;
+    try {
+      snapshot = await clientFor(url).get(sessionId);
+    } catch (error) {
+      return fail(ctx, "sync_unavailable", error instanceof Error ? error.message : "Could not fetch the synchronized conversation.");
+    }
+    const newId = randomUUID();
+    const forked = forkEnvelope(snapshot.session, newId);
+    const target = join(ctx.sessionManager.getSessionDir(), `${Date.now()}_${newId}.jsonl`);
+    try {
+      await materializeSessionFile(target, forked, { cwd: ctx.cwd });
+    } catch (error) {
+      return fail(ctx, "sync_fork_failed", error instanceof Error ? error.message : "Could not write the forked session file.");
+    }
+    const opened = title || snapshot.session.title;
+    await reopen(ctx, target, forked.headEntryId, `Forked “${opened || "conversation"}” into a new local session.`, undefined, undefined);
+  };
+
+  const forkPick = async (ctx: ExtensionCommandContext) => {
+    const current = await bindingFor(ctx.sessionManager.getSessionId());
+    const url = configuredUrl() ?? current?.serverUrl;
+    if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync fork.");
+    if (!ctx.hasUI) return fail(ctx, "sync_ui_required", "The fork picker requires an interactive UI.");
+    let sessions;
+    try {
+      sessions = (await clientFor(url).list()).sessions;
+    } catch (error) {
+      return fail(ctx, "sync_unavailable", error instanceof Error ? error.message : "Could not list synchronized conversations.");
+    }
+    if (sessions.length === 0) {
+      notify(ctx, "No synchronized conversations found to fork.", "info");
+      return;
+    }
+    // Prefer chats (no project/workspace) first since chat -> local build is the primary fork flow.
+    const ranked = [...sessions].sort((left, right) => {
+      const leftChat = !left.project && !left.workspace ? 0 : 1;
+      const rightChat = !right.project && !right.workspace ? 0 : 1;
+      if (leftChat !== rightChat) return leftChat - rightChat;
+      return (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt);
+    });
+    const rows = ranked.map((item) => {
+      const title = usefulTitle(item.title, item.sessionId) || `untitled ${item.sessionId.slice(-8)}`;
+      const where = item.project ? `project:${item.project}` : item.workspace ? `${repositoryIdentity(item.workspace)?.split("/").slice(-1)[0]}:${item.workspace.branch}` : "chat";
+      return { item, label: [title, where, relativeAge(item.updatedAt)].filter(Boolean).join(" · ") };
+    });
+    const selected = await ctx.ui.select("Fork synchronized conversation into a new local session", rows.map((row) => row.label));
+    const row = rows.find((candidate) => candidate.label === selected);
+    if (!row) return;
+    await forkSynced(ctx, url, row.item.sessionId, row.item.title);
+  };
+
+  /**
+   * On a fresh start in a repository, warns about the shared conversation this client hasn't caught up with, naming
+   * the clients it is on. Opening it stays a deliberate /sync.
+   * Only conversations on this checkout's branch count: their code would land here, so this checkout is out of date.
+   * shortcut: only conversations updated in the last day are mentioned.
+   */
+  const warnArrival = async (ctx: ExtensionContext) => {
+    const url = configuredUrl();
+    if (!url || !ctx.hasUI) return;
+    const repository = await repositoryFor(ctx);
+    if (!repository) return;
+    const { sessions } = await clientFor(url).list({ timeoutMs: REQUEST_TIMEOUT_MS });
+    const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
+    const branch = (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim();
+    if (!branch) return;
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const candidate = sessions
+      .filter((item) => repositoryIdentity(item.workspace) === repository && (item.updatedAt ?? item.createdAt) > dayAgo)
+      .filter((item) => (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch)
+      .filter((item) => bindings.get(item.sessionId)?.lastEtag !== item.etag)
+      .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
+    if (!candidate) return;
+    const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "A conversation";
+    notify(ctx, arrivalWarning(title, candidate, deviceLabel), "warning");
+  };
+
+  const detachCurrent = async (ctx: ExtensionCommandContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const binding = await bindingFor(sessionId);
+    if (!binding) {
+      notify(ctx, "This conversation is not synchronized.", "info");
+      return;
+    }
+    await ctx.waitForIdle();
+    await finishTurn(ctx);
+    stopPoll();
+    await dropSnapshot(ctx, binding);
+    remembered.delete(sessionId);
+    await store.remove(sessionId);
+    pi.appendEntry(LINK_ENTRY, { detached: true });
+    setStatus(ctx);
+    notify(ctx, "Stopped synchronizing this conversation on this device. The server copy is unchanged.", "info");
+  };
+
+  const showStatus = async (ctx: ExtensionCommandContext) => {
+    const binding = await bindingFor(ctx.sessionManager.getSessionId());
+    if (!binding) {
+      notify(ctx, "This conversation is not synchronized. Use /sync attach to share it.", "info");
+      return;
+    }
+    let remote = "server unreachable";
+    try {
+      const metadata = (await clientFor(binding.serverUrl).list()).sessions.find((item) => item.sessionId === binding.canonicalSessionId);
+      remote = !metadata
+        ? "missing on server"
+        : metadata.leaseHolder
+          ? `running on ${metadata.leaseHolder}`
+          : metadata.etag === binding.lastEtag
+            ? localFingerprint(ctx) === binding.lastFingerprint ? "up to date" : "local changes pending upload"
+            : "newer copy on server";
+    } catch {
+      // Status stays useful offline.
+    }
+    const workspace = binding.workspace ? `upstream ${binding.workspace.branch}@${binding.workspace.commit.slice(0, 12)}` : "no upstream";
+    notify(ctx, `Sync ${binding.serverUrl}: ${remote}; this device is “${deviceLabel}”; ${workspace}`, "info");
+  };
+
+  // ---------- Remote control host (mutually exclusive with sync) ----------
+  const REMOTE_ENTRY = "pi-sync-remote";
+  const ASK_USER_PROMPT = "rpiv:ask-user:prompt";
+  const ASK_USER_BLOCKED = "rpiv:ask-user:blocked";
+  const ASK_USER_ANSWER = "rpiv:ask-user:answer";
+  const ASK_USER_ANSWER_RESULT = "rpiv:ask-user:answer-result";
+  const SUMMARIZE_WORKING = "pi-summarize:working";
+  const SUMMARIZE_ACTIVITY = "pi-summarize:activity";
+  const ALL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+  let remoteHost: RemoteHost | undefined;
+  let remoteCtx: ExtensionContext | undefined;
+  let pendingQuestion: { toolCallId: string; questions: unknown[] } | undefined;
+  let waitingDialog: string | undefined;
+  let pendingRemoteClientMsgId: string | undefined;
+
+  const modelLabel = (ctx: ExtensionContext): string | undefined => {
+    const model = ctx.model as { provider?: string; id?: string } | undefined;
+    if (!model?.id) return undefined;
+    return model.provider ? `${model.provider}/${model.id}` : model.id;
+  };
+
+  const thinkingLevelsFor = (ctx: ExtensionContext): string[] => {
+    const model = ctx.model as { reasoning?: boolean } | undefined;
+    return model?.reasoning === false ? ["off"] : [...ALL_THINKING_LEVELS];
+  };
+
+  const contextSnapshot = (ctx: ExtensionContext) => {
+    const model = (ctx.model ?? {}) as { contextWindow?: number; provider?: string; id?: string };
+    const usageHint = ctx.getContextUsage?.();
+    const window = Number(model.contextWindow ?? usageHint?.contextWindow) || null;
+    const branch = ctx.sessionManager.getBranch() as Array<{
+      type?: string;
+      message?: { role?: string; usage?: { input?: number; cacheRead?: number; cacheWrite?: number } };
+    }>;
+    const lastAssistant = [...branch]
+      .reverse()
+      .find((entry) => entry?.type === "message" && entry.message?.role === "assistant" && entry.message?.usage);
+    const usage = lastAssistant?.message?.usage;
+    const input = Number(usage?.input) || 0;
+    const cacheRead = Number(usage?.cacheRead) || 0;
+    const cacheWrite = Number(usage?.cacheWrite) || 0;
+    const used = usage
+      ? input + cacheRead + cacheWrite
+      : typeof usageHint?.tokens === "number"
+        ? usageHint.tokens
+        : null;
+    return {
+      window,
+      used,
+      remaining: window && used != null ? Math.max(0, window - used) : null,
+      percent: window && used != null ? Math.min(100, Math.round((used / window) * 100)) : null,
+      input,
+      cacheRead,
+      cacheWrite,
+      model: modelLabel(ctx) ?? null,
+    };
+  };
+
+  const remoteStatePatch = (ctx: ExtensionContext, extra: Record<string, unknown> = {}) => ({
+    title: conversationTitle(ctx),
+    model: modelLabel(ctx),
+    thinkingLevel: String(pi.getThinkingLevel?.() ?? "off"),
+    thinkingLevels: thinkingLevelsFor(ctx),
+    context: contextSnapshot(ctx),
+    ...extra,
+  });
+
+  const remotePreference = (ctx: ExtensionContext): boolean | undefined => {
+    const marker = [...ctx.sessionManager.getBranch()]
+      .reverse()
+      .find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === REMOTE_ENTRY) as { data?: { enabled?: unknown } } | undefined;
+    return typeof marker?.data?.enabled === "boolean" ? marker.data.enabled : undefined;
+  };
+
+  const setRemoteStatus = (ctx: ExtensionContext | undefined, status?: RemoteHostStatus) => {
+    if (!ctx?.hasUI) return;
+    try {
+      const label = status === "online"
+        ? "remote: on"
+        : status === "offline"
+          ? "remote: offline"
+          : status === "connecting"
+            ? "remote: connecting"
+            : undefined;
+      ctx.ui.setStatus("pi-remote", label);
+    } catch {
+      // Stale ctx during teardown.
+    }
+  };
+
+  const stopRemoteHost = async (ctx?: ExtensionContext) => {
+    const active = remoteHost;
+    const prevCtx = ctx ?? remoteCtx;
+    remoteHost = undefined;
+    remoteCtx = undefined;
+    pendingQuestion = undefined;
+    waitingDialog = undefined;
+    pendingRemoteClientMsgId = undefined;
+    setRemoteStatus(prevCtx, undefined);
+    if (active) await active.stop().catch(() => undefined);
+  };
+
+  const shouldRemoteControl = (ctx: ExtensionContext, binding: SyncBinding | undefined): boolean => {
+    // Project sessions synchronize; remote control would detach them, so the two never mix.
+    if (!configuredUrl() || !ctx.hasUI || process.env.PI_ROLE || binding || projectOf(ctx.cwd)) return false;
+    const pref = remotePreference(ctx);
+    if (pref === false) return false;
+    if (pref === true) return true;
+    return config.remoteControl && !shouldAutoEnroll(ctx, ctx.sessionManager.getSessionId());
+  };
+
+  const answerAskUser = (payload: RemoteAnswerPayload): Promise<{ status: number; body: unknown }> => {
+    const body = (payload.body && typeof payload.body === "object" ? payload.body : {}) as Record<string, unknown>;
+    const toolCallId = typeof body.toolCallId === "string" && body.toolCallId
+      ? body.toolCallId
+      : pendingQuestion?.toolCallId;
+    if (!toolCallId) {
+      return Promise.resolve({ status: 409, body: { error: "stale_extension_ui_request", message: "No open questionnaire on this host." } });
+    }
+    const verdictId = randomUUID();
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (status: number, resBody: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve({ status, body: resBody });
+      };
+      const unsubscribe = pi.events.on(ASK_USER_ANSWER_RESULT, (raw: unknown) => {
+        const res = raw as { ok?: boolean; code?: string; reason?: string; requestId?: string };
+        if (res?.requestId !== verdictId) return;
+        if (res.ok) done(200, { ok: true });
+        else {
+          const status = res.code === "not_found" ? 409 : 400;
+          done(status, { error: res.code || "invalid_answer", message: res.reason || "Answer was rejected." });
+        }
+      });
+      const timer = setTimeout(() => done(504, { error: "answer_timeout", message: "Timed out waiting for questionnaire verdict." }), 3_000);
+      timer.unref?.();
+      pi.events.emit(ASK_USER_ANSWER, {
+        toolCallId,
+        requestId: verdictId,
+        ...(body.cancel === true || body.cancelled === true ? { cancel: true } : {}),
+        ...(Array.isArray(body.answers) ? { answers: body.answers } : {}),
+        ...(typeof body.globalNote === "string" ? { globalNote: body.globalNote } : {}),
+      });
+    });
+  };
+
+  const startRemoteHost = async (ctx: ExtensionContext) => {
+    await stopRemoteHost(ctx);
+    const url = configuredUrl();
+    if (!url || !ctx.hasUI) return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    remoteCtx = ctx;
+    const host = new RemoteHost({
+      baseUrl: url,
+      token: process.env.PI_SYNC_TOKEN?.trim() || undefined,
+      meta: {
+        sessionId,
+        device: deviceLabel,
+        cwd: ctx.cwd,
+        ...remoteStatePatch(ctx),
+        streaming: !ctx.isIdle(),
+        ...(pendingQuestion ? { pendingQuestion } : {}),
+        ...(waitingDialog ? { waitingDialog } : {}),
+      },
+      onStatus: (status) => {
+        if (remoteHost !== host) return;
+        setRemoteStatus(ctx, status);
+      },
+      handlers: {
+        onTranscript: () => ({
+          status: 200,
+          body: {
+            sessionId,
+            device: deviceLabel,
+            cwd: ctx.cwd,
+            ...remoteStatePatch(ctx),
+            model: modelLabel(ctx) ?? null,
+            streaming: !ctx.isIdle(),
+            pendingQuestion: pendingQuestion ?? null,
+            waitingDialog: waitingDialog ?? null,
+            entries: ctx.sessionManager.getBranch(),
+          },
+        }),
+        onMessage: async (payload: RemoteMessagePayload) => {
+          const text = typeof payload.text === "string" ? payload.text : "";
+          const images = Array.isArray(payload.images) ? payload.images : [];
+          if (!text.trim() && images.length === 0) {
+            return { status: 400, body: { error: "empty_message", message: "Message text or image is required." } };
+          }
+          const idle = ctx.isIdle();
+          const mode = payload.mode === "steer" || payload.mode === "followUp" ? payload.mode : "prompt";
+          if (!idle && mode === "prompt") {
+            return { status: 409, body: { error: "session_busy", message: "Session is currently running a turn." } };
+          }
+          const content = images.length > 0
+            ? [...(text ? [{ type: "text" as const, text }] : []), ...(images as any[])]
+            : text;
+          pendingRemoteClientMsgId = payload.clientMessageId;
+          try {
+            pi.sendUserMessage(content as any, idle ? undefined : { deliverAs: mode === "steer" ? "steer" : "followUp" });
+            notify(ctx, "Remote prompt received from pi-web.", "info");
+            return { status: 200, body: { ok: true } };
+          } catch (error) {
+            pendingRemoteClientMsgId = undefined;
+            return { status: 409, body: { error: "send_failed", message: error instanceof Error ? error.message : String(error) } };
+          }
+        },
+        onStop: () => {
+          ctx.abort();
+          return { status: 200, body: { ok: true } };
+        },
+        onAnswerQuestion: (payload) => answerAskUser(payload),
+        onSetThinking: (payload) => {
+          const requested = typeof payload?.level === "string" ? payload.level.trim() : "off";
+          if (!ALL_THINKING_LEVELS.includes(requested as (typeof ALL_THINKING_LEVELS)[number])) {
+            return { status: 400, body: { error: "invalid_thinking_level", message: `Unsupported thinking level "${requested}".` } };
+          }
+          pi.setThinkingLevel(requested as ReturnType<ExtensionAPI["getThinkingLevel"]>);
+          const level = String(pi.getThinkingLevel());
+          const levels = thinkingLevelsFor(ctx);
+          remoteHost?.updateMeta({ thinkingLevel: level, thinkingLevels: levels });
+          remoteHost?.pushEvent({ type: "session_meta", thinkingLevel: level, thinkingLevels: levels });
+          return { status: 200, body: { level, levels, supported: levels.length > 1 } };
+        },
+        onSetModel: async (payload) => {
+          const ref = typeof payload?.model === "string" ? payload.model.trim() : "";
+          const slash = ref.indexOf("/");
+          const candidate = slash > 0 ? ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1)) : undefined;
+          if (!candidate) {
+            return { status: 400, body: { error: "model_unavailable", message: `Model "${ref}" is not available on ${deviceLabel}.` } };
+          }
+          const ok = await pi.setModel(candidate);
+          if (!ok) {
+            return { status: 400, body: { error: "model_unavailable", message: `Could not switch to model "${ref}" on ${deviceLabel}.` } };
+          }
+          const patch = remoteStatePatch(ctx);
+          remoteHost?.updateMeta(patch);
+          remoteHost?.pushEvent({ type: "session_meta", ...patch });
+          return { status: 200, body: { ok: true, model: patch.model } };
+        },
+        onClose: () => {
+          if (!ctx.isIdle()) {
+            return {
+              status: 409,
+              body: { error: "session_streaming", message: "Stop the current response before closing this session." },
+            };
+          }
+          notify(ctx, "Closing session from pi-web…", "info");
+          // Let postReply flush the 200 response to pi-syncd before session_shutdown tears down the host.
+          setTimeout(() => ctx.shutdown(), 100);
+          return { status: 200, body: { ok: true } };
+        },
+      },
+    });
+    remoteHost = host;
+    host.start();
+  };
+
+  pi.events.on(SUMMARIZE_WORKING, (raw: unknown) => {
+    if (!remoteHost) return;
+    const text = (raw as { text?: unknown })?.text;
+    remoteHost.pushEvent({ type: "working_message", message: typeof text === "string" && text ? text : null });
+  });
+
+  pi.events.on(SUMMARIZE_ACTIVITY, (raw: unknown) => {
+    if (!remoteHost || !remoteCtx) return;
+    const data = (raw as { data?: Record<string, unknown> })?.data;
+    if (!data || typeof data.text !== "string") return;
+    const branch = remoteCtx.sessionManager.getBranch() as Array<{ id?: string; type?: string; customType?: string; timestamp?: string; data?: Record<string, unknown> }>;
+    const matched = [...branch]
+      .reverse()
+      .find((entry) => entry.type === "custom" && entry.customType === "pi-summarize" && entry.data?.at === data.at && entry.data?.text === data.text);
+    const entry = matched ?? { id: randomUUID(), type: "custom", customType: "pi-summarize", timestamp: new Date().toISOString(), data };
+    remoteHost.pushEvent({ type: "summary", entry });
+  });
+
+  pi.events.on(ASK_USER_PROMPT, (raw: unknown) => {
+    const payload = raw as { toolCallId?: string; questions?: unknown[] };
+    if (!payload?.toolCallId || !Array.isArray(payload.questions)) return;
+    pendingQuestion = { toolCallId: payload.toolCallId, questions: payload.questions };
+    waitingDialog = undefined;
+    if (remoteHost) {
+      remoteHost.updateMeta({ pendingQuestion, waitingDialog: "" });
+      remoteHost.pushEvent({ type: "ask_user_prompt", toolCallId: payload.toolCallId, questions: payload.questions });
+    }
+  });
+
+  pi.events.on(ASK_USER_BLOCKED, (raw: unknown) => {
+    const payload = raw as { active?: boolean; toolCallId?: string };
+    if (payload?.active !== false) return;
+    if (pendingQuestion && (!payload.toolCallId || pendingQuestion.toolCallId === payload.toolCallId)) {
+      const closedId = pendingQuestion.toolCallId;
+      pendingQuestion = undefined;
+      if (remoteHost) {
+        remoteHost.updateMeta({ pendingQuestion: null });
+        remoteHost.pushEvent({ type: "ask_user_cleared", toolCallId: closedId });
+      }
+    }
+  });
+
+  pi.registerCommand("remote", {
+    description: "Enable, disable, or inspect remote control for this session",
+    handler: async (args, ctx) => {
+      const [sub = "status"] = args.trim().split(/\s+/);
+      await store.load();
+      if (sub === "on") {
+        const url = configuredUrl();
+        if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /remote.");
+        if (projectOf(ctx.cwd)) return fail(ctx, "remote_project_session", "Project sessions synchronize instead of using remote control; open them from the project in pi-web.");
+        const binding = await bindingFor(ctx.sessionManager.getSessionId());
+        if (binding) await detachCurrent(ctx);
+        pi.appendEntry(REMOTE_ENTRY, { enabled: true });
+        await startRemoteHost(ctx);
+        notify(ctx, `Remote control enabled for this session on “${deviceLabel}”.`, "info");
+        return;
+      }
+      if (sub === "off") {
+        await stopRemoteHost(ctx);
+        pi.appendEntry(REMOTE_ENTRY, { enabled: false });
+        notify(ctx, "Remote control disabled for this session.", "info");
+        return;
+      }
+      if (sub === "status" || sub === "") {
+        const state = remoteHost ? remoteHost.getStatus() : "off";
+        notify(ctx, `Remote control: ${state} (device “${deviceLabel}”). Use /remote on or /remote off.`, "info");
+        return;
+      }
+      notify(ctx, "Usage: /remote [on|off|status]", "error");
+    },
+  });
+
+  pi.registerCommand("sync", {
+    description: "Open, attach, detach, refresh, or inspect synchronized conversations",
+    handler: async (args, ctx) => {
+      const [command = "", ...rest] = args.trim().split(/\s+/);
+      await store.load();
+      if (command === "attach") return enrollCurrent(ctx, rest.join(" "));
+      if (command === "detach") return detachCurrent(ctx);
+      if (command === "refresh") {
+        await refreshCurrent(ctx, rest[0] === "auto" ? "auto" : "manual");
+        return;
+      }
+      if (command === "auto-check" || command === "reconcile") {
+        const result: unknown = await checkCurrent(ctx);
+        // SAFETY: Pi types command handlers as void, but host integrations (pi-ez-web) read the returned CheckResult.
+        return result as void;
+      }
+      if (command === "fresh") {
+        const replay = freshReplay;
+        freshReplay = undefined;
+        await ctx.waitForIdle();
+        await ctx.newSession({
+          withSession: async (replacement) => {
+            freshEnroll.add(replacement.sessionManager.getSessionId());
+            if (!replay?.text && !replay?.images?.length) return;
+            const content = replay.images?.length ? [{ type: "text" as const, text: replay.text }, ...(replay.images as any[])] : replay.text;
+            await replacement.sendUserMessage(content as any);
+          },
+        });
+        return;
+      }
+      if (command === "status") return showStatus(ctx);
+      if (command === "code") return syncCode(ctx, rest[0] ?? "");
+      if (command === "open" && rest[0]) {
+        const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
+        if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
+        return openSynced(ctx, url, rest[0]);
+      }
+      if (command === "fork") {
+        if (rest[0]) {
+          const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
+          if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync fork.");
+          return forkSynced(ctx, url, rest[0]);
+        }
+        return forkPick(ctx);
+      }
+      if (command === "") return syncPick(ctx);
+      notify(ctx, "Usage: /sync, /sync fork [id], /sync attach [server URL], /sync detach, /sync refresh, /sync status, or /sync code [on|off]", "error");
+    },
+  });
+
+  /**
+   * Restores a binding lost from the shared file when the server holds a conversation with this
+   * session's own id. Copies have fresh ids and detached conversations carry a marker, so neither
+   * reconnects. The normal check then uploads local-only turns or keeps them as an unsynced copy.
+   */
+  const reconnect = async (ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const file = ctx.sessionManager.getSessionFile();
+    const url = configuredUrl();
+    if (!url || !file || !existsSync(file) || detachedHere(ctx)) return;
+    const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: file, state: "ready" };
+    let etag: string;
+    try {
+      const found = (await clientFor(url).list({ timeoutMs: 5_000 })).sessions.find((item) => item.sessionId === sessionId);
+      if (!found) return;
+      etag = found.etag;
+    } catch {
+      return; // Not on the server, or unreachable: stay unsynchronized and silent.
+    }
+    if (currentSessionId !== sessionId || (await store.get(sessionId))) return;
+    await stopRemoteHost(ctx);
+    await store.set({ ...base, lastEtag: etag });
+    setStatus(ctx, "sync: reconnected");
+    startPoll(ctx);
+  };
+
+  pi.on("session_start", async (event, ctx) => {
+    shownStatus = null; // a new session's footer starts empty
+    await stopRemoteHost();
+    if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
+    currentSessionId = ctx.sessionManager.getSessionId();
+    const reopened = ctx.sessionManager.getSessionFile();
+    const kept = reopened ? keptSettings.get(resolvePath(reopened)) : undefined;
+    if (reopened) keptSettings.delete(resolvePath(reopened));
+    if (kept) {
+      if (kept.model && (ctx.model?.provider !== kept.model.provider || ctx.model?.id !== kept.model.id)) await pi.setModel(kept.model);
+      if (pi.getThinkingLevel() !== kept.thinking) pi.setThinkingLevel(kept.thinking);
+    }
+    stopHeartbeat();
+    lease = undefined;
+    refreshDispatched = false;
+    stopPoll();
+    await store.load();
+    let binding = await bindingFor(currentSessionId);
+    if (!binding) {
+      setStatus(ctx);
+      if (shouldRemoteControl(ctx, undefined)) void startRemoteHost(ctx);
+      if (event.reason === "startup" && !hasMessages(ctx)) void warnArrival(ctx).catch(() => undefined);
+      else void reconnect(ctx).catch(() => undefined);
+      return;
+    }
+    // A token held by another live local process (e.g. a background run) is in use, not left behind.
+    if (binding.leaseToken && !(binding.leasePid && binding.leasePid !== process.pid && pidAlive(binding.leasePid))) {
+      // Left behind by a crash mid-turn; the server lease expires anyway, so drop it.
+      await release(binding, binding.leaseToken);
+      binding = { ...binding };
+      delete binding.leaseToken;
+      delete binding.leasePid;
+      delete binding.leaseExpiresAt;
+      await store.set(binding);
+    }
+    const file = ctx.sessionManager.getSessionFile();
+    if (file && resolvePath(file) !== resolvePath(binding.materializedFile)) {
+      // Opened through /resume or a copy from an older pi-sync; adopt it as this device's file.
+      binding = { ...binding, materializedFile: file };
+      await store.set(binding);
+    }
+    setStatus(ctx, binding.state === "setup_required" ? "sync: server copy missing (/sync attach)" : "sync: on");
+    startPoll(ctx);
+    if (event.reason === "startup" || event.reason === "resume") void arriveCode(ctx);
+  });
+
+  pi.on("resources_discover", async () => {
+    const extensionDir = dirname(fileURLToPath(import.meta.url));
+    const skillPath = [join(extensionDir, "../skills"), join(extensionDir, "../../skills")].find((path) => existsSync(path));
+    return skillPath ? { skillPaths: [skillPath] } : undefined;
+  });
+
+  const refuse = (ctx: ExtensionContext, text: string, message: string) => {
+    notify(ctx, message, "warning");
+    try {
+      if (ctx.hasUI && text) ctx.ui.setEditorText(text);
+    } catch {
+      // Hosts without an editor keep the warning only.
+    }
+    return { action: "handled" as const };
+  };
+
+  // The prompt that hit a deleted conversation, for /sync fresh (same instance: the command runs here).
+  let freshReplay: { text: string; images?: unknown[] } | undefined;
+  const startFreshChat = (ctx: ExtensionContext, text: string, images?: unknown[]) => {
+    freshReplay = { text, images };
+    notify(ctx, "Starting a new synchronized chat; the deleted history is not restored.", "warning");
+    setTimeout(() => {
+      try {
+        pi.sendUserMessage("/sync fresh", { expandPromptTemplates: true });
+      } catch {
+        freshReplay = undefined;
+      }
+    }, 0);
+    return { action: "handled" as const };
+  };
+
+  pi.on("input", async (event, ctx) => {
+    if (lease) return { action: "continue" as const };
+    // Typing into a copy whose synchronized history was deleted starts a new chat, unless sync is off here.
+    if (deletedHere(ctx) && !detachedHere(ctx) && config.serverUrl && ctx.hasUI && !event.text.startsWith("/")) {
+      return startFreshChat(ctx, event.text, event.images);
+    }
+    if (!currentSessionId) return { action: "continue" as const };
+    const binding = await bindingFor(currentSessionId);
+    if (!binding) return { action: "continue" as const };
+    if (binding.state === "setup_required") {
+      return refuse(ctx, event.text, "The sync server no longer has this conversation. Run /sync attach to upload this copy again.");
+    }
+    await askToShareCode(ctx).catch(() => undefined);
+    let reserved = await exclusive(() => acquire(ctx, binding));
+    if (!reserved.ok && reserved.holder && ctx.hasUI) {
+      // A sleeping or crashed device can hold the lease for up to two minutes; let the user take it.
+      const takeOver = await ctx.ui.confirm(
+        `Running on ${reserved.holder}`,
+        `This conversation is running on ${reserved.holder}. Take it over here? Anything ${reserved.holder} is still writing will be kept there as a separate copy.`,
+      );
+      if (takeOver) reserved = await exclusive(() => acquire(ctx, binding, true));
+    }
+    // A sync problem may delay uploads but never blocks local work: the turn stays here and uploads later.
+    if (!reserved.ok && reserved.unauthorized) return { action: "continue" as const };
+    if (!reserved.ok && reserved.offline && ctx.hasUI) {
+      const sendAnyway = await ctx.ui.confirm(
+        "Sync server unreachable",
+        "Send anyway? This turn uploads when the server is back. If another device continues the conversation meanwhile, this turn is kept as a separate copy.",
+      );
+      if (sendAnyway) {
+        setStatus(ctx, "sync: offline; will upload later");
+        return { action: "continue" as const };
+      }
+    }
+    if (!reserved.ok && reserved.message === DELETED_MESSAGE && ctx.hasUI) {
+      notify(ctx, DELETED_MESSAGE, "warning");
+      return startFreshChat(ctx, event.text, event.images);
+    }
+    if (!reserved.ok) return refuse(ctx, event.text, reserved.message);
+    const { acquired } = reserved;
+    // The prefix check also refuses an older copy reopened through /resume, which would roll the conversation back.
+    // A binding without a count has no cheap check; its first turn goes through a catch-up, which records the count.
+    const intact = acquired.count === undefined || (binding.syncedCount !== undefined && syncedPrefix(ctx.sessionManager.getEntries() as PiEntry[], binding) === acquired.count);
+    if (acquired.etag === binding.lastEtag && intact) {
+      holdLease(ctx, binding, acquired.lease.token);
+      return { action: "continue" as const };
+    }
+    // Another device moved the conversation on: bring this copy up to date, then send the prompt.
+    await release(binding, acquired.lease.token);
+    pendingReplay = { sessionId: currentSessionId, text: event.text, images: event.images };
+    notify(ctx, "Catching up with changes from another device…", "info");
+    dispatchRefresh();
+    return { action: "handled" as const };
+  });
+
+  // Marks where turns ran, so the agent can tell the conversation moved. Not part of the model's context.
+  const DEVICE_ENTRY = "pi-sync-device";
+  const lastDevice = (ctx: ExtensionContext): string | undefined => {
+    // The current branch only: after /tree, markers on abandoned branches say nothing about the previous turn.
+    const marker = [...ctx.sessionManager.getBranch()].reverse().find((entry) => entry.type === "custom" && (entry as { customType?: string }).customType === DEVICE_ENTRY) as { data?: { device?: unknown } } | undefined;
+    return typeof marker?.data?.device === "string" ? marker.data.device : undefined;
+  };
+
+  // This session's turn in a project folder, counted in projectTurns while it runs.
+  let turnRoot: string | undefined;
+  const endProjectTurn = () => {
+    if (!turnRoot) return;
+    const left = (projectTurns.get(turnRoot) ?? 1) - 1;
+    if (left > 0) projectTurns.set(turnRoot, left);
+    else projectTurns.delete(turnRoot);
+    turnRoot = undefined;
+  };
+  pi.on("agent_start", async (_event, ctx) => {
+    endProjectTurn();
+    if (remoteHost) {
+      remoteHost.updateMeta(remoteStatePatch(ctx, { streaming: true }));
+      remoteHost.pushEvent({ type: "turn_start" });
+    }
+    const project = projectOf(ctx.cwd);
+    turnRoot = project?.root;
+    if (!project) return;
+    projectTurns.set(project.root, (projectTurns.get(project.root) ?? 0) + 1);
+    const open = (await projectDesyncs(project).catch(() => [])).filter((item) => item.message);
+    if (open.length) notify(ctx, `${open.length === 1 ? open[0]!.message!.replace(/ Nothing was changed\..*$/, "") : `${open.length} checkouts are desynced`}. Edits there stay on this machine until you choose: /sync code`, "warning");
+  });
+  pi.on("agent_end", async () => endProjectTurn());
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (remoteHost && (event as { messageType?: string }).messageType !== "custom") {
+      const clientMessageId = pendingRemoteClientMsgId;
+      pendingRemoteClientMsgId = undefined;
+      remoteHost.pushEvent({
+        type: "user_message",
+        text: event.prompt ?? "",
+        images: event.images ?? [],
+        ...(clientMessageId ? { clientMessageId } : {}),
+        at: Date.now(),
+      });
+    }
+    if (!lease) return;
+    const previous = lastDevice(ctx);
+    if (previous !== deviceLabel) pi.appendEntry(DEVICE_ENTRY, { device: deviceLabel });
+    return { systemPrompt: `${event.systemPrompt}\n\n${locationPrompt({ device: deviceLabel, previous, cwd: ctx.cwd, platform: process.platform, workspace: lease.binding.workspace })}` };
+  });
+
+  pi.on("message_start", async (event) => {
+    if (!remoteHost) return;
+    const role = (event as { message?: { role?: string } }).message?.role;
+    if (role === "assistant") remoteHost.pushEvent({ type: "message_start", role: "assistant" });
+  });
+
+  pi.on("message_update", async (event) => {
+    if (!remoteHost) return;
+    const e = (event as { assistantMessageEvent?: { type?: string; delta?: string } }).assistantMessageEvent;
+    if (e?.type === "text_delta" && e.delta) remoteHost.pushEvent({ type: "text_delta", delta: e.delta });
+    else if (e?.type === "thinking_delta" && e.delta) remoteHost.pushEvent({ type: "thinking_delta", delta: e.delta });
+  });
+
+  pi.on("message_end", async (event) => {
+    if (!remoteHost) return;
+    const role = (event as { message?: { role?: string } }).message?.role;
+    if (role === "assistant") remoteHost.pushEvent({ type: "message_end", role: "assistant" });
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    if (!remoteHost) return;
+    const e = event as { toolCallId?: string; toolName?: string; args?: unknown };
+    remoteHost.pushEvent({ type: "tool_start", toolId: e.toolCallId, name: e.toolName, args: e.args });
+  });
+
+  pi.on("ui_prompt_start", async (event) => {
+    if (!remoteHost || pendingQuestion) return;
+    const title = typeof (event as { title?: unknown })?.title === "string" ? (event as { title: string }).title : "Waiting for input on local terminal";
+    waitingDialog = title;
+    remoteHost.updateMeta({ waitingDialog: title });
+    remoteHost.pushEvent({ type: "waiting_dialog", title });
+  });
+
+  pi.on("ui_prompt_end", async () => {
+    if (!remoteHost || !waitingDialog) return;
+    waitingDialog = undefined;
+    remoteHost.updateMeta({ waitingDialog: "" });
+    remoteHost.pushEvent({ type: "waiting_dialog", title: "" });
+  });
+
+  pi.on("session_info_changed", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  pi.on("model_select", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  pi.on("thinking_level_select", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!remoteHost) return;
+    const patch = remoteStatePatch(ctx);
+    remoteHost.updateMeta(patch);
+    remoteHost.pushEvent({ type: "session_meta", ...patch });
+  });
+
+  /** Whether auto-enrollment applies to this session (allSessions=on, allSessions=projects inside a pi-project, or freshEnroll). */
+  const shouldAutoEnroll = (ctx: ExtensionContext, sessionId: string): boolean => {
+    if (freshEnroll.has(sessionId)) return true;
+    if (config.allSessions === "on") return true;
+    if (config.allSessions === "projects") return !!projectOf(ctx.cwd);
+    return false;
+  };
+
+  /** With allSessions on (or projects inside a pi-project), a conversation is synchronized once it has a reply, unless detached here. */
+  const autoEnroll = async (ctx: ExtensionContext) => {
+    const url = config.serverUrl;
+    const path = ctx.sessionManager.getSessionFile();
+    // hasUI keeps print-mode runs and headless subagents from enrolling their conversations.
+    // pi-background runs (PI_BACKGROUND=1) are the user's own sessions moved off-screen, so they enroll.
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!shouldAutoEnroll(ctx, sessionId) || !url || !(ctx.hasUI || process.env.PI_BACKGROUND) || !path || !existsSync(path) || detachedHere(ctx) || !hasMessages(ctx)) return;
+    if (await bindingFor(sessionId)) return;
+    const envelope = await normalizeCurrent(ctx);
+    try {
+      const response = await exclusive(() => enrollInBatches(url, envelope));
+      const base: SyncBinding = { nativeSessionId: sessionId, serverUrl: url, canonicalSessionId: sessionId, lastEtag: "", materializedFile: path, state: "ready" };
+      await store.set(syncedBinding(base, envelope, response.etag, path));
+      freshEnroll.delete(sessionId);
+    } catch (error) {
+      // Already on the server (this copy was opened elsewhere and its binding lost): /sync attach adopts it deliberately.
+      if (error instanceof SyncClientError && error.code === "duplicate_enrollment") return;
+      setStatus(ctx, "sync: not synchronized yet (offline?)");
+      return;
+    }
+    currentSessionId = sessionId;
+    setStatus(ctx, "sync: up to date");
+    startPoll(ctx);
+  };
+
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (remoteHost) {
+      const e = event as { toolCallId?: string; toolName?: string; isError?: boolean; result?: unknown };
+      remoteHost.pushEvent({ type: "tool_end", toolId: e.toolCallId, name: e.toolName, ok: !e.isError, result: e.result });
+    }
+    // Not awaited: sharing must never slow the agent down.
+    void shareDuringTurn(ctx).catch(() => undefined);
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    endProjectTurn();
+    if (remoteHost) {
+      const patch = remoteStatePatch(ctx, { streaming: false });
+      remoteHost.updateMeta(patch);
+      remoteHost.pushEvent({ type: "session_meta", ...patch });
+      remoteHost.pushEvent({ type: "turn_end", ok: true });
+    }
+    await finishTurn(ctx);
+    await autoEnroll(ctx).catch(() => undefined);
+  });
+
+  // Compaction outside a turn rewrites context, so it needs the lease and a current copy.
+  // Inside a turn (threshold or overflow while the lease is held) it is part of that turn's upload.
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (lease || !currentSessionId) return;
+    const binding = await bindingFor(currentSessionId);
+    if (!binding) return;
+    const reserved = await exclusive(() => acquire(ctx, binding));
+    if (!reserved.ok) {
+      notify(ctx, reserved.message, "warning");
+      return { cancel: true as const };
+    }
+    if (reserved.acquired.etag !== binding.lastEtag) {
+      await release(binding, reserved.acquired.lease.token);
+      // Catch up, then compact the current conversation; automatic compaction simply re-triggers later.
+      if (event.reason === "manual") {
+        pendingReplay = { sessionId: currentSessionId, text: "", compact: { customInstructions: event.customInstructions } };
+        notify(ctx, "Catching up with changes from another device, then compacting…", "info");
+      }
+      dispatchRefresh();
+      return { cancel: true as const };
+    }
+    holdLease(ctx, binding, reserved.acquired.lease.token);
+  });
+  pi.on("session_compact", async (_event, ctx) => finishTurn(ctx));
+  pi.on("session_compact_failed", async (_event, ctx) => finishTurn(ctx));
+
+  pi.on("session_before_switch", async (_event, ctx) => {
+    await stopRemoteHost(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    endProjectTurn();
+    await stopRemoteHost(ctx);
+    stopPoll();
+    await finishTurn(ctx);
+    // Leaving: share hand edits made since the last turn, without holding up exit for long.
+    const binding = currentSessionId ? await bindingFor(currentSessionId) : undefined;
+    if (binding) await Promise.race([shareBetweenTurns(ctx, binding, true).catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 15_000).unref?.())]);
+  });
+}

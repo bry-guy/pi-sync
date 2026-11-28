@@ -39,7 +39,7 @@ Each one can be overridden by an environment variable. Edits take effect after
 | `serverUrl` | `PI_SYNC_SERVER_URL` (or `PI_SYNC_URL`) | http(s) URL of pi-syncd | none: sync is off |
 | `deviceLabel` | `PI_SYNC_DEVICE_LABEL` | name other devices see | host name at first run, then kept in `sync-device.json` |
 | `code` | `PI_SYNC_CODE` | `ask` once per repository, `auto` share without asking (announced once per remote; anyone who can read the remote can read the code), `off` never, whatever a repository says | `ask` |
-| `allSessions` | `PI_SYNC_ALL_SESSIONS` | `on`: every conversation syncs after its first reply; `off`: only `/sync attach` | `off` |
+| `allSessions` | `PI_SYNC_ALL_SESSIONS` | `on`: every conversation syncs after its first reply; `projects`: only conversations inside a pi project do; `off`: only `/sync attach` | `off` |
 
 With `ask` or `auto`, a repository's own `/sync code on|off` wins. `/sync detach` keeps a
 conversation out of `allSessions`.
@@ -52,8 +52,17 @@ conversation out of `allSessions`.
   device already has reuses its file.
 - Starting pi in a repository warns when a shared conversation for that
   repository, updated in the last day, is ahead of this device, and names the
-  other clients it is on. Nothing opens by itself: use `/sync`, or
-  `/sync open <id>` to open one directly.
+  other clients it is on. Starting pi inside a pi project (pi-projects) warns
+  the same way about that project's conversations, whichever folder of the
+  project they ran in, including ones this device does not have yet. Nothing
+  opens by itself: use `/sync`, or `/sync open <id>` to open one directly.
+- Other extensions in the same pi process can list and open shared
+  conversations through `globalThis[Symbol.for("pi-sync.v1")]`: `list()`
+  resolves to the server's conversations (`sessionId`, `title`, `project`,
+  `updatedAt`, `devices`, and `local` when this device already has a file for
+  it) and rejects when no server is configured or it cannot be reached;
+  `open(ctx, sessionId, title?)` does what `/sync open <id>` does. pi-projects
+  uses it to show a project's conversations from other devices in `/project`.
 - `/sync status`, `/sync refresh`, and `/sync detach` inspect, force-refresh,
   or stop syncing on this device. Detaching leaves the server copy unchanged.
 - `/sync attach` on a detached conversation syncs it again. If no other device

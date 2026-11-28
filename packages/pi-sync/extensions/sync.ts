@@ -78,12 +78,35 @@ const shared = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.shar
   keptSettings: new Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>(),
   // The rejected-token warning shows once per process, not on every message or poll.
   tokenWarned: false,
+  // The extension instance serving each session, by session id: the public handle below calls into it.
+  instances: new Map<string, SyncHandle>(),
 }) as {
   freshEnroll: Set<string>;
   keptSettings: Map<string, { model: ExtensionContext["model"]; thinking: ReturnType<ExtensionAPI["getThinkingLevel"]> }>;
   tokenWarned: boolean;
+  instances: Map<string, SyncHandle>;
 };
-const { freshEnroll, keptSettings } = shared;
+const { freshEnroll, keptSettings, instances } = shared;
+
+/** A conversation on the server; `local` when this device already has a file for it. */
+export interface SyncedConversation { sessionId: string; title: string; project?: string; updatedAt: string; devices: { label: string; lastSeen: string }[]; local: boolean }
+/** For other extensions in this process (pi-projects), at `globalThis[Symbol.for("pi-sync.v1")]`. */
+export interface SyncHandle {
+  /** The server's conversations. Rejects when no server is configured or it cannot be reached. */
+  list(): Promise<SyncedConversation[]>;
+  /** Opens a conversation on this device, as `/sync open <id>` does. */
+  open(ctx: ExtensionCommandContext, sessionId: string, title?: string): Promise<void>;
+}
+// Set once per process: calls go to the instance serving the calling session, else to the newest one.
+const instanceFor = (sessionId?: string): SyncHandle => {
+  const instance = (sessionId ? instances.get(sessionId) : undefined) ?? [...instances.values()].at(-1);
+  if (!instance) throw new Error("pi-sync is not running in this session.");
+  return instance;
+};
+(globalThis as Record<symbol, unknown>)[Symbol.for("pi-sync.v1")] ??= {
+  list: async () => instanceFor().list(),
+  open: async (ctx, sessionId, title) => instanceFor(ctx.sessionManager.getSessionId()).open(ctx, sessionId, title),
+} satisfies SyncHandle;
 
 type CheckOutcome = "unchanged" | "busy" | "conflict" | "refreshed";
 type CheckResult = { outcome: CheckOutcome; sessionId?: string; switched?: boolean; uploaded?: { entries: number; turns: number; pending?: number; error?: string } };
@@ -1529,6 +1552,28 @@ export default function syncExtension(pi: ExtensionAPI) {
     await reopen(ctx, target, outcome.written.headEntryId, `Opened “${opened || "conversation"}”.`, outcome.written.copyTitle, undefined);
   };
 
+  const handle: SyncHandle = {
+    list: async () => {
+      const url = configuredUrl();
+      if (!url) throw new Error("Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
+      const { sessions } = await clientFor(url).list();
+      const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
+      return sessions.map((item) => ({
+        sessionId: item.sessionId,
+        title: usefulTitle(item.title, item.sessionId),
+        ...(item.project ? { project: item.project } : {}),
+        updatedAt: item.updatedAt ?? item.createdAt,
+        devices: item.devices ?? [],
+        local: existsSync(bindings.get(item.sessionId)?.materializedFile ?? ""),
+      }));
+    },
+    open: async (ctx, sessionId, title) => {
+      const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
+      if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
+      return openSynced(ctx, url, sessionId, title);
+    },
+  };
+
   /** Forks a synchronized conversation into a brand-new local unbound session (no lease, no binding). */
   const forkSynced = async (ctx: ExtensionCommandContext, url: string, sessionId: string, title?: string) => {
     let snapshot: SessionResponse;
@@ -1583,26 +1628,28 @@ export default function syncExtension(pi: ExtensionAPI) {
   };
 
   /**
-   * On a fresh start in a repository, warns about the shared conversation this client hasn't caught up with, naming
-   * the clients it is on. Opening it stays a deliberate /sync.
-   * Only conversations on this checkout's branch count: their code would land here, so this checkout is out of date.
+   * On a fresh start in a pi project or a repository, warns about the shared conversation this client doesn't have or
+   * hasn't caught up with, naming the clients it is on. Opening it stays a deliberate /sync.
+   * In a project, any of the project's conversations counts. In a repository, only conversations on this checkout's
+   * branch count: their code would land here, so this checkout is out of date.
    * shortcut: only conversations updated in the last day are mentioned.
    */
   const warnArrival = async (ctx: ExtensionContext) => {
     const url = configuredUrl();
     if (!url || !ctx.hasUI) return;
+    const project = projectOf(ctx.cwd);
     const repository = await repositoryFor(ctx);
-    if (!repository) return;
+    if (!project && !repository) return;
     const { sessions } = await clientFor(url).list({ timeoutMs: REQUEST_TIMEOUT_MS });
     const bindings = new Map((await store.all()).map((binding) => [binding.canonicalSessionId, binding]));
-    const branch = (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim();
-    if (!branch) return;
     const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const candidate = sessions
-      .filter((item) => repositoryIdentity(item.workspace) === repository && (item.updatedAt ?? item.createdAt) > dayAgo)
-      .filter((item) => (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch)
-      .filter((item) => bindings.get(item.sessionId)?.lastEtag !== item.etag)
+    const newest = (items: typeof sessions) => items
+      .filter((item) => (item.updatedAt ?? item.createdAt) > dayAgo && bindings.get(item.sessionId)?.lastEtag !== item.etag)
       .sort((left, right) => (right.updatedAt ?? right.createdAt).localeCompare(left.updatedAt ?? left.createdAt))[0];
+    // The checkout's own branch comes first, as before projects were covered: its code would land here.
+    const branch = repository ? (await gitRunnerFor(ctx)("git", ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined))?.stdout.trim() : undefined;
+    const candidate = (branch ? newest(sessions.filter((item) => repositoryIdentity(item.workspace) === repository && (item.workspace?.wip?.branch ?? item.workspace?.branch) === branch)) : undefined)
+      ?? (project ? newest(sessions.filter((item) => item.project === project.name)) : undefined);
     if (!candidate) return;
     const title = usefulTitle(candidate.title, candidate.sessionId) || bindings.get(candidate.sessionId)?.title || "A conversation";
     notify(ctx, arrivalWarning(title, candidate, deviceLabel), "warning");
@@ -2017,11 +2064,7 @@ export default function syncExtension(pi: ExtensionAPI) {
       }
       if (command === "status") return showStatus(ctx);
       if (command === "code") return syncCode(ctx, rest[0] ?? "");
-      if (command === "open" && rest[0]) {
-        const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
-        if (!url) return fail(ctx, "sync_not_configured", "Set serverUrl in pi-sync.json (or PI_SYNC_SERVER_URL) before using /sync.");
-        return openSynced(ctx, url, rest[0]);
-      }
+      if (command === "open" && rest[0]) return handle.open(ctx, rest[0]);
       if (command === "fork") {
         if (rest[0]) {
           const url = configuredUrl() ?? (await bindingFor(ctx.sessionManager.getSessionId()))?.serverUrl;
@@ -2061,11 +2104,17 @@ export default function syncExtension(pi: ExtensionAPI) {
     startPoll(ctx);
   };
 
+  const forgetInstance = () => {
+    for (const [id, instance] of instances) if (instance === handle) instances.delete(id);
+  };
+
   pi.on("session_start", async (event, ctx) => {
     shownStatus = null; // a new session's footer starts empty
     await stopRemoteHost();
     if (config.problems.length && event.reason === "startup") notify(ctx, `pi-sync settings ignored: ${config.problems.join("; ")}.`, "warning");
     currentSessionId = ctx.sessionManager.getSessionId();
+    forgetInstance();
+    instances.set(currentSessionId, handle);
     const reopened = ctx.sessionManager.getSessionFile();
     const kept = reopened ? keptSettings.get(resolvePath(reopened)) : undefined;
     if (reopened) keptSettings.delete(resolvePath(reopened));
@@ -2397,6 +2446,7 @@ export default function syncExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    forgetInstance();
     endProjectTurn();
     await stopRemoteHost(ctx);
     stopPoll();
